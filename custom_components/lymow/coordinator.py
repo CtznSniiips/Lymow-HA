@@ -5,15 +5,12 @@ Commands are published to /pbinput as protobuf messages.
 
 Startup + periodic refresh:
   On connect:
-    QUERY_MAP          → full map + zone list (btMap)
-    QUERY_SCHEDULES    → schedules
-    QUERY_ROBOT_CONFIG → firmware version, IP, blade height, clean mode
-    QUERY_NET_DETAIL   → WiFi/LTE info
-    QUERY_RTK_L1       → RTK status
+    build_initial_query_packets() → map, path, schedules, cleaning info,
+                                      robot config, net detail, WiFi/4G, RTK L1/L2
 
   Every _REFRESH_INTERVAL (default 90s):
-    QUERY_ROBOT_CONFIG + QUERY_NET_DETAIL + QUERY_RTK_L1
-    (ensures IP address and signal info stay current without the app open)
+    build_refresh_query_packets()
+    (ensures IP address, signal info and RTK stay current without the app open)
 
   On MQTT disconnect:
     Refresh AWS credentials (they expire after ~1h causing the disconnect)
@@ -48,15 +45,12 @@ from .protocol import (
     USER_CTRL_FORCE_REINIT,
     USER_CTRL_PAUSE,
     USER_CTRL_PAUSE_DOCK,
-    USER_CTRL_QUERY_NET_DETAIL,
-    USER_CTRL_QUERY_ROBOT_CFG,
-    USER_CTRL_QUERY_RTK_L1,
-    USER_CTRL_QUERY_SCHEDULES,
     USER_CTRL_RECHARGE_DOCK,
     USER_CTRL_RESUME,
     USER_CTRL_RESUME_DOCK,
+    build_initial_query_packets,
+    build_refresh_query_packets,
     decode_pboutput_envelope,
-    encode_query_map,
     encode_start_zones,
     encode_userctrl,
 )
@@ -168,17 +162,13 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _fire_startup_queries(self) -> None:
         """Publish all startup queries. Also called after reconnect."""
-        self._publish(encode_query_map())
-        self._publish(encode_userctrl(USER_CTRL_QUERY_SCHEDULES))
-        self._publish(encode_userctrl(USER_CTRL_QUERY_ROBOT_CFG))
-        self._publish(encode_userctrl(USER_CTRL_QUERY_NET_DETAIL))
-        self._publish(encode_userctrl(USER_CTRL_QUERY_RTK_L1))
+        for raw in build_initial_query_packets():
+            self._publish(raw)
 
     def _fire_refresh_queries(self) -> None:
         """Periodic refresh — keeps IP, signal, RTK and config up to date."""
-        self._publish(encode_userctrl(USER_CTRL_QUERY_ROBOT_CFG))
-        self._publish(encode_userctrl(USER_CTRL_QUERY_NET_DETAIL))
-        self._publish(encode_userctrl(USER_CTRL_QUERY_RTK_L1))
+        for raw in build_refresh_query_packets():
+            self._publish(raw)
 
     # ── Properties ──────────────────────────────────────────────
 

@@ -32,6 +32,7 @@ PLATFORMS = [
     Platform.SELECT,
     Platform.NUMBER,
     Platform.CAMERA,
+    Platform.DEVICE_TRACKER,
 ]
 
 

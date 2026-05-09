@@ -13,21 +13,24 @@ from typing import Any
 
 PB_VERSION_4_9 = 40
 
-USER_CTRL_CLEAN            = 1
-USER_CTRL_DOCK             = 2
-USER_CTRL_PAUSE            = 3
-USER_CTRL_RESUME           = 4
-USER_CTRL_QUERY_MAP        = 19
-USER_CTRL_QUERY_SCHEDULES  = 20
-USER_CTRL_PAUSE_DOCK       = 21
-USER_CTRL_RESUME_DOCK      = 22
-USER_CTRL_FORCE_REINIT     = 28
-USER_CTRL_RECHARGE_DOCK    = 33
-USER_CTRL_QUERY_CLEANING   = 24
-USER_CTRL_QUERY_ROBOT_CFG  = 35
-USER_CTRL_QUERY_NET_DETAIL = 53
-USER_CTRL_QUERY_RTK_L1     = 57
-USER_CTRL_QUERY_RTK_L2     = 58
+USER_CTRL_CLEAN                  = 1
+USER_CTRL_DOCK                   = 2
+USER_CTRL_PAUSE                  = 3
+USER_CTRL_RESUME                 = 4
+USER_CTRL_QUERY_MAP              = 19
+USER_CTRL_QUERY_SCHEDULES        = 20
+USER_CTRL_PAUSE_DOCK             = 21
+USER_CTRL_RESUME_DOCK            = 22
+USER_CTRL_QUERY_PATH             = 23
+USER_CTRL_QUERY_CLEANING         = 24
+USER_CTRL_FORCE_REINIT           = 28
+USER_CTRL_RECHARGE_DOCK          = 33
+USER_CTRL_QUERY_CLEANING_SUMMARY = 34
+USER_CTRL_QUERY_ROBOT_CFG        = 35
+USER_CTRL_QUERY_WIFI_4G          = 52
+USER_CTRL_QUERY_NET_DETAIL       = 53
+USER_CTRL_QUERY_RTK_L1           = 57
+USER_CTRL_QUERY_RTK_L2           = 58
 
 CLEAN_MODE_INT = {
     0: "NONE",
@@ -61,21 +64,109 @@ def _enc_len(field_no: int, data: bytes) -> bytes:
 # ── PbInput encoders ───────────────────────────────────────────
 
 def encode_userctrl(user_ctrl: int) -> bytes:
+    """PbInput {version=40, userCtrl=N}."""
     return _enc_i32(2, PB_VERSION_4_9) + _enc_i32(5, user_ctrl)
 
-def encode_query_map() -> bytes:
+
+def encode_query_map(query_index: int = 0) -> bytes:
+    """Query full map via PbInput.btMap.queryMap."""
+    btmap = _enc_i32(1, query_index) + _enc_i32(4, 1)
     return (
         _enc_i32(2, PB_VERSION_4_9)
         + _enc_i32(5, USER_CTRL_QUERY_MAP)
-        + _enc_len(6, _enc_i32(1, 1))
+        + _enc_len(23, btmap)
     )
 
+
+def encode_query_path(query_index: int = 0) -> bytes:
+    """Query path data via PbInput.btMap.queryPath."""
+    btmap = _enc_i32(1, query_index) + _enc_i32(3, 1)
+    return (
+        _enc_i32(2, PB_VERSION_4_9)
+        + _enc_i32(5, USER_CTRL_QUERY_PATH)
+        + _enc_len(23, btmap)
+    )
+
+
+def encode_query_schedules() -> bytes:
+    return encode_userctrl(USER_CTRL_QUERY_SCHEDULES)
+
+
+def encode_query_cleaning_info() -> bytes:
+    return encode_userctrl(USER_CTRL_QUERY_CLEANING)
+
+
+def encode_query_cleaning_summary() -> bytes:
+    return encode_userctrl(USER_CTRL_QUERY_CLEANING_SUMMARY)
+
+
+def encode_query_robot_config() -> bytes:
+    return encode_userctrl(USER_CTRL_QUERY_ROBOT_CFG)
+
+
+def encode_query_wifi_4g() -> bytes:
+    return encode_userctrl(USER_CTRL_QUERY_WIFI_4G)
+
+
+def encode_query_net_detail() -> bytes:
+    return encode_userctrl(USER_CTRL_QUERY_NET_DETAIL)
+
+
+def encode_query_rtk_l1() -> bytes:
+    return encode_userctrl(USER_CTRL_QUERY_RTK_L1)
+
+
+def encode_query_rtk_l2() -> bytes:
+    return encode_userctrl(USER_CTRL_QUERY_RTK_L2)
+
+
 def encode_start_zones(zone_hash_ids: list[str]) -> bytes:
+    """Start mowing selected zones using PbInput.map.goZones."""
     pb = _enc_i32(2, PB_VERSION_4_9) + _enc_i32(5, USER_CTRL_CLEAN)
+    map_pb = b""
+
     for i, hash_id in enumerate(zone_hash_ids, start=1):
-        basic_info = _enc_len(3, hash_id.encode()) + _enc_i32(8, i)
-        pb += _enc_len(7, _enc_len(2, _enc_len(1, basic_info)))
+        if not hash_id:
+            continue
+        basic_info = _enc_len(3, hash_id.encode("utf-8")) + _enc_i32(8, i)
+        zone = _enc_len(1, basic_info)
+        map_pb += _enc_len(1, zone)
+
+    if map_pb:
+        pb += _enc_len(12, map_pb)
     return pb
+
+
+def build_initial_query_packets(query_index: int = 0) -> list[bytes]:
+    """Queries to send after MQTT subscribe/reconnect.
+
+    This mimics the app behaviour enough to populate IP, firmware, net detail,
+    map/zones and RTK even when the official app is not open.
+    """
+    return [
+        encode_query_map(query_index),
+        encode_query_path(query_index),
+        encode_query_schedules(),
+        encode_query_cleaning_info(),
+        encode_query_cleaning_summary(),
+        encode_query_net_detail(),
+        encode_query_robot_config(),
+        encode_query_wifi_4g(),
+        encode_query_rtk_l1(),
+        encode_query_rtk_l2(),
+    ]
+
+
+def build_refresh_query_packets() -> list[bytes]:
+    """Periodic lightweight refresh for data that otherwise appears only when the app is open."""
+    return [
+        encode_query_cleaning_info(),
+        encode_query_net_detail(),
+        encode_query_robot_config(),
+        encode_query_wifi_4g(),
+        encode_query_rtk_l1(),
+        encode_query_rtk_l2(),
+    ]
 
 
 # ── Envelope ───────────────────────────────────────────────────
@@ -180,6 +271,44 @@ def _packed_ints(fields: dict, fno: int) -> list[int]:
     return result
 
 
+# ── Small typed decoders ───────────────────────────────────────
+
+def _decode_point(fields: dict) -> dict[str, Any]:
+    """Decode PbPoint {x=1 float, y=2 float}."""
+    out: dict[str, Any] = {}
+    x = _gf(fields, 1)
+    y = _gf(fields, 2)
+    if x is not None:
+        out["x"] = x
+    if y is not None:
+        out["y"] = y
+    return out
+
+
+def _decode_pose(fields: dict) -> dict[str, Any]:
+    """Decode a pose-like message {x=1, y=2, heading=3}, all float32."""
+    out = _decode_point(fields)
+    heading = _gf(fields, 3)
+    if heading is not None:
+        out["heading"] = heading
+    return out
+
+
+def _decode_lla(fields: dict) -> dict[str, Any]:
+    """Decode PbRobotLLACoords {latitude=1, longitude=2, altitude=3}, all float32."""
+    out: dict[str, Any] = {}
+    lat = _gf(fields, 1)
+    lon = _gf(fields, 2)
+    alt = _gf(fields, 3)
+    if lat is not None:
+        out["latitude"] = lat
+    if lon is not None:
+        out["longitude"] = lon
+    if alt is not None:
+        out["altitude"] = alt
+    return out
+
+
 # ── PbBtMap decoder ────────────────────────────────────────────
 
 def decode_btmap(raw: bytes) -> dict[str, Any]:
@@ -193,12 +322,20 @@ def decode_btmap(raw: bytes) -> dict[str, Any]:
     """
     zones: list[dict] = []
     zone_count = 0
+    enu_base_point: dict[str, Any] | None = None
     root = _wire_parse(raw)
 
     for kind, map_val in root.get(2, []):
         if kind != "L":
             continue
         map_data = _wire_parse(map_val)
+
+        # PbMap.enuBasePoint = field 7 (real-world origin for local ENU metres)
+        enu = _sub(map_data, 7)
+        if enu:
+            decoded_enu = _decode_lla(enu)
+            if decoded_enu:
+                enu_base_point = decoded_enu
         for kind2, zc_val in map_data.get(3, []):
             if kind2 != "L":
                 continue
@@ -238,7 +375,10 @@ def decode_btmap(raw: bytes) -> dict[str, Any]:
                     zone["points"] = pts
                 zones.append(zone)
 
-    return {"zones": zones, "zone_count": zone_count or len(zones)}
+    out: dict[str, Any] = {"zones": zones, "zone_count": zone_count or len(zones)}
+    if enu_base_point:
+        out["enuBasePoint"] = enu_base_point
+    return out
 
 
 # ── PbOutput decoder ───────────────────────────────────────────
@@ -291,8 +431,11 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
      18  outputCtrl        int32
      23  PbBtMap           → state["btMap"] = decode_btmap(...)
      24  PbPose chargingStationLoc → state["chargingStationLoc"]
+     26  PbRobotLLACoords robotLlaCoords → latitude/longitude/altitude
+     31  PbPoint robotPosePib → local robot x/y on the mower map
      34  PbNetDetailInfo   → state["netDetailInfo"]
      35  PbRtkDiagnosticL1 → state["rtkDiagnosticL1"] + state["rtkStatus"]
+     36  PbRtkDiagnosticL2 → state["rtkDiagnosticL2"]
     """
     state: dict[str, Any] = {}
     root = _wire_parse(raw)
@@ -396,14 +539,34 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
                 state["btMap"] = btmap
             break
 
-    # chargingStationLoc / PbPose (field 24)
+    # chargingStationLoc / PbPose (field 24) — local map coordinates
     pose = _sub(root, 24)
     if pose:
-        dock: dict[str, Any] = {}
-        for fno, key in [(1,"x"),(2,"y"),(3,"heading")]:
-            f = _gf(pose, fno)
-            if f is not None: dock[key] = f
-        if dock: state["chargingStationLoc"] = dock
+        dock = _decode_pose(pose)
+        if dock:
+            state["chargingStationLoc"] = dock
+
+    # PbRobotLLACoords / real GPS/RTK position (field 26)
+    lla = _sub(root, 26)
+    if lla:
+        robot_lla = _decode_lla(lla)
+        if robot_lla:
+            state["robotLlaCoords"] = robot_lla
+            # Home Assistant tracker-friendly aliases
+            if "latitude" in robot_lla:
+                state["latitude"] = robot_lla["latitude"]
+            if "longitude" in robot_lla:
+                state["longitude"] = robot_lla["longitude"]
+            if "altitude" in robot_lla:
+                state["altitude"] = robot_lla["altitude"]
+
+    # PbPoint / robot position in local map coordinates (field 31)
+    rp = _sub(root, 31)
+    if rp:
+        robot_pose = _decode_point(rp)
+        if robot_pose:
+            state["robotPosePib"] = robot_pose
+            state["robotLoc"] = robot_pose
 
     # PbNetDetailInfo (field 34)
     nd = _sub(root, 34)
@@ -417,7 +580,12 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
         for fno, key in [(2,"wifiName"),(3,"wifiIp"),(6,"simIp"),(10,"simIccid")]:
             s = _gs(nd, fno)
             if s: net[key] = s
-        if net: state["netDetailInfo"] = net
+        if net:
+            state["netDetailInfo"] = net
+            if "wifiIp" in net and "ipAddress" not in state:
+                state["ipAddress"] = net["wifiIp"]
+            if "wifiName" in net and "wifiSsid" not in state:
+                state["wifiSsid"] = net["wifiName"]
 
     # PbRtkDiagnosticL1 (field 35)
     rd = _sub(root, 35)
@@ -433,19 +601,65 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
             state["rtkDiagnosticL1"] = rtk
             if "rtkStatus" in rtk: state["rtkStatus"] = rtk["rtkStatus"]
 
-    # PbLocalizationInfo (field 6) — fallback RTK
+    # PbRtkDiagnosticL2 (field 36)
+    rd2 = _sub(root, 36)
+    if rd2:
+        rtk2: dict[str, Any] = {}
+        for fno, key in [
+            (2, "loraBps0"), (3, "loraBps1"), (4, "loraBps2"),
+            (8, "cwRatio0"), (9, "cwRatio1"), (10, "cwRatio2"),
+            (11, "antValue0"), (12, "antValue1"), (13, "antValue2"),
+        ]:
+            v = _gv(rd2, fno)
+            if v is not None:
+                rtk2[key] = _s32(v)
+        for fno, key in [
+            (1, "diffAge"), (5, "hwDc0"), (6, "hwDc1"), (7, "hwDc2"),
+        ]:
+            f = _gf(rd2, fno)
+            if f is not None:
+                rtk2[key] = f
+        if rtk2:
+            state["rtkDiagnosticL2"] = rtk2
+
+    # PbLocalizationInfo (field 6) — fallback RTK/location
     loc = _sub(root, 6)
     if loc and "rtkDiagnosticL1" not in state:
-        rtk_loc: dict[str, Any] = {}
-        for fno, key in [(1,"satelliteCount"),(4,"rtkStatus"),(5,"baseStationStatus")]:
-            v = _gv(loc, fno)
-            if v is not None: rtk_loc[key] = v
-        for fno, key in [(2,"precision"),(3,"baseDataErrorRate")]:
-            f = _gf(loc, fno)
-            if f is not None: rtk_loc[key] = f
-        if rtk_loc:
-            state["rtkDiagnosticL1"] = rtk_loc
-            if "rtkStatus" in rtk_loc: state["rtkStatus"] = rtk_loc["rtkStatus"]
+        loc_info: dict[str, Any] = {}
+        v = _gv(loc, 1)
+        if v is not None:
+            loc_info["numSatellites"] = v
+            loc_info["satelliteCount"] = v
+        f = _gf(loc, 2)
+        if f is not None:
+            loc_info["horizontalAccuracy"] = f
+            loc_info["precision"] = f
+        f = _gf(loc, 3)
+        if f is not None:
+            loc_info["verticalAccuracy"] = f
+        v = _gv(loc, 4)
+        if v is not None:
+            loc_info["positionQuality"] = v
+            loc_info["rtkStatus"] = v
+        v = _gv(loc, 5)
+        if v is not None:
+            loc_info["locNodeStatus"] = v
+        if loc_info:
+            state["localizationInfo"] = loc_info
+            state["rtkDiagnosticL1"] = loc_info
+            if "rtkStatus" in loc_info:
+                state["rtkStatus"] = loc_info["rtkStatus"]
+
+    known_root = {1, 2, 3, 4, 5, 6, 9, 10, 12, 16, 17, 18, 22, 23, 24, 26, 31, 34, 35, 36}
+    unknown = {k: v for k, v in root.items() if k not in known_root}
+    if unknown:
+        state["_unknown_root_fields"] = {
+            k: [
+                (kind, val.hex() if isinstance(val, (bytes, bytearray)) else val)
+                for kind, val in entries
+            ]
+            for k, entries in unknown.items()
+        }
 
     return state
 
