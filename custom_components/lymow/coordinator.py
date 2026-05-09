@@ -169,10 +169,6 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             or self.work_status not in (WORK_STATUS_OFFLINE, -1)
         )
 
-    @property
-    def data(self) -> dict[str, Any]:
-        return self._state
-
     # ── Inbound MQTT handlers ────────────────────────────────────
 
     def _handle_pboutput(self, raw_envelope: bytes) -> None:
