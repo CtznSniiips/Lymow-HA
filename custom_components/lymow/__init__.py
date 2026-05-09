@@ -1,9 +1,8 @@
-"""Lymow Robot Mower integration."""
+"""Lymow Robot Mower integration — MQTT push-driven."""
 
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
@@ -14,11 +13,9 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import CognitoAuth, LymowClient
 from .const import (
-    CLEAN_MODE_OPTIONS,
     CONF_EMAIL,
     CONF_PASSWORD,
     CONF_REGION,
-    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     SERVICE_SET_BLADE,
     SERVICE_SET_SCHEDULE,
@@ -63,27 +60,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     client = LymowClient(region, auth, session)
 
-    scan_interval = entry.options.get("scan_interval", DEFAULT_SCAN_INTERVAL)
-    coordinator   = LymowCoordinator(
+    coordinator = LymowCoordinator(
         hass=hass,
         auth=auth,
         client=client,
         thing_name=thing_name,
+        region=region,
         email=email,
         password=password,
     )
-    coordinator.update_interval = timedelta(seconds=scan_interval)
 
     # Store reference so entity platforms can find it
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
-    # First refresh + static device info
-    await coordinator.async_config_entry_first_refresh()
+    # Connect MQTT and fire startup queries
+    await coordinator.async_setup()
+
+    # Static device info (IP for camera, serial, fw version)
     await coordinator.async_refresh_device_info()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # ── Register services (only once, even with multiple robots) ──────────
+    # ── Register services ─────────────────────────────────────────
 
     def _coord_for_call(call: ServiceCall) -> LymowCoordinator | None:
         entry_id = call.data.get("entry_id")
@@ -139,7 +137,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             }),
         )
 
-    # Persist updated tokens after successful setup
+    # Persist updated tokens
     hass.config_entries.async_update_entry(
         entry,
         data={**entry.data, **auth.to_dict()},
@@ -150,6 +148,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    coordinator: LymowCoordinator | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator:
+        await coordinator.async_shutdown()
+
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         hass.data[DOMAIN].pop(entry.entry_id, None)
