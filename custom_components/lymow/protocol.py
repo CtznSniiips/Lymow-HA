@@ -271,10 +271,16 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
     # robotInfo (field 5) → robotStatus sub-message (field 1)
     ri_entries = root.get(5)
     if ri_entries:
-        ri = _wire_parse(ri_entries[0][1])
+        ri_val = ri_entries[0][1]
+        if not isinstance(ri_val, (bytes, bytearray)):
+            ri_val = b""
+        ri = _wire_parse(ri_val)
         rs_entries = ri.get(1)
         if rs_entries:
-            rs = _wire_parse(rs_entries[0][1])
+            rs_val = rs_entries[0][1]
+            if not isinstance(rs_val, (bytes, bytearray)):
+                rs_val = b""
+            rs = _wire_parse(rs_val)
             for fno, key in [
                 (1, "robotStatus"),
                 (2, "battery"),
@@ -304,7 +310,8 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
     # netDetailInfo (field 34)
     nd_entries = root.get(34)
     if nd_entries:
-        nd = _wire_parse(nd_entries[0][1])
+        nd_val = nd_entries[0][1]
+        nd = _wire_parse(nd_val) if isinstance(nd_val, (bytes, bytearray)) else {}
         net: dict[str, Any] = {}
         for fno, key in [(1, "currentNet"), (4, "wifiSignal"), (5, "simCardStatus"),
                           (7, "simSignal"), (8, "simRegistration")]:
@@ -324,7 +331,8 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
     # rtkDiagnosticL1 (field 35)
     rtk_entries = root.get(35)
     if rtk_entries:
-        rd = _wire_parse(rtk_entries[0][1])
+        rtk_val = rtk_entries[0][1]
+        rd = _wire_parse(rtk_val) if isinstance(rtk_val, (bytes, bytearray)) else {}
         rtk: dict[str, Any] = {}
         for fno, key in [(1, "rtkStatus"), (3, "satelliteCount"), (10, "baseStationStatus")]:
             v = _get_varint(rd, fno)
