@@ -268,40 +268,54 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
     if warn:
         state["warningCodes"] = warn
 
-    # robotInfo (field 5) → robotStatus sub-message (field 1)
+    # robotInfo (field 5) — fields directly in message, no sub-message nesting
     ri_entries = root.get(5)
     if ri_entries:
         ri_val = ri_entries[0][1]
-        if not isinstance(ri_val, (bytes, bytearray)):
-            ri_val = b""
-        ri = _wire_parse(ri_val)
-        rs_entries = ri.get(1)
-        if rs_entries:
-            rs_val = rs_entries[0][1]
-            if not isinstance(rs_val, (bytes, bytearray)):
-                rs_val = b""
-            rs = _wire_parse(rs_val)
-            for fno, key in [
-                (1, "robotStatus"),
-                (2, "battery"),
-                (3, "wifiSignalQuality"),
-                (4, "lteSignalQuality"),
-                (5, "btSignalQuality"),
-                (6, "workStatus"),
-            ]:
-                v = _get_varint(rs, fno)
-                if v is not None:
-                    state[key] = v
+        ri = _wire_parse(ri_val) if isinstance(ri_val, (bytes, bytearray)) else {}
+        for fno, key in [
+            (1, "robotStatus"),
+            (2, "battery"),
+            (3, "wifiSignalQuality"),
+            (4, "lteSignalQuality"),
+            (5, "btSignalQuality"),
+            (6, "workStatus"),
+        ]:
+            v = _get_varint(ri, fno)
+            if v is not None:
+                # Signed int32: negative values are sign-extended to 64-bit
+                if v >= (1 << 31):
+                    v = v - (1 << 64)
+                state[key] = v
 
-            for fno, key in [
-                (7, "isRecharging"),
-                (8, "isCharging"),
-                (9, "wifiWorking"),
-                (10, "lteWorking"),
-            ]:
-                v = _get_varint(rs, fno)
-                if v is not None:
-                    state[key] = bool(v)
+        for fno, key in [
+            (7, "isRecharging"),
+            (8, "isCharging"),
+            (9, "wifiWorking"),
+            (10, "lteWorking"),
+        ]:
+            v = _get_varint(ri, fno)
+            if v is not None:
+                state[key] = bool(v)
+
+    # rtkInfo (field 6 of root — NOT field 35 as originally assumed)
+    rtk6_entries = root.get(6)
+    if rtk6_entries:
+        rtk6_val = rtk6_entries[0][1]
+        rtk6 = _wire_parse(rtk6_val) if isinstance(rtk6_val, (bytes, bytearray)) else {}
+        rtk: dict[str, Any] = {}
+        for fno, key in [(1, "satelliteCount"), (4, "rtkStatus"), (5, "baseStationStatus")]:
+            v = _get_varint(rtk6, fno)
+            if v is not None:
+                rtk[key] = v
+        for fno, key in [(2, "precision"), (3, "baseDataErrorRate")]:
+            f = _get_float32(rtk6, fno)
+            if f is not None:
+                rtk[key] = f
+        if rtk:
+            state["rtkDiagnosticL1"] = rtk
+            if "rtkStatus" in rtk:
+                state["rtkStatus"] = rtk["rtkStatus"]
 
     # Derive isOnline from workStatus presence
     if "workStatus" in state:
@@ -328,24 +342,24 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
         if net:
             state["netDetailInfo"] = net
 
-    # rtkDiagnosticL1 (field 35)
-    rtk_entries = root.get(35)
-    if rtk_entries:
-        rtk_val = rtk_entries[0][1]
-        rd = _wire_parse(rtk_val) if isinstance(rtk_val, (bytes, bytearray)) else {}
-        rtk: dict[str, Any] = {}
+    # field 35 kept for backward compat (may appear in some firmware versions)
+    rtk35_entries = root.get(35)
+    if rtk35_entries and "rtkDiagnosticL1" not in state:
+        rtk35_val = rtk35_entries[0][1]
+        rd = _wire_parse(rtk35_val) if isinstance(rtk35_val, (bytes, bytearray)) else {}
+        rtk35: dict[str, Any] = {}
         for fno, key in [(1, "rtkStatus"), (3, "satelliteCount"), (10, "baseStationStatus")]:
             v = _get_varint(rd, fno)
             if v is not None:
-                rtk[key] = v
+                rtk35[key] = v
         for fno, key in [(2, "precision"), (11, "baseDataErrorRate")]:
             f = _get_float32(rd, fno)
             if f is not None:
-                rtk[key] = f
-        if rtk:
-            state["rtkDiagnosticL1"] = rtk
-            if "rtkStatus" in rtk:
-                state["rtkStatus"] = rtk["rtkStatus"]
+                rtk35[key] = f
+        if rtk35:
+            state["rtkDiagnosticL1"] = rtk35
+            if "rtkStatus" in rtk35:
+                state["rtkStatus"] = rtk35["rtkStatus"]
 
     return state
 
