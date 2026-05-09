@@ -223,6 +223,19 @@ def decode_btmap(raw: bytes) -> dict[str, Any]:
                         except: pass
                     elif k3 == "v":
                         zone["zoneType"] = v3
+                # field 5 = simplified boundary points (repeated PbPoint sub-messages)
+                pts: list[tuple[float, float]] = []
+                for k5, v5 in zs.get(5, []):
+                    if k5 != "L":
+                        continue
+                    # Each point is a sub-message: field 1 (wire 5) = x, field 2 (wire 5) = y
+                    pb = _wire_parse(v5)
+                    px = _gf(pb, 1)
+                    py = _gf(pb, 2)
+                    if px is not None and py is not None:
+                        pts.append((round(px, 3), round(py, 3)))
+                if pts:
+                    zone["points"] = pts
                 zones.append(zone)
 
     return {"zones": zones, "zone_count": zone_count or len(zones)}

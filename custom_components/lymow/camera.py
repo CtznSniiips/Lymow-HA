@@ -1,26 +1,20 @@
-"""
-Lymow camera platform.
+"""Lymow camera platform.
 
 Two camera entities:
-  1. LymowMapCamera  — SVG map rendered from zone/obstacle shadow data (always available)
-  2. LymowRTSPCamera — live video stream from the robot's onboard camera (requires local network)
+  1. LymowMapCamera  — SVG map rendered from btMap zone data (MQTT)
+  2. LymowRTSPCamera — live video stream via RTSP (requires local network)
 
-RTSP URL format (verified from APK source):
-  rtsp://<ipAddress>:10022/h264ESVideoTest
-  where ipAddress comes from the fwVersion.ipAddress shadow field.
+Map data source (MQTT / PbBtMap field 23):
+  btMap.zones[]:
+    hashId  — ID used in zone commands
+    name    — human label (e.g. "charging_area")
+    points  — simplified boundary [(x, y), ...] in local metres
+  chargingStationLoc: {x, y, heading} — dock position in local metres
 
-HA cannot snapshot RTSP natively without go2rtc or ffmpeg.
-LymowRTSPCamera exposes the URL via attributes so it can be used with go2rtc:
-
-  go2rtc:
-    streams:
-      lymow:
-        - "rtsp://{{ states('sensor.lymow_ip_address') }}:10022/h264ESVideoTest"
+RTSP URL: rtsp://<ipAddress>:10022/h264ESVideoTest
 """
-
 from __future__ import annotations
 
-import json
 import logging
 import math
 from typing import Any
@@ -33,11 +27,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import (
     DOMAIN,
     F_CLEAN_ZONE_IDS,
-    F_CUT_ZONE_ID,
-    F_GO_ZONE_IDS,
-    F_MAP_AREA,
-    F_OBS_MAP,
-    RTK_STATUS_LABELS,
+    F_IP_ADDRESS,
+    F_NET_DETAIL,
     RTSP_PATH,
     RTSP_PORT,
     WORK_STATUS_OFFLINE,
@@ -47,21 +38,47 @@ from .entity_base import LymowEntity
 
 _LOGGER = logging.getLogger(__name__)
 
+_CANVAS  = 500
+_PADDING = 28
+
+# Colour palette
+_C_BG           = "#111827"
+_C_LAWN         = "#1a3a1a"
+_C_BOUNDARY     = "#4ade80"
+_C_ZONE_IDLE    = "#22c55e"
+_C_ZONE_ACTIVE  = "#86efac"
+_C_CHARGING     = "#f59e0b"
+_C_DOCK         = "#fbbf24"
+_C_ROBOT        = "#f97316"
+_C_TEXT         = "white"
+
+_STATUS_COLOR = {
+    -1: "#374151", 0: "#6b7280", 1: "#6b7280",
+     2: "#16a34a", 3: "#9333ea", 4: "#2563eb",
+     5: "#d97706", 6: "#0891b2", 7: "#dc2626",
+     8: "#16a34a", 9: "#16a34a", 10: "#2563eb",
+    11: "#d97706", 12: "#0891b2", 13: "#dc2626",
+    14: "#9333ea", 15: "#6b7280",
+}
+_STATUS_LABEL = {
+    -1: "OFFLINE", 0: "IDLE", 1: "WAITING", 2: "MOWING",
+     3: "PAUSED",  4: "DOCKING", 5: "CHARGING", 6: "REMOTE",
+     7: "ERROR",   8: "RESUMING", 9: "MAPPING", 10: "DOCKING",
+    11: "UPDATE",  12: "CHARGED", 13: "E-STOP", 14: "ESCAPING",
+}
+
 
 def _get_robot_ip(data: dict) -> str | None:
-    """
-    Extract the robot's local WiFi IP from the shadow state.
-    Priority: fwVersion.ipAddress → netDetailInfo.wifiIp → top-level ipAddress.
-    """
     return (
-        (data.get("fwVersion") or {}).get("ipAddress")
-        or (data.get("netDetailInfo") or {}).get("wifiIp")
-        or data.get("ipAddress")
+        data.get(F_IP_ADDRESS)
+        or (data.get(F_NET_DETAIL) or {}).get("wifiIp")
     )
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
@@ -71,42 +88,30 @@ async def async_setup_entry(
 
 
 class LymowMapCamera(LymowEntity, Camera):
-    """Camera that renders the Lymow lawn map as SVG."""
+    """SVG map from btMap zone data (received via MQTT PbBtMap)."""
 
-    _attr_name         = "Map"
-    _attr_icon         = "mdi:map"
-    _attr_content_type = "image/svg+xml"
+    _attr_name               = "Map"
+    _attr_icon               = "mdi:map"
+    _attr_content_type       = "image/svg+xml"
     _attr_supported_features = CameraEntityFeature(0)
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
         LymowEntity.__init__(self, coordinator, "map")
         Camera.__init__(self)
-        self._backup_map: dict | None = None
 
     @property
     def available(self) -> bool:
-        # Camera is always available (shows placeholder when offline)
         return self.coordinator.last_update_success
 
-    async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
+    async def async_camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
         d = self.coordinator.data or {}
-        work_status = d.get("workStatus", WORK_STATUS_OFFLINE)
-
-        # Primary map source: obsMap from shadow
-        obs_map = d.get(F_OBS_MAP)
-
-        # Fetch backup map from API once if shadow has no map
-        if not obs_map and not self._backup_map:
-            self._backup_map = await self.coordinator.async_refresh_map()
-
-        map_data = obs_map or self._backup_map
-
         svg = render_svg(
-            map_data=map_data,
-            robot_pos=d.get("position") or d.get("robotPosition") or d.get("locData"),
-            active_zone_id=d.get(F_CUT_ZONE_ID),
-            queued_zone_ids=set(d.get(F_GO_ZONE_IDS) or d.get(F_CLEAN_ZONE_IDS) or []),
-            work_status=work_status,
+            btmap=d.get("btMap"),
+            charging_loc=d.get("chargingStationLoc"),
+            active_zone_ids=set(d.get(F_CLEAN_ZONE_IDS) or []),
+            work_status=d.get("workStatus", WORK_STATUS_OFFLINE),
             rtk_status=d.get("rtkStatus"),
             battery=d.get("battery"),
         )
@@ -116,92 +121,58 @@ class LymowMapCamera(LymowEntity, Camera):
     def extra_state_attributes(self) -> dict:
         d = self.coordinator.data or {}
         attrs: dict = {}
-        if area := d.get(F_MAP_AREA):
-            attrs["map_area_m2"] = area
-        if obs := d.get(F_OBS_MAP):
-            # Expose raw map as JSON for external integrations / dashboards
-            attrs["obs_map_json"] = json.dumps(obs) if not isinstance(obs, str) else obs
-        if pos := d.get("position") or d.get("robotPosition"):
-            attrs["robot_position"] = pos
+        btmap = d.get("btMap") or {}
+        if btmap.get("zone_count"):
+            attrs["zone_count"] = btmap["zone_count"]
+        # Expose zone list for automations / dashboards
+        zones = btmap.get("zones", [])
+        if zones:
+            attrs["zones"] = [
+                {"hashId": z.get("hashId"), "name": z.get("name", z.get("hashId", ""))}
+                for z in zones if z.get("hashId")
+            ]
+        if ma := d.get("mapArea"):
+            attrs["map_area_m2"] = ma
         return attrs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SVG renderer
-# ─────────────────────────────────────────────────────────────────────────────
-
-_CANVAS   = 500
-_PADDING  = 24
-
-_COLOR_BG         = "#111827"
-_COLOR_LAWN       = "#1a3a1a"
-_COLOR_BOUNDARY   = "#4ade80"
-_COLOR_ZONE_IDLE  = "#22c55e"
-_COLOR_ZONE_ACTIVE = "#86efac"
-_COLOR_OBSTACLE   = "#ef4444"
-_COLOR_ROBOT      = "#f97316"
-_COLOR_PATH       = "#fde68a"
-_COLOR_STATUS_BG  = {
-    2: "#16a34a",   # mowing
-    4: "#2563eb",   # docking
-    5: "#d97706",   # charging
-    7: "#dc2626",   # error
-    3: "#9333ea",   # pause
-    12: "#0891b2",  # charging full
-    13: "#dc2626",  # emergency stop
-    1: "#6b7280",   # waiting
-    0: "#6b7280",   # idle
-    -1: "#374151",  # offline
-}
-_STATUS_LABELS = {
-    -1: "OFFLINE", 0: "IDLE", 1: "WAITING", 2: "MOWING",
-    3: "PAUSED", 4: "DOCKING", 5: "CHARGING", 6: "REMOTE",
-    7: "ERROR", 8: "RESUMING", 9: "MAPPING", 10: "DOCKING",
-    11: "UPDATING", 12: "CHARGED", 13: "E-STOP", 14: "ESCAPING",
-}
-
+# ── SVG renderer ───────────────────────────────────────────────
 
 def render_svg(
-    map_data: dict | None,
-    robot_pos: Any,
-    active_zone_id: str | None,
-    queued_zone_ids: set[str],
+    btmap: dict | None,
+    charging_loc: dict | None,
+    active_zone_ids: set[str],
     work_status: int,
-    rtk_status: int | None = None,
-    battery: int | None = None,
+    rtk_status: int | None,
+    battery: int | None,
 ) -> str:
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" '
         f'viewBox="0 0 {_CANVAS} {_CANVAS}" width="{_CANVAS}" height="{_CANVAS}">',
-        f'<rect width="{_CANVAS}" height="{_CANVAS}" fill="{_COLOR_BG}"/>',
+        f'<rect width="{_CANVAS}" height="{_CANVAS}" fill="{_C_BG}"/>',
     ]
 
-    if not map_data:
+    zones = (btmap or {}).get("zones", [])
+    # Only zones that have boundary points
+    drawable = [z for z in zones if z.get("points") and len(z["points"]) >= 2]
+
+    if not drawable and not charging_loc:
         parts += _placeholder()
         parts.append("</svg>")
         return "\n".join(parts)
 
-    # ── Collect all geometry points ──────────────────────────────────────────
+    # ── Compute bounding box ─────────────────────────────────────────────
     all_pts: list[tuple[float, float]] = []
-
-    boundary = _get_boundary(map_data)
-    zones    = _get_zones(map_data)
-    obstacles = _get_obstacles(map_data)
-    robot_path = _get_path(map_data)
-
-    for pts in [boundary, *[_zone_pts(z) for z in zones], *obstacles]:
-        all_pts.extend(pts)
-    if robot_pos:
-        pt = _to_point(robot_pos)
-        if pt:
-            all_pts.append(pt)
+    for z in drawable:
+        all_pts.extend(z["points"])
+    if charging_loc:
+        all_pts.append((charging_loc.get("x", 0), charging_loc.get("y", 0)))
 
     if not all_pts:
         parts += _placeholder()
         parts.append("</svg>")
         return "\n".join(parts)
 
-    # ── Transform: fit all points into canvas ────────────────────────────────
     min_x = min(p[0] for p in all_pts)
     max_x = max(p[0] for p in all_pts)
     min_y = min(p[1] for p in all_pts)
@@ -210,134 +181,125 @@ def render_svg(
     h = max_y - min_y or 1
     scale = (_CANVAS - _PADDING * 2) / max(w, h)
 
-    def tx(x: float) -> str:
-        return f"{(x - min_x) * scale + _PADDING:.1f}"
+    def tx(x: float) -> str: return f"{(x - min_x) * scale + _PADDING:.1f}"
+    def ty(y: float) -> str: return f"{(y - min_y) * scale + _PADDING:.1f}"
+    def poly(pts: list) -> str: return " ".join(f"{tx(x)},{ty(y)}" for x, y in pts)
 
-    def ty(y: float) -> str:
-        return f"{(y - min_y) * scale + _PADDING:.1f}"
-
-    def poly(pts: list[tuple[float, float]]) -> str:
-        return " ".join(f"{tx(x)},{ty(y)}" for x, y in pts)
-
-    # ── Draw lawn fill (boundary) ─────────────────────────────────────────────
-    if len(boundary) >= 3:
+    # ── Background lawn fill using all zone points as convex hull approx ─
+    if len(all_pts) >= 3:
+        # Sort by angle from centroid for a rough convex outline
+        cx = sum(p[0] for p in all_pts) / len(all_pts)
+        cy = sum(p[1] for p in all_pts) / len(all_pts)
+        hull = sorted(all_pts, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
         parts.append(
-            f'<polygon points="{poly(boundary)}" '
-            f'fill="{_COLOR_LAWN}" stroke="{_COLOR_BOUNDARY}" '
-            f'stroke-width="2"/>'
+            f'<polygon points="{poly(hull)}" '
+            f'fill="{_C_LAWN}" stroke="{_C_BOUNDARY}" stroke-width="1.5" stroke-dasharray="4 2"/>'
         )
 
-    # ── Draw robot path ───────────────────────────────────────────────────────
-    path_pts = robot_path[-300:]
-    if len(path_pts) >= 2:
-        d_attr = " ".join(
-            f"{'M' if i == 0 else 'L'}{tx(p[0])},{ty(p[1])}"
-            for i, p in enumerate(path_pts)
-        )
-        parts.append(
-            f'<path d="{d_attr}" fill="none" stroke="{_COLOR_PATH}" '
-            f'stroke-width="1.5" stroke-opacity="0.5" stroke-dasharray="3 2"/>'
-        )
+    # ── Draw zones ───────────────────────────────────────────────────────
+    zone_alphas = ["99", "aa", "bb", "99", "88", "aa"]
+    for i, zone in enumerate(drawable):
+        pts = zone["points"]
+        z_id = zone.get("hashId", "")
+        name = zone.get("name", "")
+        is_charging_area = name == "charging_area"
+        is_active = z_id in active_zone_ids
 
-    # ── Draw obstacles ────────────────────────────────────────────────────────
-    for obs_pts in obstacles:
-        if len(obs_pts) >= 2:
-            parts.append(
-                f'<polygon points="{poly(obs_pts)}" '
-                f'fill="{_COLOR_OBSTACLE}" fill-opacity="0.35" '
-                f'stroke="{_COLOR_OBSTACLE}" stroke-width="1"/>'
-            )
-
-    # ── Draw zones ────────────────────────────────────────────────────────────
-    zone_alphas = ["88", "aa", "cc", "bb", "99", "77"]
-    for i, zone in enumerate(zones):
-        z_pts = _zone_pts(zone)
-        if len(z_pts) < 3:
-            continue
-        z_id   = _zone_id(zone)
-        is_active  = z_id == active_zone_id
-        is_queued  = z_id in queued_zone_ids
-        alpha  = "dd" if is_active else ("aa" if is_queued else zone_alphas[i % len(zone_alphas)])
-        color  = _COLOR_ZONE_ACTIVE if (is_active or is_queued) else _COLOR_ZONE_IDLE
-        stroke_w = "2.5" if is_active else "1.5"
-
-        cx = sum(p[0] for p in z_pts) / len(z_pts)
-        cy = sum(p[1] for p in z_pts) / len(z_pts)
-        z_name = zone.get("name") or zone.get("zoneName") or z_id or str(i + 1)
+        if is_charging_area:
+            color = _C_CHARGING
+            alpha = "66"
+            stroke_w = "1"
+        elif is_active:
+            color = _C_ZONE_ACTIVE
+            alpha = "cc"
+            stroke_w = "2.5"
+        else:
+            color = _C_ZONE_IDLE
+            alpha = zone_alphas[i % len(zone_alphas)]
+            stroke_w = "1.5"
 
         parts.append(
-            f'<polygon points="{poly(z_pts)}" '
+            f'<polygon points="{poly(pts)}" '
             f'fill="{color}{alpha}" stroke="{color}" stroke-width="{stroke_w}"/>'
         )
+
+        # Label — zone name or short hash
+        if len(pts) >= 2:
+            lcx = sum(p[0] for p in pts) / len(pts)
+            lcy = sum(p[1] for p in pts) / len(pts)
+            label = name if name and name != "charging_area" else (z_id[:6] if z_id else "")
+            if label:
+                parts.append(
+                    f'<text x="{tx(lcx)}" y="{ty(lcy)}" text-anchor="middle" '
+                    f'dominant-baseline="middle" font-size="10" '
+                    f'font-family="sans-serif" fill="{_C_TEXT}" '
+                    f'fill-opacity="0.8">{label}</text>'
+                )
+
+    # ── Draw charging dock ───────────────────────────────────────────────
+    if charging_loc:
+        dx = float(tx(charging_loc.get("x", 0)))
+        dy = float(ty(charging_loc.get("y", 0)))
+        hdg = charging_loc.get("heading", 0)
+        # Dock circle
         parts.append(
-            f'<text x="{tx(cx)}" y="{ty(cy)}" text-anchor="middle" '
-            f'dominant-baseline="middle" font-size="11" '
-            f'font-family="sans-serif" fill="white" font-weight="bold">'
-            f'{z_name}</text>'
+            f'<circle cx="{dx:.1f}" cy="{dy:.1f}" r="10" '
+            f'fill="{_C_DOCK}" fill-opacity="0.9" stroke="white" stroke-width="2"/>'
         )
-
-    # ── Draw robot ────────────────────────────────────────────────────────────
-    if robot_pos:
-        rpt = _to_point(robot_pos)
-        if rpt:
-            rx, ry = float(tx(rpt[0])), float(ty(rpt[1]))
-            heading = 0
-            if isinstance(robot_pos, dict):
-                heading = robot_pos.get("heading") or robot_pos.get("angle") or 0
-
-            # Glow
+        # Lightning bolt ⚡ symbol
+        parts.append(
+            f'<text x="{dx:.1f}" y="{dy:.1f}" text-anchor="middle" '
+            f'dominant-baseline="middle" font-size="11" font-family="sans-serif">⚡</text>'
+        )
+        # Direction tick
+        if hdg:
+            ang = math.radians(hdg)
+            ax = dx + 15 * math.sin(ang)
+            ay = dy - 15 * math.cos(ang)
             parts.append(
-                f'<circle cx="{rx:.1f}" cy="{ry:.1f}" r="14" '
-                f'fill="{_COLOR_ROBOT}" fill-opacity="0.25"/>'
-            )
-            # Body
-            parts.append(
-                f'<circle cx="{rx:.1f}" cy="{ry:.1f}" r="9" '
-                f'fill="{_COLOR_ROBOT}" stroke="white" stroke-width="2"/>'
-            )
-            # Direction arrow
-            ang = math.radians(heading)
-            ax = rx + 13 * math.sin(ang)
-            ay = ry - 13 * math.cos(ang)
-            parts.append(
-                f'<line x1="{rx:.1f}" y1="{ry:.1f}" '
-                f'x2="{ax:.1f}" y2="{ay:.1f}" '
-                f'stroke="white" stroke-width="2.5" '
-                f'stroke-linecap="round"/>'
+                f'<line x1="{dx:.1f}" y1="{dy:.1f}" x2="{ax:.1f}" y2="{ay:.1f}" '
+                f'stroke="{_C_DOCK}" stroke-width="2" stroke-dasharray="3 2"/>'
             )
 
-    # ── HUD: status badge ─────────────────────────────────────────────────────
-    status_color = _COLOR_STATUS_BG.get(work_status, "#374151")
-    status_label = _STATUS_LABELS.get(work_status, "?")
+    # ── HUD: status badge ─────────────────────────────────────────────────
+    sc = _STATUS_COLOR.get(work_status, "#374151")
+    sl = _STATUS_LABEL.get(work_status, "?")
     parts += [
-        f'<rect x="6" y="6" width="90" height="22" rx="5" fill="{status_color}" fill-opacity="0.92"/>',
+        f'<rect x="6" y="6" width="90" height="22" rx="5" fill="{sc}" fill-opacity="0.92"/>',
         f'<text x="51" y="20" text-anchor="middle" dominant-baseline="middle" '
-        f'font-size="11" font-family="sans-serif" fill="white" '
-        f'font-weight="bold">{status_label}</text>',
+        f'font-size="11" font-family="sans-serif" fill="white" font-weight="bold">{sl}</text>',
     ]
 
-    # ── HUD: battery ─────────────────────────────────────────────────────────
+    # ── HUD: battery ─────────────────────────────────────────────────────
     if battery is not None:
-        bat_color = "#4ade80" if battery > 30 else ("#facc15" if battery > 15 else "#f87171")
+        bc = "#4ade80" if battery > 30 else ("#facc15" if battery > 15 else "#f87171")
         parts += [
-            f'<rect x="104" y="6" width="52" height="22" rx="5" '
-            f'fill="#1f2937" fill-opacity="0.9"/>',
-            f'<text x="130" y="20" text-anchor="middle" dominant-baseline="middle" '
-            f'font-size="11" font-family="sans-serif" fill="{bat_color}" '
-            f'font-weight="bold">🔋{battery}%</text>',
+            f'<rect x="104" y="6" width="58" height="22" rx="5" fill="#1f2937" fill-opacity="0.9"/>',
+            f'<text x="133" y="20" text-anchor="middle" dominant-baseline="middle" '
+            f'font-size="11" font-family="sans-serif" fill="{bc}" font-weight="bold">'
+            f'🔋{battery}%</text>',
         ]
 
-    # ── HUD: RTK badge ────────────────────────────────────────────────────────
+    # ── HUD: RTK ─────────────────────────────────────────────────────────
     if rtk_status is not None:
-        rtk_labels = {0: "RTK ✗", 1: "RTK ~", 2: "RTK ✓"}
-        rtk_colors = {0: "#dc2626", 1: "#d97706", 2: "#16a34a"}
+        rl = {0: "RTK ✗", 1: "RTK ~", 2: "RTK ✓", 3: "RTK ✓"}
+        rc = {0: "#dc2626", 1: "#d97706", 2: "#16a34a", 3: "#16a34a"}
         parts += [
-            f'<rect x="164" y="6" width="52" height="22" rx="5" '
-            f'fill="{rtk_colors.get(rtk_status, "#374151")}" fill-opacity="0.9"/>',
-            f'<text x="190" y="20" text-anchor="middle" dominant-baseline="middle" '
-            f'font-size="11" font-family="sans-serif" fill="white" '
-            f'font-weight="bold">{rtk_labels.get(rtk_status, "RTK ?")}</text>',
+            f'<rect x="170" y="6" width="54" height="22" rx="5" '
+            f'fill="{rc.get(rtk_status, "#374151")}" fill-opacity="0.9"/>',
+            f'<text x="197" y="20" text-anchor="middle" dominant-baseline="middle" '
+            f'font-size="11" font-family="sans-serif" fill="white" font-weight="bold">'
+            f'{rl.get(rtk_status, "RTK ?")}</text>',
         ]
+
+    # ── Zone count label ──────────────────────────────────────────────────
+    zcount = (btmap or {}).get("zone_count")
+    if zcount:
+        parts.append(
+            f'<text x="{_CANVAS - 6}" y="{_CANVAS - 8}" text-anchor="end" '
+            f'font-size="10" font-family="sans-serif" fill="#6b7280">'
+            f'{zcount} zones</text>'
+        )
 
     parts.append("</svg>")
     return "\n".join(parts)
@@ -345,105 +307,26 @@ def render_svg(
 
 def _placeholder() -> list[str]:
     return [
-        f'<text x="{_CANVAS // 2}" y="{_CANVAS // 2 - 10}" text-anchor="middle" '
+        f'<text x="{_CANVAS//2}" y="{_CANVAS//2 - 12}" text-anchor="middle" '
         f'font-size="15" font-family="sans-serif" fill="#4b5563">Map not available</text>',
-        f'<text x="{_CANVAS // 2}" y="{_CANVAS // 2 + 14}" text-anchor="middle" '
+        f'<text x="{_CANVAS//2}" y="{_CANVAS//2 + 12}" text-anchor="middle" '
         f'font-size="11" font-family="sans-serif" fill="#374151">'
-        f'Waiting for shadow data...</text>',
+        f'Waiting for MQTT map data (QUERY_MAP)...</text>',
     ]
 
 
-# ── Geometry extraction helpers ───────────────────────────────────────────────
-
-def _get_boundary(m: dict) -> list[tuple[float, float]]:
-    for key in ("boundary", "workArea", "outline", "perimeter", "area"):
-        if v := m.get(key):
-            return _extract_pts(v)
-    return []
-
-def _get_zones(m: dict) -> list[dict]:
-    for key in ("zones", "workZones", "cutZones", "zoneList"):
-        if v := m.get(key):
-            return v if isinstance(v, list) else []
-    return []
-
-def _zone_pts(z: dict) -> list[tuple[float, float]]:
-    for key in ("points", "vertices", "coordinates", "polygon", "outline"):
-        if v := z.get(key):
-            return _extract_pts(v)
-    return _extract_pts(z)
-
-def _zone_id(z: dict) -> str | None:
-    return z.get("id") or z.get("zoneId") or z.get("hashId") or z.get("zoneHashId")
-
-def _get_obstacles(m: dict) -> list[list[tuple[float, float]]]:
-    obs = m.get("obstacles") or m.get("noGoZones") or m.get("nogoZones") or []
-    if not isinstance(obs, list):
-        return []
-    result = []
-    for o in obs:
-        pts = _extract_pts(o.get("points") or o.get("vertices") or o) if isinstance(o, dict) else _extract_pts(o)
-        if pts:
-            result.append(pts)
-    return result
-
-def _get_path(m: dict) -> list[tuple[float, float]]:
-    for key in ("path", "track", "trajectory"):
-        if v := m.get(key):
-            return _extract_pts(v)
-    return []
-
-def _extract_pts(obj: Any) -> list[tuple[float, float]]:
-    if isinstance(obj, list):
-        result = []
-        for item in obj:
-            pt = _to_point(item)
-            if pt:
-                result.append(pt)
-        return result
-    if isinstance(obj, dict):
-        for key in ("points", "vertices", "coordinates", "coords"):
-            if v := obj.get(key):
-                return _extract_pts(v)
-    return []
-
-def _to_point(obj: Any) -> tuple[float, float] | None:
-    if isinstance(obj, (list, tuple)) and len(obj) >= 2:
-        try:
-            return (float(obj[0]), float(obj[1]))
-        except (TypeError, ValueError):
-            return None
-    if isinstance(obj, dict):
-        for kx, ky in [("x", "y"), ("lon", "lat"), ("longitude", "latitude"),
-                        ("lng", "lat"), ("e", "n")]:
-            if kx in obj and ky in obj:
-                try:
-                    return (float(obj[kx]), float(obj[ky]))
-                except (TypeError, ValueError):
-                    pass
-    return None
-
+# ── RTSP camera ────────────────────────────────────────────────
 
 class LymowRTSPCamera(LymowEntity, Camera):
-    """
-    Exposes the robot's live video camera stream.
+    """Exposes the robot RTSP stream URL via attributes.
 
-    The robot runs an RTSP server on port 10022. The URL is built dynamically
-    from the robot's current local IP address (fwVersion.ipAddress in the shadow).
-
-    HA cannot pull RTSP frames natively — this entity exposes the URL via the
-    'rtsp_url' attribute so external tools (go2rtc, VLC, ffmpeg) can consume it.
-
-    Recommended go2rtc config:
-      go2rtc:
-        streams:
-          lymow:
-            - "rtsp://{{ states('sensor.lymow_ip_address') }}:10022/h264ESVideoTest"
+    HA cannot pull RTSP natively — use go2rtc or a Generic Camera entity.
+    The rtsp_url attribute contains the full URL.
     """
 
-    _attr_name         = "Live Camera"
-    _attr_icon         = "mdi:cctv"
-    _attr_content_type = "image/jpeg"
+    _attr_name               = "Live Camera"
+    _attr_icon               = "mdi:cctv"
+    _attr_content_type       = "image/jpeg"
     _attr_supported_features = CameraEntityFeature(0)
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
@@ -452,7 +335,6 @@ class LymowRTSPCamera(LymowEntity, Camera):
 
     @property
     def available(self) -> bool:
-        # Only mark available when we know the robot's IP.
         return bool(_get_robot_ip(self.coordinator.data or {}))
 
     @property
@@ -469,8 +351,4 @@ class LymowRTSPCamera(LymowEntity, Camera):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """
-        HA cannot snapshot RTSP without go2rtc/ffmpeg configured externally.
-        Returns None — use the rtsp_url attribute to connect an external player.
-        """
         return None
