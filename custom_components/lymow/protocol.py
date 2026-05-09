@@ -57,6 +57,9 @@ def _enc_varint(value: int) -> bytes:
 def _enc_i32(field_no: int, value: int) -> bytes:
     return _enc_varint((field_no << 3) | 0) + _enc_varint(value)
 
+def _enc_bool(field_no: int, value: bool = True) -> bytes:
+    return _enc_i32(field_no, 1 if value else 0)
+
 def _enc_len(field_no: int, data: bytes) -> bytes:
     return _enc_varint((field_no << 3) | 2) + _enc_varint(len(data)) + data
 
@@ -120,6 +123,69 @@ def encode_query_rtk_l2() -> bytes:
     return encode_userctrl(USER_CTRL_QUERY_RTK_L2)
 
 
+def encode_debug_setting(
+    *,
+    upload_log: bool = False,
+    upload_version: bool = False,
+    query_wifi_config: bool = False,
+    upload_robot_config: bool = False,
+    upload_task_config: bool = False,
+    exec_cmd: str | None = None,
+) -> bytes:
+    """Encode PbInput.debugSetting.
+
+    PbInput.debugSetting = field 9. Known PbDebugSetting fields:
+      1  uploadLog
+      2  uploadVersion
+      5  queryWifiConfig
+      10 uploadRobotConfig
+      11 uploadTaskConfig
+      12 execCmd
+
+    The official app appears to use these debug flags to make the robot
+    publish PbDeviceProfile/PbWifiConfig-like data such as local IP, firmware,
+    MAC and serial number.
+    """
+    dbg = b""
+    if upload_log:
+        dbg += _enc_bool(1, True)
+    if upload_version:
+        dbg += _enc_bool(2, True)
+    if query_wifi_config:
+        dbg += _enc_bool(5, True)
+    if upload_robot_config:
+        dbg += _enc_bool(10, True)
+    if upload_task_config:
+        dbg += _enc_bool(11, True)
+    if exec_cmd:
+        dbg += _enc_len(12, exec_cmd.encode("utf-8"))
+
+    return _enc_i32(2, PB_VERSION_4_9) + _enc_len(9, dbg)
+
+
+def encode_query_device_profile() -> bytes:
+    """Ask the robot to upload firmware/device profile details."""
+    return encode_debug_setting(upload_version=True, upload_robot_config=True)
+
+
+def encode_query_wifi_config_debug() -> bytes:
+    """Ask the robot to upload WiFi config/status details."""
+    return encode_debug_setting(query_wifi_config=True)
+
+
+def encode_app_connect(client_uuid: str) -> bytes:
+    """Encode app-connect presence packet.
+
+    PbInput.appConnect = field 7, PbInput.uuid = field 27.
+    This mimics the official app announcing an active client session.
+    """
+    return (
+        _enc_i32(2, PB_VERSION_4_9)
+        + _enc_i32(7, 1)
+        + _enc_len(27, client_uuid.encode("utf-8"))
+    )
+
+
 def encode_start_zones(zone_hash_ids: list[str]) -> bytes:
     """Start mowing selected zones using PbInput.map.goZones."""
     pb = _enc_i32(2, PB_VERSION_4_9) + _enc_i32(5, USER_CTRL_CLEAN)
@@ -137,13 +203,24 @@ def encode_start_zones(zone_hash_ids: list[str]) -> bytes:
     return pb
 
 
-def build_initial_query_packets(query_index: int = 0) -> list[bytes]:
+def build_initial_query_packets(
+    query_index: int = 0,
+    client_uuid: str | None = None,
+) -> list[bytes]:
     """Queries to send after MQTT subscribe/reconnect.
 
-    This mimics the app behaviour enough to populate IP, firmware, net detail,
-    map/zones and RTK even when the official app is not open.
+    Includes the normal userCtrl queries plus appConnect/debugSetting packets.
+    The latter are important because firmware, local IP, MAC and SN may only
+    be published when the robot thinks an app client is connected.
     """
-    return [
+    packets: list[bytes] = []
+
+    if client_uuid:
+        packets.append(encode_app_connect(client_uuid))
+
+    packets.extend([
+        encode_query_device_profile(),
+        encode_query_wifi_config_debug(),
         encode_query_map(query_index),
         encode_query_path(query_index),
         encode_query_schedules(),
@@ -154,19 +231,28 @@ def build_initial_query_packets(query_index: int = 0) -> list[bytes]:
         encode_query_wifi_4g(),
         encode_query_rtk_l1(),
         encode_query_rtk_l2(),
-    ]
+    ])
+    return packets
 
 
-def build_refresh_query_packets() -> list[bytes]:
-    """Periodic lightweight refresh for data that otherwise appears only when the app is open."""
-    return [
+def build_refresh_query_packets(client_uuid: str | None = None) -> list[bytes]:
+    """Periodic refresh for app-only data such as local IP, firmware and signal info."""
+    packets: list[bytes] = []
+
+    if client_uuid:
+        packets.append(encode_app_connect(client_uuid))
+
+    packets.extend([
+        encode_query_device_profile(),
+        encode_query_wifi_config_debug(),
         encode_query_cleaning_info(),
         encode_query_net_detail(),
         encode_query_robot_config(),
         encode_query_wifi_4g(),
         encode_query_rtk_l1(),
         encode_query_rtk_l2(),
-    ]
+    ])
+    return packets
 
 
 # ── Envelope ───────────────────────────────────────────────────

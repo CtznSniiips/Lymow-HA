@@ -6,7 +6,7 @@ Commands are published to /pbinput as protobuf messages.
 Startup + periodic refresh:
   On connect:
     build_initial_query_packets() → map, path, schedules, cleaning info,
-                                      robot config, net detail, WiFi/4G, RTK L1/L2
+                                      appConnect, debug profile/WiFi, robot config, net detail, WiFi/4G, RTK L1/L2
 
   Every _REFRESH_INTERVAL (default 90s):
     build_refresh_query_packets()
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import timedelta
 from typing import Any
 
@@ -88,6 +89,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._region    = region
         self._email     = email
         self._password  = password
+        self._client_uuid = str(uuid.uuid4())
 
         self._state: dict[str, Any] = {}
         self.device_info_data: dict = {}
@@ -162,12 +164,12 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _fire_startup_queries(self) -> None:
         """Publish all startup queries. Also called after reconnect."""
-        for raw in build_initial_query_packets():
+        for raw in build_initial_query_packets(client_uuid=self._client_uuid):
             self._publish(raw)
 
     def _fire_refresh_queries(self) -> None:
         """Periodic refresh — keeps IP, signal, RTK and config up to date."""
-        for raw in build_refresh_query_packets():
+        for raw in build_refresh_query_packets(client_uuid=self._client_uuid):
             self._publish(raw)
 
     # ── Properties ──────────────────────────────────────────────
