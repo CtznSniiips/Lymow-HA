@@ -32,6 +32,7 @@ from .const import (
 )
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
+from .state_matrix import lookup as lookup_state_row
 
 FEATURES = (
     LawnMowerEntityFeature.START_MOWING
@@ -56,8 +57,41 @@ class LymowMower(LymowEntity, LawnMowerEntity):
     def __init__(self, coordinator: LymowCoordinator) -> None:
         super().__init__(coordinator, "mower")
 
+    def _state_row(self):
+        d = self.coordinator.data or {}
+        return lookup_state_row(
+            work_status=d.get("workStatus"),
+            robot_status=d.get("robotStatus"),
+            is_recharging=d.get("isRecharging"),
+        )
+
+    @property
+    def supported_features(self) -> LawnMowerEntityFeature:
+        row = self._state_row()
+        features = LawnMowerEntityFeature(0)
+        if row.start_mowing is not None:
+            features |= LawnMowerEntityFeature.START_MOWING
+        if row.pause is not None:
+            features |= LawnMowerEntityFeature.PAUSE
+        if row.dock is not None:
+            features |= LawnMowerEntityFeature.DOCK
+        return features or FEATURES
+
     @property
     def activity(self) -> LawnMowerActivity:
+        row = self._state_row()
+        if row.activity == "mowing":
+            return LawnMowerActivity.MOWING
+        if row.activity == "returning":
+            return LawnMowerActivity.RETURNING
+        if row.activity == "docked":
+            return LawnMowerActivity.DOCKED
+        if row.activity == "paused":
+            return LawnMowerActivity.PAUSED
+        if row.activity == "error":
+            return LawnMowerActivity.ERROR
+
+        # Fallback to the previous simple grouping for unknown combos.
         status = self.coordinator.work_status
         if status in MOWING_STATUSES:
             return LawnMowerActivity.MOWING
@@ -67,10 +101,6 @@ class LymowMower(LymowEntity, LawnMowerEntity):
             return LawnMowerActivity.DOCKED
         if status in PAUSED_STATUSES:
             return LawnMowerActivity.PAUSED
-        if status in ERROR_STATUSES:
-            return LawnMowerActivity.ERROR
-        if status == WORK_STATUS_OFFLINE:
-            return LawnMowerActivity.ERROR
         return LawnMowerActivity.ERROR
 
     @property
@@ -103,8 +133,14 @@ class LymowMower(LymowEntity, LawnMowerEntity):
         if errs := d.get(F_ERROR_CODES):
             attrs["error_codes"] = errs
 
-        # Work status as human label (for automation use)
+        # Work/action decision matrix debug.
+        row = self._state_row()
         attrs["work_status_code"] = self.coordinator.work_status
+        attrs["robot_status_code"] = d.get("robotStatus")
+        attrs["is_recharging"] = d.get("isRecharging")
+        attrs["state_matrix_note"] = row.note
+        if current_zone := d.get("currentZone"):
+            attrs["current_zone"] = current_zone
 
         return attrs
 

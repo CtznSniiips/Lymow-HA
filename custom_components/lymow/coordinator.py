@@ -55,6 +55,8 @@ from .protocol import (
     encode_start_zones,
     encode_userctrl,
 )
+from .state import derive_current_zone, robot_gps_from_state
+from .state_matrix import lookup as lookup_state_row
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -188,6 +190,54 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             or self.work_status not in (WORK_STATUS_OFFLINE, -1)
         )
 
+    @property
+    def state_dict(self) -> dict[str, Any]:
+        """Compatibility alias used by helper entities."""
+        return self._state
+
+    def _merge_state(self, new_state: dict[str, Any]) -> None:
+        """Merge MQTT/REST state without losing sticky subfields.
+
+        Many PbOutput messages are partial. Dict submessages are merged so a
+        packet carrying just one field does not wipe previously-known IP, map,
+        RTK or configuration details. btMap.enuBasePoint is kept sticky because
+        QUERY_PATH/QUERY_MAP can share the same branch.
+        """
+        for k, v in new_state.items():
+            if isinstance(v, dict) and isinstance(self._state.get(k), dict):
+                if k == "btMap":
+                    old = self._state[k]
+                    # Preserve ENU anchor and zone catalog when a partial path
+                    # response arrives without the full map payload.
+                    if "enuBasePoint" in old and "enuBasePoint" not in v:
+                        v = {**v, "enuBasePoint": old["enuBasePoint"]}
+                    if old.get("zones") and not v.get("zones"):
+                        v = {**v, "zones": old["zones"]}
+                    if old.get("zone_count") and not v.get("zone_count"):
+                        v = {**v, "zone_count": old["zone_count"]}
+                self._state[k].update(v)
+            else:
+                self._state[k] = v
+
+        btmap = self._state.get("btMap") or {}
+        if isinstance(btmap, dict) and isinstance(btmap.get("enuBasePoint"), dict):
+            self._state["enu_base_point"] = btmap["enuBasePoint"]
+
+    def _derive_state(self) -> None:
+        """Derive convenience fields used by HA entities."""
+        gps = robot_gps_from_state(self._state)
+        if gps is not None:
+            self._state["derivedLatitude"] = gps[0]
+            self._state["derivedLongitude"] = gps[1]
+            # Keep top-level aliases useful for sensors, but do not overwrite
+            # explicit robotLlaCoords if the firmware ever emits them.
+            self._state.setdefault("latitude", gps[0])
+            self._state.setdefault("longitude", gps[1])
+
+        zone = derive_current_zone(self._state)
+        if zone:
+            self._state["currentZone"] = zone
+
     # ── Inbound MQTT handlers ────────────────────────────────────
 
     def _handle_pboutput(self, raw_envelope: bytes) -> None:
@@ -199,12 +249,8 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("Empty pboutput decode for %s", self.thing_name)
             return
 
-        # Merge — never lose previously received data
-        for k, v in new_state.items():
-            if isinstance(v, dict) and isinstance(self._state.get(k), dict):
-                self._state[k].update(v)
-            else:
-                self._state[k] = v
+        self._merge_state(new_state)
+        self._derive_state()
 
         if (ws := new_state.get("workStatus")) is not None:
             self._prev_work_status = ws
@@ -293,8 +339,48 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.device_info_data = info
                 ds = info.get("deviceState") or info.get("device_state") or "offline"
                 self._rest_online = ds == "online"
-                if ip := info.get("ipAddress") or info.get("ip_address"):
-                    self._state["rest_ip_address"] = ip
+
+                rest_state: dict[str, Any] = {
+                    "deviceInfoRest": info,
+                    "deviceState": ds,
+                    "isOnline": self._rest_online,
+                }
+                for src, dst in [
+                    ("ipAddress", "ipAddress"),
+                    ("sn", "sn"),
+                    ("macAddress", "macAddress"),
+                    ("simId", "simId"),
+                    ("mcuVersion", "fwVersion"),
+                    ("mcuVersion", "appFwVersion"),
+                    ("softwareVersion", "mcuVersion"),
+                    ("softwareVersion", "softwareVersion"),
+                ]:
+                    if val := info.get(src):
+                        rest_state[dst] = val.strip() if isinstance(val, str) else val
+
+                loc = info.get("robotLocation")
+                if isinstance(loc, list) and len(loc) >= 2:
+                    rest_state["robotLocation"] = loc
+                    rest_state["latitude"] = loc[0]
+                    rest_state["longitude"] = loc[1]
+
+                self._merge_state(rest_state)
+
+                # Lightweight feature data: theft/find settings, notification switches.
+                try:
+                    features = await self.client.get_device_feature(self.thing_name)
+                    if features:
+                        self._merge_state({
+                            "deviceFeature": features,
+                            "theftDetectionSwitch": features.get("theftDetectionSwitch"),
+                            "findRobotSwitch": features.get("findRobotSwitch"),
+                            "mobileNotificationSwitch": features.get("mobileNotificationSwitch"),
+                            "theftLock": features.get("theftLock"),
+                        })
+                except Exception:
+                    _LOGGER.debug("Feature poll error for %s", self.thing_name, exc_info=True)
+
+                self._derive_state()
             else:
                 self._rest_online = False
         except Exception:
@@ -316,19 +402,30 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except asyncio.TimeoutError:
             return False
 
+    def _state_row(self):
+        return lookup_state_row(
+            work_status=self._state.get("workStatus"),
+            robot_status=self._state.get("robotStatus"),
+            is_recharging=self._state.get("isRecharging"),
+        )
+
     # ── Commands ─────────────────────────────────────────────────
 
     async def async_start_mow(self, zone_ids: list[str] | None = None) -> bool:
         await self.auth.ensure_valid(self._email, self._password)
-        raw = encode_start_zones(zone_ids) if zone_ids else encode_userctrl(USER_CTRL_CLEAN)
+        if zone_ids:
+            raw = encode_start_zones(zone_ids)
+        else:
+            row = self._state_row()
+            raw = encode_userctrl(row.start_mowing or USER_CTRL_CLEAN)
         ok  = self._publish(raw)
         await self._wait_state_update()
         return ok
 
     async def async_pause(self) -> bool:
         await self.auth.ensure_valid(self._email, self._password)
-        ws   = self.work_status
-        ctrl = USER_CTRL_PAUSE_DOCK if ws in (WORK_STATUS_DOCKING, WORK_STATUS_PAUSE_DOCKING) else USER_CTRL_PAUSE
+        row = self._state_row()
+        ctrl = row.pause or (USER_CTRL_PAUSE_DOCK if self.work_status in (WORK_STATUS_DOCKING, WORK_STATUS_PAUSE_DOCKING) else USER_CTRL_PAUSE)
         ok   = self._publish(encode_userctrl(ctrl))
         await self._wait_state_update()
         return ok
@@ -342,7 +439,8 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_dock(self) -> bool:
         await self.auth.ensure_valid(self._email, self._password)
-        ok = self._publish(encode_userctrl(USER_CTRL_RECHARGE_DOCK))
+        row = self._state_row()
+        ok = self._publish(encode_userctrl(row.dock or USER_CTRL_RECHARGE_DOCK))
         await self._wait_state_update()
         return ok
 
@@ -382,7 +480,17 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_refresh_history(self, count: int = 10) -> list[dict]:
         try:
             await self.auth.ensure_valid(self._email, self._password)
-            self.history = await self.client.get_clean_history(self.thing_name, size=count)
+            data = await self.client.get_clean_history(self.thing_name, size=count)
+            if isinstance(data, dict):
+                self._merge_state({
+                    "cleanHistory": data.get("clean_history") or [],
+                    "cleanHistorySummary": data.get("clean_summary") or {},
+                    "cleanHistoryTotalRecords": data.get("total_records"),
+                })
+                self.history = data.get("clean_history") or []
+            else:
+                self.history = data or []
+            self.async_set_updated_data(self._state)
             return self.history
         except LymowError as err:
             _LOGGER.warning("History fetch failed: %s", err)

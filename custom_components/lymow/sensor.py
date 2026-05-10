@@ -93,21 +93,18 @@ def _net(key: str) -> Callable[[dict], Any]:
 def _rtk(key: str) -> Callable[[dict], Any]:
     return lambda d: (d.get("rtkDiagnosticL1") or {}).get(key)
 
-def _rtk2(key: str) -> Callable[[dict], Any]:
-    return lambda d: (d.get("rtkDiagnosticL2") or {}).get(key)
-
 def _robot_ip(d: dict) -> str | None:
     """Robot IP — top-level ipAddress, fallback netDetailInfo.wifiIp."""
     return d.get(F_IP_ADDRESS) or (d.get(F_NET_DETAIL) or {}).get("wifiIp")
 
-def _robot_lla(key: str) -> Callable[[dict], Any]:
-    return lambda d: (d.get("robotLlaCoords") or {}).get(key) or d.get(key)
+def _pose(key: str) -> Callable[[dict], Any]:
+    return lambda d: (d.get("pose") or d.get("robotLoc") or d.get("robotPosePib") or {}).get(key)
 
-def _robot_loc(key: str) -> Callable[[dict], Any]:
-    return lambda d: (d.get("robotLoc") or d.get("robotPosePib") or {}).get(key)
+def _enu(key: str) -> Callable[[dict], Any]:
+    return lambda d: (d.get("enu_base_point") or (d.get("btMap") or {}).get("enuBasePoint") or {}).get(key)
 
-def _enu_base(key: str) -> Callable[[dict], Any]:
-    return lambda d: ((d.get("btMap") or {}).get("enuBasePoint") or {}).get(key)
+def _history_summary(key: str) -> Callable[[dict], Any]:
+    return lambda d: (d.get("cleanHistorySummary") or {}).get(key)
 
 
 # ── Sensor definitions ────────────────────────────────────────
@@ -240,39 +237,6 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         value_source=_rtk("satelliteCount"),
         entity_registry_enabled_default=False,
     ),
-    LymowSensorDesc(
-        key="rtk_diff_age",
-        name="RTK Diff Age",
-        native_unit_of_measurement=UnitOfTime.SECONDS,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:satellite-uplink",
-        value_source=_rtk2("diffAge"),
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="rtk_lora_bps0",
-        name="RTK Lora BPS 0",
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:radio-tower",
-        value_source=_rtk2("loraBps0"),
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="rtk_lora_bps1",
-        name="RTK Lora BPS 1",
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:radio-tower",
-        value_source=_rtk2("loraBps1"),
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="rtk_lora_bps2",
-        name="RTK Lora BPS 2",
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:radio-tower",
-        value_source=_rtk2("loraBps2"),
-        entity_registry_enabled_default=False,
-    ),
 
     # ── Connectivity ──────────────────────────────────────────────────────
     LymowSensorDesc(
@@ -363,29 +327,20 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         entity_registry_enabled_default=False,
     ),
 
-    # ── Robot position ─────────────────────────────────────────────────────
+
+    # ── Position / Map frame ───────────────────────────────────────────────
     LymowSensorDesc(
-        key="robot_latitude",
-        name="Robot Latitude",
+        key="derived_latitude",
+        name="Derived Latitude",
         icon="mdi:latitude",
-        value_source=_robot_lla("latitude"),
+        value_source="derivedLatitude",
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
-        key="robot_longitude",
-        name="Robot Longitude",
+        key="derived_longitude",
+        name="Derived Longitude",
         icon="mdi:longitude",
-        value_source=_robot_lla("longitude"),
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="robot_altitude",
-        name="Robot Altitude",
-        native_unit_of_measurement=UnitOfLength.METERS,
-        device_class=SensorDeviceClass.DISTANCE,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:elevation-rise",
-        value_source=_robot_lla("altitude"),
+        value_source="derivedLongitude",
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
@@ -394,7 +349,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         native_unit_of_measurement=UnitOfLength.METERS,
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:axis-x-arrow",
-        value_source=_robot_loc("x"),
+        value_source=_pose("x"),
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
@@ -403,24 +358,67 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         native_unit_of_measurement=UnitOfLength.METERS,
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:axis-y-arrow",
-        value_source=_robot_loc("y"),
+        value_source=_pose("y"),
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
-        key="map_enu_base_latitude",
-        name="Map ENU Base Latitude",
-        icon="mdi:map-marker-radius",
-        value_source=_enu_base("latitude"),
+        key="robot_heading",
+        name="Robot Heading",
+        icon="mdi:compass",
+        value_source=lambda d: (d.get("pose") or d.get("robotLoc") or {}).get("heading")
+            or (d.get("pose") or d.get("robotLoc") or {}).get("theta"),
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
-        key="map_enu_base_longitude",
-        name="Map ENU Base Longitude",
+        key="current_zone",
+        name="Current Zone",
         icon="mdi:map-marker-radius",
-        value_source=_enu_base("longitude"),
+        value_source="currentZone",
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="enu_base_latitude",
+        name="RTK Base Latitude",
+        icon="mdi:satellite-uplink",
+        value_source=_enu("latitude"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="enu_base_longitude",
+        name="RTK Base Longitude",
+        icon="mdi:satellite-uplink",
+        value_source=_enu("longitude"),
         entity_registry_enabled_default=False,
     ),
 
+    # ── REST history / cloud summary ───────────────────────────────────────
+    LymowSensorDesc(
+        key="clean_history_records",
+        name="Clean History Records",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:history",
+        value_source="cleanHistoryTotalRecords",
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="total_clean_time",
+        name="Total Clean Time",
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:timer-outline",
+        value_source=_history_summary("total_clean_time"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="total_clean_area",
+        name="Total Clean Area",
+        native_unit_of_measurement=UnitOfArea.SQUARE_METERS,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:map-check",
+        value_source=_history_summary("total_clean_area"),
+        entity_registry_enabled_default=False,
+    ),
     # ── Network / Camera ──────────────────────────────────────────────────
     LymowSensorDesc(
         key="ip_address",

@@ -372,11 +372,18 @@ def _decode_point(fields: dict) -> dict[str, Any]:
 
 
 def _decode_pose(fields: dict) -> dict[str, Any]:
-    """Decode a pose-like message {x=1, y=2, heading=3}, all float32."""
+    """Decode PbPose {x=1, y=2, theta=3, z=4}, all float32.
+
+    For UI compatibility we expose both ``theta`` and ``heading``.
+    """
     out = _decode_point(fields)
-    heading = _gf(fields, 3)
-    if heading is not None:
-        out["heading"] = heading
+    theta = _gf(fields, 3)
+    z = _gf(fields, 4)
+    if theta is not None:
+        out["theta"] = theta
+        out["heading"] = theta
+    if z is not None:
+        out["z"] = z
     return out
 
 
@@ -467,6 +474,132 @@ def decode_btmap(raw: bytes) -> dict[str, Any]:
     return out
 
 
+def _decode_polygon(fields: dict) -> list[tuple[float, float]]:
+    pts: list[tuple[float, float]] = []
+    for kind, val in fields.get(1, []):
+        if kind != "L":
+            continue
+        pt = _wire_parse(val)
+        x = _gf(pt, 1)
+        y = _gf(pt, 2)
+        if x is not None and y is not None:
+            pts.append((round(x, 3), round(y, 3)))
+    return pts
+
+
+def _decode_zone_config(fields: dict) -> dict[str, Any]:
+    cfg: dict[str, Any] = {}
+    for fno, key in [
+        (1,"cutHeight"),(5,"brushSpeed"),(6,"cutSpeed"),(7,"cleanMode"),
+        (8,"cleanDir"),(9,"pathSpacing"),(10,"perimeterMowLaps"),
+        (11,"perimeterMowDir"),(12,"noGoMowLaps"),(13,"obsDecMode"),
+        (15,"startProgress"),(16,"relativeCleanDir"),(19,"followDetectMode"),
+    ]:
+        v = _gv(fields, fno)
+        if v is not None:
+            cfg[key] = v
+    for fno, key in [
+        (2,"raiseCutHeight"),(3,"lowerCutHeight"),(14,"pathOrder"),
+        (17,"lineFollowMode"),(18,"disableOuterDischarge"),
+    ]:
+        v = _gv(fields, fno)
+        if v is not None:
+            cfg[key] = bool(v)
+    f = _gf(fields, 4)
+    if f is not None:
+        cfg["moveSpeed"] = f
+    return cfg
+
+
+def decode_map_fields(map_data: dict) -> dict[str, Any]:
+    """Decode a direct PbMap message (PbOutput.map field 11)."""
+    zones: list[dict[str, Any]] = []
+    channels: list[dict[str, Any]] = []
+    out: dict[str, Any] = {}
+
+    enu = _sub(map_data, 7)
+    if enu:
+        ebp = _decode_lla(enu)
+        if ebp:
+            out["enuBasePoint"] = ebp
+
+    dock = _sub(map_data, 4)
+    if dock:
+        dp = _decode_pose(dock)
+        if dp:
+            out["chargingStationLoc"] = dp
+
+    for kind, zval in map_data.get(1, []):
+        if kind != "L":
+            continue
+        z = _wire_parse(zval)
+        basic = _sub(z, 1)
+        zone: dict[str, Any] = {}
+        if basic:
+            if (v := _gv(basic, 1)) is not None:
+                zone["zoneType"] = v
+            if (name := _gs(basic, 2)):
+                zone["name"] = name
+            if (hid := _gs(basic, 3)):
+                zone["hashId"] = hid
+            if (v := _gv(basic, 4)) is not None:
+                zone["isEnabled"] = bool(v)
+            poly = _sub(basic, 5)
+            if poly:
+                pts = _decode_polygon(poly)
+                if pts:
+                    zone["points"] = pts
+                    zone["area"] = round(_polygon_area(pts), 3)
+            if (rename := _gs(basic, 6)):
+                zone["zoneRename"] = rename
+            if (v := _gv(basic, 8)) is not None:
+                zone["mowOrder"] = v
+        zcfg = _sub(z, 2)
+        if zcfg:
+            cfg = _decode_zone_config(zcfg)
+            if cfg:
+                zone["zoneConfig"] = cfg
+        if zone:
+            zones.append(zone)
+
+    for kind, cval in map_data.get(3, []):
+        if kind != "L":
+            continue
+        chf = _wire_parse(cval)
+        ch: dict[str, Any] = {}
+        for fno, key in [(1,"hashId"),(2,"zone1"),(3,"zone2")]:
+            if (v := _gs(chf, fno)):
+                ch[key] = v
+        for fno, key in [(4,"isValid"),(6,"isDockingChannel")]:
+            if (v := _gv(chf, fno)) is not None:
+                ch[key] = bool(v)
+        poly = _sub(chf, 5)
+        if poly:
+            pts = _decode_polygon(poly)
+            if pts:
+                ch["points"] = pts
+        if ch:
+            channels.append(ch)
+
+    if zones:
+        out["zones"] = zones
+        out["zone_count"] = len(zones)
+    if channels:
+        out["channels"] = channels
+    return out
+
+
+def _polygon_area(pts: list[tuple[float, float]]) -> float:
+    if len(pts) < 3:
+        return 0.0
+    total = 0.0
+    for i in range(len(pts)):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % len(pts)]
+        total += x1 * y2 - x2 * y1
+    return abs(total) * 0.5
+
+
 # ── PbOutput decoder ───────────────────────────────────────────
 
 def decode_pboutput(raw: bytes) -> dict[str, Any]:
@@ -515,10 +648,11 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
              7 cleanMode → state["robotCleanMode"] + state["cleanMode"] (string)
              ... (full config in state["robotConfig"])
      18  outputCtrl        int32
+     14  PbPose pose      → live local robot pose {x,y,theta,z}
      23  PbBtMap           → state["btMap"] = decode_btmap(...)
      24  PbPose chargingStationLoc → state["chargingStationLoc"]
-     26  PbRobotLLACoords robotLlaCoords → latitude/longitude/altitude
-     31  PbPoint robotPosePib → local robot x/y on the mower map
+     26  PbRobotLLACoords robotLlaCoords → schema-supported lat/lon/alt; often absent
+     31  PbPoint robotPosePib → fallback local robot x/y on the mower map
      34  PbNetDetailInfo   → state["netDetailInfo"]
      35  PbRtkDiagnosticL1 → state["rtkDiagnosticL1"] + state["rtkStatus"]
      36  PbRtkDiagnosticL2 → state["rtkDiagnosticL2"]
@@ -564,6 +698,17 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
             s = _gs(dp, fno)
             if s: state[key] = s
 
+    # PbMap (field 11) — direct full map branch
+    direct_map = _sub(root, 11)
+    if direct_map:
+        mp = decode_map_fields(direct_map)
+        if mp:
+            state["btMap"] = {**state.get("btMap", {}), **mp}
+            if mp.get("enuBasePoint"):
+                state["enu_base_point"] = mp["enuBasePoint"]
+            if mp.get("chargingStationLoc"):
+                state["chargingStationLoc"] = mp["chargingStationLoc"]
+
     # PbCleanInfo (field 12)
     ci = _sub(root, 12)
     if ci:
@@ -586,32 +731,40 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
                     except: pass
             if zone_ids: state["cleanZoneIds"] = zone_ids
 
-    # PbRobotConfig (field 17)
+    # PbRobotConfig (field 17) — remote/control-level config, not zone config
     rc = _sub(root, 17)
     if rc:
         cfg: dict[str, Any] = {}
         for fno, key in [
-            (1,"cutHeight"),(5,"brushSpeed"),(6,"cutSpeed"),(7,"cleanMode"),
-            (8,"cleanDir"),(9,"pathSpacing"),(10,"perimeterMowLaps"),
-            (11,"perimeterMowDir"),(12,"noGoMowLaps"),(13,"obsDecMode"),
-            (15,"startProgress"),(16,"relativeCleanDir"),(19,"followDetectMode"),
+            (2,"rcCutSpeed"),(3,"rcCutHeight"),(6,"audioVolume"),(8,"signal"),
+            (12,"camLedStatus"),(13,"vehLedStatus"),(16,"resumeBat"),
+            (19,"scheduleId"),(20,"schedulePathOffset"),(21,"timezoneOffset"),
         ]:
             v = _gv(rc, fno)
-            if v is not None: cfg[key] = v
+            if v is not None: cfg[key] = _s32(v)
         for fno, key in [
-            (2,"raiseCutHeight"),(3,"lowerCutHeight"),(14,"pathOrder"),
-            (17,"lineFollowMode"),(18,"disableOuterDischarge"),
+            (4,"rcRaiseCutHeight"),(5,"rcLowerCutHeight"),(7,"isOpenLed"),
+            (10,"cmdCellularSwitch"),(11,"metric_4g"),(22,"dockOnError"),
         ]:
             v = _gv(rc, fno)
             if v is not None: cfg[key] = bool(v)
-        f = _gf(rc, 4)
-        if f is not None: cfg["moveSpeed"] = f
         if cfg:
             state["robotConfig"] = cfg
-            if "cutHeight" in cfg: state["cutHeight"] = cfg["cutHeight"]
-            if "cleanMode" in cfg:
-                state["robotCleanMode"] = cfg["cleanMode"]
-                state["cleanMode"]      = CLEAN_MODE_INT.get(cfg["cleanMode"], "NONE")
+            # Compatibility aliases used by existing number/sensor entities.
+            if "rcCutHeight" in cfg:
+                state["cutHeight"] = cfg["rcCutHeight"]
+            if "rcCutSpeed" in cfg:
+                state["cutSpeed"] = cfg["rcCutSpeed"]
+
+    # PbPose / live robot pose in local ENU/map coordinates (field 14)
+    # This is the most useful live position field. The official app and other
+    # integrations derive GPS from this local pose + btMap.enuBasePoint.
+    pose14 = _sub(root, 14)
+    if pose14:
+        robot_pose = _decode_pose(pose14)
+        if robot_pose:
+            state["pose"] = robot_pose
+            state["robotLoc"] = robot_pose
 
     # outputCtrl (field 18)
     v = _gv(root, 18)
@@ -621,8 +774,11 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
     for kind, btmap_val in root.get(23, []):
         if kind == "L":
             btmap = decode_btmap(btmap_val)
-            if btmap.get("zones") or btmap.get("zone_count"):
+            if btmap.get("zones") or btmap.get("zone_count") or btmap.get("enuBasePoint"):
                 state["btMap"] = btmap
+                # Convenience alias used by device_tracker/state helpers.
+                if btmap.get("enuBasePoint"):
+                    state["enu_base_point"] = btmap["enuBasePoint"]
             break
 
     # chargingStationLoc / PbPose (field 24) — local map coordinates
@@ -646,13 +802,15 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
             if "altitude" in robot_lla:
                 state["altitude"] = robot_lla["altitude"]
 
-    # PbPoint / robot position in local map coordinates (field 31)
+    # PbPoint / fallback robot position in local map coordinates (field 31)
     rp = _sub(root, 31)
     if rp:
-        robot_pose = _decode_point(rp)
-        if robot_pose:
-            state["robotPosePib"] = robot_pose
-            state["robotLoc"] = robot_pose
+        robot_pose_pib = _decode_point(rp)
+        if robot_pose_pib:
+            state["robotPosePib"] = robot_pose_pib
+            # Prefer field 14 pose when present because it also carries heading/theta.
+            if "robotLoc" not in state:
+                state["robotLoc"] = robot_pose_pib
 
     # PbNetDetailInfo (field 34)
     nd = _sub(root, 34)
@@ -736,7 +894,7 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
             if "rtkStatus" in loc_info:
                 state["rtkStatus"] = loc_info["rtkStatus"]
 
-    known_root = {1, 2, 3, 4, 5, 6, 9, 10, 12, 16, 17, 18, 22, 23, 24, 26, 31, 34, 35, 36}
+    known_root = {1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 14, 16, 17, 18, 22, 23, 24, 26, 31, 34, 35, 36}
     unknown = {k: v for k, v in root.items() if k not in known_root}
     if unknown:
         state["_unknown_root_fields"] = {

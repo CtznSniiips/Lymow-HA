@@ -101,6 +101,30 @@ BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
         value_fn=lambda d: bool(d.get("rainDelay") or d.get("rain_delay")),
         entity_registry_enabled_default=False,
     ),
+
+    LymowBinDesc(
+        key="theft_detection",
+        name="Theft Detection",
+        device_class=BinarySensorDeviceClass.SAFETY,
+        icon="mdi:shield-lock",
+        value_fn=lambda d: bool(d.get("theftDetectionSwitch")),
+        entity_registry_enabled_default=False,
+    ),
+    LymowBinDesc(
+        key="theft_lock",
+        name="Theft Lock",
+        device_class=BinarySensorDeviceClass.LOCK,
+        icon="mdi:lock-alert",
+        value_fn=lambda d: bool(d.get("theftLock")),
+        entity_registry_enabled_default=False,
+    ),
+    LymowBinDesc(
+        key="find_robot_enabled",
+        name="Find Robot Enabled",
+        icon="mdi:map-marker-question",
+        value_fn=lambda d: bool(d.get("findRobotSwitch")),
+        entity_registry_enabled_default=False,
+    ),
     LymowBinDesc(
         key="lifted",
         name="Lifted",

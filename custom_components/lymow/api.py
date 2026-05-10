@@ -361,21 +361,35 @@ class LymowClient:
         )
         return data or {}
 
-    async def get_clean_history(self, thing_name: str, page: int = 1, size: int = 10) -> list[dict]:
+    async def get_clean_history(self, thing_name: str, page: int = 1, size: int = 10) -> dict | list[dict]:
+        """Return raw clean-history payload.
+
+        The API can return a dict with clean_history, clean_summary,
+        total_records, page and has_more. Keep that structure instead of
+        flattening it, so Home Assistant can expose summary sensors.
+        """
         data = await self._api_get(
             "s3Api",
             f"/get-clean-history-collect?deviceThingName={thing_name}&page={page}&pageSize={size}",
         )
-        if isinstance(data, list):
+        if isinstance(data, (dict, list)):
             return data
-        if isinstance(data, dict):
-            for k in ("data", "items", "list"):
-                if isinstance(data.get(k), list):
-                    return data[k]
-        return []
+        return {}
 
     async def get_backup_map(self, thing_name: str) -> dict | None:
         return await self._api_get("s3Api", f"/get-backup-map?deviceThingName={thing_name}")
+
+    async def get_download_url(self, file_key: str) -> dict:
+        """Return a signed download URL for an S3 map/history file.
+
+        The official app uses s3Api /get-download-url for backup maps and
+        history assets. The most likely parameter name is ``key``; if the
+        backend rejects it, use ``get_download_url_debug`` from a PC script to
+        test aliases.
+        """
+        key = urllib.parse.quote(file_key, safe="")
+        data = await self._api_get("s3Api", f"/get-download-url?key={key}")
+        return data or {}
 
     async def check_update(self, thing_name: str) -> dict:
         data = await self._api_get("checkUpdateApi", f"/check-update?deviceThingName={thing_name}")

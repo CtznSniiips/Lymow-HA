@@ -1,7 +1,7 @@
 {
   "domain": "lymow",
   "name": "Lymow HA Integration",
-  "version": "2.0.8",
+  "version": "2.0.9",
   "config_flow": true,
   "documentation": "https://github.com/d3dfantasy99/Lymow-HA",
   "requirements": [
@@ -14,5 +14,5 @@
   ],
   "iot_class": "local_push",
   "single_config_entry": false,
-  "hacs": "2.0.8"
+  "hacs": "2.0.9"
 }

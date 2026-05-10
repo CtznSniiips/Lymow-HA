@@ -10,8 +10,6 @@ Map data source (MQTT / PbBtMap field 23):
     name    — human label (e.g. "charging_area")
     points  — simplified boundary [(x, y), ...] in local metres
   chargingStationLoc: {x, y, heading} — dock position in local metres
-  robotLoc / robotPosePib: {x, y} — robot position in local map metres
-  robotLlaCoords: {latitude, longitude, altitude} — real GPS/RTK position
 
 RTSP URL: rtsp://<ipAddress>:10022/h264ESVideoTest
 """
@@ -112,8 +110,8 @@ class LymowMapCamera(LymowEntity, Camera):
         svg = render_svg(
             btmap=d.get("btMap"),
             charging_loc=d.get("chargingStationLoc"),
-            robot_loc=d.get("robotLoc") or d.get("robotPosePib"),
             active_zone_ids=set(d.get(F_CLEAN_ZONE_IDS) or []),
+            robot_loc=d.get("pose") or d.get("robotLoc") or d.get("robotPosePib"),
             work_status=d.get("workStatus", WORK_STATUS_OFFLINE),
             rtk_status=d.get("rtkStatus"),
             battery=d.get("battery"),
@@ -136,12 +134,10 @@ class LymowMapCamera(LymowEntity, Camera):
             ]
         if ma := d.get("mapArea"):
             attrs["map_area_m2"] = ma
-        if robot_loc := d.get("robotLoc") or d.get("robotPosePib"):
-            attrs["robot_local_position"] = robot_loc
-        if robot_lla := d.get("robotLlaCoords"):
-            attrs["robot_gps_position"] = robot_lla
-        if enu := btmap.get("enuBasePoint"):
-            attrs["enu_base_point"] = enu
+        if pose := d.get("pose") or d.get("robotLoc") or d.get("robotPosePib"):
+            attrs["robot_local_position"] = pose
+        if ebp := (btmap.get("enuBasePoint") or d.get("enu_base_point")):
+            attrs["enu_base_point"] = ebp
         return attrs
 
 
@@ -150,8 +146,8 @@ class LymowMapCamera(LymowEntity, Camera):
 def render_svg(
     btmap: dict | None,
     charging_loc: dict | None,
-    robot_loc: dict | None,
     active_zone_ids: set[str],
+    robot_loc: dict | None,
     work_status: int,
     rtk_status: int | None,
     battery: int | None,
@@ -166,7 +162,7 @@ def render_svg(
     # Only zones that have boundary points
     drawable = [z for z in zones if z.get("points") and len(z["points"]) >= 2]
 
-    if not drawable and not charging_loc and not robot_loc:
+    if not drawable and not charging_loc:
         parts += _placeholder()
         parts.append("</svg>")
         return "\n".join(parts)
@@ -273,24 +269,24 @@ def render_svg(
                 f'stroke="{_C_DOCK}" stroke-width="2" stroke-dasharray="3 2"/>'
             )
 
-    # ── Draw robot position ────────────────────────────────────────────────
-    if robot_loc:
+
+    # ── Draw live robot position ──────────────────────────────────────────
+    if robot_loc and robot_loc.get("x") is not None and robot_loc.get("y") is not None:
         rx = float(tx(robot_loc.get("x", 0)))
         ry = float(ty(robot_loc.get("y", 0)))
-        hdg = robot_loc.get("heading")
-
+        heading = robot_loc.get("heading", robot_loc.get("theta", 0)) or 0
         parts.append(
             f'<circle cx="{rx:.1f}" cy="{ry:.1f}" r="9" '
-            f'fill="{_C_ROBOT}" fill-opacity="0.95" stroke="white" stroke-width="2"/>'
+            f'fill="{_C_ROBOT}" stroke="white" stroke-width="2"/>'
         )
         parts.append(
-            f'<text x="{rx:.1f}" y="{ry:.1f}" text-anchor="middle" '
+            f'<text x="{rx:.1f}" y="{ry + 1:.1f}" text-anchor="middle" '
             f'dominant-baseline="middle" font-size="10" font-family="sans-serif" '
-            f'fill="white" font-weight="bold">R</text>'
+            f'fill="white">●</text>'
         )
-
-        if hdg is not None:
-            ang = math.radians(float(hdg))
+        if heading:
+            # theta/heading is treated as radians when small, degrees otherwise.
+            ang = heading if abs(float(heading)) <= 6.2832 else math.radians(float(heading))
             ax = rx + 18 * math.sin(ang)
             ay = ry - 18 * math.cos(ang)
             parts.append(
