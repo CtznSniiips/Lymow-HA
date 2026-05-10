@@ -589,6 +589,19 @@ def decode_map_fields(map_data: dict) -> dict[str, Any]:
     return out
 
 
+
+
+def decode_pbmap(raw: bytes) -> dict[str, Any]:
+    """Decode a standalone PbMap file downloaded from S3 backup maps.
+
+    Backup map files such as ``device_xxx/map/map.pb`` are not PbOutput
+    envelopes and are not PbBtMap wrappers: they are direct PbMap messages.
+    """
+    if not raw:
+        return {}
+    return decode_map_fields(_wire_parse(raw))
+
+
 def _polygon_area(pts: list[tuple[float, float]]) -> float:
     if len(pts) < 3:
         return 0.0

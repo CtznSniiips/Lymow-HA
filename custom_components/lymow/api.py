@@ -34,6 +34,15 @@ from .const import API_ENDPOINTS, COGNITO_CONFIG
 
 _LOGGER = logging.getLogger(__name__)
 
+# Amplify Storage buckets extracted from the official Lymow app config.
+S3_BUCKETS: dict[str, str] = {
+    "eu-west-1": "lymow-user-data-eu-west-1",
+    "ap-southeast-2": "lymow-user-data-ap-southeast-2",
+    "us-east-2": "lymow-user-data-us-east-2",
+    "ap-east-1": "lymow-user-data-ap-east-1",
+}
+
+
 
 # ─────────────────────────────────────────────
 # SigV4 (used only for shadow config writes)
@@ -379,14 +388,50 @@ class LymowClient:
     async def get_backup_map(self, thing_name: str) -> dict | None:
         return await self._api_get("s3Api", f"/get-backup-map?deviceThingName={thing_name}")
 
-    async def get_download_url(self, file_key: str) -> dict:
-        """Return a signed download URL for an S3 map/history file.
+    async def download_s3_object(self, key: str) -> bytes | None:
+        """Download a private object from the official Amplify Storage bucket.
 
-        The official app uses s3Api /get-download-url for backup maps and
-        history assets. The most likely parameter name is ``key``; if the
-        backend rejects it, use ``get_download_url_debug`` from a PC script to
-        test aliases.
+        Backup map files returned by ``get_backup_map`` are S3 keys, for example
+        ``device_xxx/map/map.pb``. The official app downloads them with
+        Amplify Storage.getUrl(), using bucket ``lymow-user-data-<region>``.
+        This method performs the same GET with SigV4 headers and the Cognito
+        Identity temporary credentials already stored in ``CognitoAuth``.
         """
+        bucket = S3_BUCKETS.get(self._region)
+        if not bucket:
+            _LOGGER.warning("No Lymow S3 bucket configured for region %s", self._region)
+            return None
+        if not (self._auth.access_key_id and self._auth.secret_access_key and self._auth.session_token):
+            await self._auth.get_aws_credentials()
+
+        encoded_key = urllib.parse.quote(key, safe="/~")
+        url = f"https://{bucket}.s3.{self._region}.amazonaws.com/{encoded_key}"
+        hdrs = _sigv4_headers(
+            method="GET",
+            url=url,
+            payload=b"",
+            service="s3",
+            region=self._region,
+            access_key=self._auth.access_key_id,
+            secret_key=self._auth.secret_access_key,
+            session_token=self._auth.session_token,
+        )
+        try:
+            async with self._session.get(url, headers=hdrs) as r:
+                body = await r.read()
+                if r.status >= 400:
+                    _LOGGER.warning(
+                        "S3 download failed for %s/%s: %s %s",
+                        bucket, key, r.status, body[:500].decode("utf-8", errors="replace"),
+                    )
+                    return None
+                return body
+        except Exception as e:
+            _LOGGER.warning("S3 download error for %s: %s", key, e)
+            return None
+
+    async def get_download_url(self, file_key: str) -> dict:
+        """Legacy/debug endpoint. Not used for backup maps."""
         key = urllib.parse.quote(file_key, safe="")
         data = await self._api_get("s3Api", f"/get-download-url?key={key}")
         return data or {}

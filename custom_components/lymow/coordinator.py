@@ -52,6 +52,7 @@ from .protocol import (
     build_initial_query_packets,
     build_refresh_query_packets,
     decode_pboutput_envelope,
+    decode_pbmap,
     encode_start_zones,
     encode_userctrl,
 )
@@ -331,6 +332,77 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except Exception:
                 _LOGGER.exception("REST poll failed for %s", self.thing_name)
 
+    async def _load_backup_map(self) -> None:
+        """Load the latest/selected backup map from S3 and merge it into state.
+
+        get_backup_map returns S3 keys such as ``device_xxx/map/map.pb``.
+        The downloaded object is a standalone PbMap message, not a PbOutput and
+        not a PbBtMap wrapper. Loading it here gives the SVG camera zones, dock
+        position and enuBasePoint even when MQTT QUERY_MAP does not return the
+        full catalog.
+        """
+        try:
+            await self.auth.ensure_valid(self._email, self._password)
+            backup = await self.client.get_backup_map(self.thing_name)
+            map_list = (backup or {}).get("mapList") if isinstance(backup, dict) else None
+            if not isinstance(map_list, list) or not map_list:
+                self._merge_state({"backupMapList": [], "backupMapDownloadError": "empty_map_list"})
+                return
+
+            # Prefer the current map.pb, otherwise use the first returned backup.
+            selected = None
+            for item in map_list:
+                if isinstance(item, dict) and isinstance(item.get("map_file"), str) and item["map_file"].endswith("/map.pb"):
+                    selected = item
+                    break
+            if selected is None:
+                selected = next((i for i in map_list if isinstance(i, dict) and isinstance(i.get("map_file"), str)), None)
+            if not selected:
+                self._merge_state({"backupMapList": map_list, "backupMapDownloadError": "no_valid_map_file"})
+                return
+
+            map_file = selected["map_file"]
+            raw = await self.client.download_s3_object(map_file)
+            if not raw:
+                self._merge_state({
+                    "backupMapList": map_list,
+                    "loadedBackupMap": selected,
+                    "backupMapDownloadError": "download_failed",
+                })
+                return
+
+            decoded = decode_pbmap(raw)
+            if not decoded:
+                self._merge_state({
+                    "backupMapList": map_list,
+                    "loadedBackupMap": selected,
+                    "backupMapBytes": len(raw),
+                    "backupMapDownloadError": "decode_failed",
+                })
+                return
+
+            state_update: dict[str, Any] = {
+                "backupMapList": map_list,
+                "loadedBackupMap": selected,
+                "backupMapBytes": len(raw),
+                "backupMapDownloadError": None,
+                "btMap": decoded,
+            }
+            if decoded.get("enuBasePoint"):
+                state_update["enu_base_point"] = decoded["enuBasePoint"]
+            if decoded.get("chargingStationLoc"):
+                state_update["chargingStationLoc"] = decoded["chargingStationLoc"]
+            self._merge_state(state_update)
+            self._derive_state()
+            _LOGGER.info(
+                "Loaded Lymow backup map for %s: %s zones, %s bytes, key=%s",
+                self.thing_name, decoded.get("zone_count"), len(raw), map_file,
+            )
+            self.async_set_updated_data(self._state)
+        except Exception:
+            _LOGGER.debug("Backup map load failed for %s", self.thing_name, exc_info=True)
+            self._merge_state({"backupMapDownloadError": "exception"})
+
     async def _do_rest_poll(self) -> None:
         try:
             await self.auth.ensure_valid(self._email, self._password)
@@ -498,8 +570,8 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_refresh_map(self) -> dict | None:
         try:
-            await self.auth.ensure_valid(self._email, self._password)
-            return await self.client.get_backup_map(self.thing_name)
+            await self._load_backup_map()
+            return self._state.get("btMap")
         except LymowError as err:
             _LOGGER.warning("Map fetch failed: %s", err)
             return None
