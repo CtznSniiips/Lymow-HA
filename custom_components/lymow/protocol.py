@@ -141,10 +141,6 @@ def encode_debug_setting(
       10 uploadRobotConfig
       11 uploadTaskConfig
       12 execCmd
-
-    The official app appears to use these debug flags to make the robot
-    publish PbDeviceProfile/PbWifiConfig-like data such as local IP, firmware,
-    MAC and serial number.
     """
     dbg = b""
     if upload_log:
@@ -177,7 +173,6 @@ def encode_app_connect(client_uuid: str) -> bytes:
     """Encode app-connect presence packet.
 
     PbInput.appConnect = field 7, PbInput.uuid = field 27.
-    This mimics the official app announcing an active client session.
     """
     return (
         _enc_i32(2, PB_VERSION_4_9)
@@ -207,12 +202,7 @@ def build_initial_query_packets(
     query_index: int = 0,
     client_uuid: str | None = None,
 ) -> list[bytes]:
-    """Queries to send after MQTT subscribe/reconnect.
-
-    Includes the normal userCtrl queries plus appConnect/debugSetting packets.
-    The latter are important because firmware, local IP, MAC and SN may only
-    be published when the robot thinks an app client is connected.
-    """
+    """Queries to send after MQTT subscribe/reconnect."""
     packets: list[bytes] = []
 
     if client_uuid:
@@ -236,7 +226,7 @@ def build_initial_query_packets(
 
 
 def build_refresh_query_packets(client_uuid: str | None = None) -> list[bytes]:
-    """Periodic refresh for app-only data such as local IP, firmware and signal info."""
+    """Periodic refresh for app-only/profile/network data."""
     packets: list[bytes] = []
 
     if client_uuid:
@@ -357,51 +347,6 @@ def _packed_ints(fields: dict, fno: int) -> list[int]:
     return result
 
 
-# ── Small typed decoders ───────────────────────────────────────
-
-def _decode_point(fields: dict) -> dict[str, Any]:
-    """Decode PbPoint {x=1 float, y=2 float}."""
-    out: dict[str, Any] = {}
-    x = _gf(fields, 1)
-    y = _gf(fields, 2)
-    if x is not None:
-        out["x"] = x
-    if y is not None:
-        out["y"] = y
-    return out
-
-
-def _decode_pose(fields: dict) -> dict[str, Any]:
-    """Decode PbPose {x=1, y=2, theta=3, z=4}, all float32.
-
-    For UI compatibility we expose both ``theta`` and ``heading``.
-    """
-    out = _decode_point(fields)
-    theta = _gf(fields, 3)
-    z = _gf(fields, 4)
-    if theta is not None:
-        out["theta"] = theta
-        out["heading"] = theta
-    if z is not None:
-        out["z"] = z
-    return out
-
-
-def _decode_lla(fields: dict) -> dict[str, Any]:
-    """Decode PbRobotLLACoords {latitude=1, longitude=2, altitude=3}, all float32."""
-    out: dict[str, Any] = {}
-    lat = _gf(fields, 1)
-    lon = _gf(fields, 2)
-    alt = _gf(fields, 3)
-    if lat is not None:
-        out["latitude"] = lat
-    if lon is not None:
-        out["longitude"] = lon
-    if alt is not None:
-        out["altitude"] = alt
-    return out
-
-
 # ── PbBtMap decoder ────────────────────────────────────────────
 
 def decode_btmap(raw: bytes) -> dict[str, Any]:
@@ -415,20 +360,12 @@ def decode_btmap(raw: bytes) -> dict[str, Any]:
     """
     zones: list[dict] = []
     zone_count = 0
-    enu_base_point: dict[str, Any] | None = None
     root = _wire_parse(raw)
 
     for kind, map_val in root.get(2, []):
         if kind != "L":
             continue
         map_data = _wire_parse(map_val)
-
-        # PbMap.enuBasePoint = field 7 (real-world origin for local ENU metres)
-        enu = _sub(map_data, 7)
-        if enu:
-            decoded_enu = _decode_lla(enu)
-            if decoded_enu:
-                enu_base_point = decoded_enu
         for kind2, zc_val in map_data.get(3, []):
             if kind2 != "L":
                 continue
@@ -468,138 +405,81 @@ def decode_btmap(raw: bytes) -> dict[str, Any]:
                     zone["points"] = pts
                 zones.append(zone)
 
-    out: dict[str, Any] = {"zones": zones, "zone_count": zone_count or len(zones)}
-    if enu_base_point:
-        out["enuBasePoint"] = enu_base_point
+    return {"zones": zones, "zone_count": zone_count or len(zones)}
+
+
+
+
+# ── Standalone PbMap decoder for S3 backup maps ─────────────────
+
+def _field_debug(fields: dict, *, max_values: int = 4) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for fno, entries in sorted(fields.items()):
+        vals: list[Any] = []
+        for kind, val in entries[:max_values]:
+            if kind == "L":
+                vals.append({
+                    "wire": kind,
+                    "len": len(val),
+                    "first16": val[:16].hex(),
+                    "sub_fields": sorted(_wire_parse(val).keys()),
+                })
+            elif isinstance(val, (bytes, bytearray)):
+                vals.append({"wire": kind, "hex": val[:16].hex(), "len": len(val)})
+            else:
+                vals.append({"wire": kind, "value": val})
+        out[str(fno)] = vals
     return out
 
 
-def _decode_polygon(fields: dict) -> list[tuple[float, float]]:
+def _decode_point_dict(fields: dict) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    x = _gf(fields, 1)
+    y = _gf(fields, 2)
+    if x is not None:
+        out["x"] = x
+    if y is not None:
+        out["y"] = y
+    return out
+
+
+def _decode_pose_dict(fields: dict) -> dict[str, Any]:
+    out = _decode_point_dict(fields)
+    theta = _gf(fields, 3)
+    z = _gf(fields, 4)
+    if theta is not None:
+        out["theta"] = theta
+        out["heading"] = theta
+    if z is not None:
+        out["z"] = z
+    return out
+
+
+def _decode_lla_dict(fields: dict) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    lat = _gf(fields, 1)
+    lon = _gf(fields, 2)
+    alt = _gf(fields, 3)
+    if lat is not None:
+        out["latitude"] = lat
+    if lon is not None:
+        out["longitude"] = lon
+    if alt is not None:
+        out["altitude"] = alt
+    return out
+
+
+def _decode_polygon_points(fields: dict) -> list[tuple[float, float]]:
     pts: list[tuple[float, float]] = []
     for kind, val in fields.get(1, []):
         if kind != "L":
             continue
-        pt = _wire_parse(val)
-        x = _gf(pt, 1)
-        y = _gf(pt, 2)
+        pf = _wire_parse(val)
+        x = _gf(pf, 1)
+        y = _gf(pf, 2)
         if x is not None and y is not None:
             pts.append((round(x, 3), round(y, 3)))
     return pts
-
-
-def _decode_zone_config(fields: dict) -> dict[str, Any]:
-    cfg: dict[str, Any] = {}
-    for fno, key in [
-        (1,"cutHeight"),(5,"brushSpeed"),(6,"cutSpeed"),(7,"cleanMode"),
-        (8,"cleanDir"),(9,"pathSpacing"),(10,"perimeterMowLaps"),
-        (11,"perimeterMowDir"),(12,"noGoMowLaps"),(13,"obsDecMode"),
-        (15,"startProgress"),(16,"relativeCleanDir"),(19,"followDetectMode"),
-    ]:
-        v = _gv(fields, fno)
-        if v is not None:
-            cfg[key] = v
-    for fno, key in [
-        (2,"raiseCutHeight"),(3,"lowerCutHeight"),(14,"pathOrder"),
-        (17,"lineFollowMode"),(18,"disableOuterDischarge"),
-    ]:
-        v = _gv(fields, fno)
-        if v is not None:
-            cfg[key] = bool(v)
-    f = _gf(fields, 4)
-    if f is not None:
-        cfg["moveSpeed"] = f
-    return cfg
-
-
-def decode_map_fields(map_data: dict) -> dict[str, Any]:
-    """Decode a direct PbMap message (PbOutput.map field 11)."""
-    zones: list[dict[str, Any]] = []
-    channels: list[dict[str, Any]] = []
-    out: dict[str, Any] = {}
-
-    enu = _sub(map_data, 7)
-    if enu:
-        ebp = _decode_lla(enu)
-        if ebp:
-            out["enuBasePoint"] = ebp
-
-    dock = _sub(map_data, 4)
-    if dock:
-        dp = _decode_pose(dock)
-        if dp:
-            out["chargingStationLoc"] = dp
-
-    for kind, zval in map_data.get(1, []):
-        if kind != "L":
-            continue
-        z = _wire_parse(zval)
-        basic = _sub(z, 1)
-        zone: dict[str, Any] = {}
-        if basic:
-            if (v := _gv(basic, 1)) is not None:
-                zone["zoneType"] = v
-            if (name := _gs(basic, 2)):
-                zone["name"] = name
-            if (hid := _gs(basic, 3)):
-                zone["hashId"] = hid
-            if (v := _gv(basic, 4)) is not None:
-                zone["isEnabled"] = bool(v)
-            poly = _sub(basic, 5)
-            if poly:
-                pts = _decode_polygon(poly)
-                if pts:
-                    zone["points"] = pts
-                    zone["area"] = round(_polygon_area(pts), 3)
-            if (rename := _gs(basic, 6)):
-                zone["zoneRename"] = rename
-            if (v := _gv(basic, 8)) is not None:
-                zone["mowOrder"] = v
-        zcfg = _sub(z, 2)
-        if zcfg:
-            cfg = _decode_zone_config(zcfg)
-            if cfg:
-                zone["zoneConfig"] = cfg
-        if zone:
-            zones.append(zone)
-
-    for kind, cval in map_data.get(3, []):
-        if kind != "L":
-            continue
-        chf = _wire_parse(cval)
-        ch: dict[str, Any] = {}
-        for fno, key in [(1,"hashId"),(2,"zone1"),(3,"zone2")]:
-            if (v := _gs(chf, fno)):
-                ch[key] = v
-        for fno, key in [(4,"isValid"),(6,"isDockingChannel")]:
-            if (v := _gv(chf, fno)) is not None:
-                ch[key] = bool(v)
-        poly = _sub(chf, 5)
-        if poly:
-            pts = _decode_polygon(poly)
-            if pts:
-                ch["points"] = pts
-        if ch:
-            channels.append(ch)
-
-    if zones:
-        out["zones"] = zones
-        out["zone_count"] = len(zones)
-    if channels:
-        out["channels"] = channels
-    return out
-
-
-
-
-def decode_pbmap(raw: bytes) -> dict[str, Any]:
-    """Decode a standalone PbMap file downloaded from S3 backup maps.
-
-    Backup map files such as ``device_xxx/map/map.pb`` are not PbOutput
-    envelopes and are not PbBtMap wrappers: they are direct PbMap messages.
-    """
-    if not raw:
-        return {}
-    return decode_map_fields(_wire_parse(raw))
 
 
 def _polygon_area(pts: list[tuple[float, float]]) -> float:
@@ -612,6 +492,219 @@ def _polygon_area(pts: list[tuple[float, float]]) -> float:
         total += x1 * y2 - x2 * y1
     return abs(total) * 0.5
 
+
+def _decode_zone_config_fields(fields: dict) -> dict[str, Any]:
+    cfg: dict[str, Any] = {}
+    for fno, key in [
+        (1, "cutHeight"), (5, "brushSpeed"), (6, "cutSpeed"), (7, "cleanMode"),
+        (8, "cleanDir"), (9, "pathSpacing"), (10, "perimeterMowLaps"),
+        (11, "perimeterMowDir"), (12, "noGoMowLaps"), (13, "obsDecMode"),
+        (15, "startProgress"), (16, "relativeCleanDir"), (19, "followDetectMode"),
+    ]:
+        v = _gv(fields, fno)
+        if v is not None:
+            cfg[key] = v
+    for fno, key in [
+        (2, "raiseCutHeight"), (3, "lowerCutHeight"), (14, "pathOrder"),
+        (17, "lineFollowMode"), (18, "disableOuterDischarge"),
+    ]:
+        v = _gv(fields, fno)
+        if v is not None:
+            cfg[key] = bool(v)
+    f = _gf(fields, 4)
+    if f is not None:
+        cfg["moveSpeed"] = f
+    return cfg
+
+
+def _decode_pp_basic_info(fields: dict) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+
+    b00 = _sub(fields, 1)
+    if b00:
+        p = _decode_point_dict(b00)
+        if "x" in p and "y" in p:
+            out["bound_00"] = (p["x"], p["y"])
+
+    b11 = _sub(fields, 2)
+    if b11:
+        p = _decode_point_dict(b11)
+        if "x" in p and "y" in p:
+            out["bound_11"] = (p["x"], p["y"])
+
+    area = _gv(fields, 3)
+    if area is not None:
+        out["ppArea"] = area
+
+    cw = _gv(fields, 4)
+    if cw is not None:
+        out["isClockwise"] = bool(cw)
+
+    inner = _sub(fields, 5)
+    if inner:
+        p = _decode_point_dict(inner)
+        if "x" in p and "y" in p:
+            out["innerPoint"] = (p["x"], p["y"])
+
+    return out
+
+
+def _rectangle_from_bounds(b00: Any, b11: Any) -> list[tuple[float, float]]:
+    try:
+        x1, y1 = float(b00[0]), float(b00[1])
+        x2, y2 = float(b11[0]), float(b11[1])
+    except Exception:
+        return []
+
+    if x1 == x2 or y1 == y2:
+        return []
+
+    return [
+        (round(x1, 3), round(y1, 3)),
+        (round(x2, 3), round(y1, 3)),
+        (round(x2, 3), round(y2, 3)),
+        (round(x1, 3), round(y2, 3)),
+    ]
+
+
+def decode_map_fields(map_data: dict) -> dict[str, Any]:
+    """Decode a direct PbMap message from PbOutput.map or S3 map.pb."""
+    zones: list[dict[str, Any]] = []
+    channels: list[dict[str, Any]] = []
+    out: dict[str, Any] = {}
+
+    enu = _sub(map_data, 7)
+    if enu:
+        ebp = _decode_lla_dict(enu)
+        if ebp:
+            out["enuBasePoint"] = ebp
+
+    dock = _sub(map_data, 4)
+    if dock:
+        dp = _decode_pose_dict(dock)
+        if dp:
+            out["chargingStationLoc"] = dp
+
+    for kind, zval in map_data.get(1, []):
+        if kind != "L":
+            continue
+
+        z = _wire_parse(zval)
+        zone: dict[str, Any] = {}
+
+        basic = _sub(z, 1)
+        if basic:
+            if (v := _gv(basic, 1)) is not None:
+                zone["zoneType"] = v
+            if (name := _gs(basic, 2)):
+                zone["name"] = name
+            if (hid := _gs(basic, 3)):
+                zone["hashId"] = hid
+            if (v := _gv(basic, 4)) is not None:
+                zone["isEnabled"] = bool(v)
+
+            poly = _sub(basic, 5)
+            if poly:
+                pts = _decode_polygon_points(poly)
+                zone["polygon_debug"] = {
+                    "field_keys": sorted(poly.keys()),
+                    "point_entries": len(poly.get(1, [])),
+                }
+                if pts:
+                    zone["points"] = pts
+                    zone["points_count"] = len(pts)
+                    zone["points_source"] = "basicInfo.polygon"
+                    zone["area"] = round(_polygon_area(pts), 3)
+                else:
+                    zone["polygon_debug"]["fields"] = _field_debug(poly, max_values=2)
+            else:
+                zone["polygon_debug"] = {
+                    "missing": True,
+                    "basic_fields": sorted(basic.keys()),
+                }
+
+            if (rename := _gs(basic, 6)):
+                zone["zoneRename"] = rename
+                zone.setdefault("name", rename)
+
+            if (v := _gv(basic, 8)) is not None:
+                zone["mowOrder"] = v
+
+        zcfg = _sub(z, 2)
+        if zcfg:
+            cfg = _decode_zone_config_fields(zcfg)
+            if cfg:
+                zone["zoneConfig"] = cfg
+
+        pp = _sub(z, 3)
+        if pp:
+            pp_info = _decode_pp_basic_info(pp)
+            zone.update(pp_info)
+            if not zone.get("points") and pp_info.get("bound_00") and pp_info.get("bound_11"):
+                rect = _rectangle_from_bounds(pp_info["bound_00"], pp_info["bound_11"])
+                if rect:
+                    zone["points"] = rect
+                    zone["points_count"] = len(rect)
+                    zone["points_source"] = "ppBasicInfo.bounds_fallback"
+                    zone["area"] = round(_polygon_area(rect), 3)
+
+        if zone and "points_count" not in zone:
+            zone["points_count"] = len(zone.get("points") or [])
+            zone["points_source"] = zone.get("points_source")
+
+        if zone:
+            zones.append(zone)
+
+    for kind, cval in map_data.get(3, []):
+        if kind != "L":
+            continue
+
+        chf = _wire_parse(cval)
+        ch: dict[str, Any] = {}
+
+        for fno, key in [(1, "hashId"), (2, "zone1"), (3, "zone2")]:
+            if (v := _gs(chf, fno)):
+                ch[key] = v
+
+        for fno, key in [(4, "isValid"), (6, "isDockingChannel")]:
+            if (v := _gv(chf, fno)) is not None:
+                ch[key] = bool(v)
+
+        poly = _sub(chf, 5)
+        if poly:
+            pts = _decode_polygon_points(poly)
+            if pts:
+                ch["points"] = pts
+                ch["points_count"] = len(pts)
+
+        if ch:
+            channels.append(ch)
+
+    if zones:
+        out["zones"] = zones
+        out["zone_count"] = len(zones)
+        out["zones_with_points"] = sum(1 for z in zones if z.get("points"))
+        out["zones_with_polygon"] = sum(
+            1 for z in zones
+            if z.get("points_source") == "basicInfo.polygon"
+        )
+        out["zones_with_bounds_fallback"] = sum(
+            1 for z in zones
+            if z.get("points_source") == "ppBasicInfo.bounds_fallback"
+        )
+
+    if channels:
+        out["channels"] = channels
+        out["channels_with_points"] = sum(1 for c in channels if c.get("points"))
+
+    return out
+
+
+def decode_pbmap(raw: bytes) -> dict[str, Any]:
+    """Decode standalone PbMap file downloaded from S3 backup maps."""
+    if not raw:
+        return {}
+    return decode_map_fields(_wire_parse(raw))
 
 # ── PbOutput decoder ───────────────────────────────────────────
 
@@ -661,14 +754,10 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
              7 cleanMode → state["robotCleanMode"] + state["cleanMode"] (string)
              ... (full config in state["robotConfig"])
      18  outputCtrl        int32
-     14  PbPose pose      → live local robot pose {x,y,theta,z}
      23  PbBtMap           → state["btMap"] = decode_btmap(...)
      24  PbPose chargingStationLoc → state["chargingStationLoc"]
-     26  PbRobotLLACoords robotLlaCoords → schema-supported lat/lon/alt; often absent
-     31  PbPoint robotPosePib → fallback local robot x/y on the mower map
      34  PbNetDetailInfo   → state["netDetailInfo"]
      35  PbRtkDiagnosticL1 → state["rtkDiagnosticL1"] + state["rtkStatus"]
-     36  PbRtkDiagnosticL2 → state["rtkDiagnosticL2"]
     """
     state: dict[str, Any] = {}
     root = _wire_parse(raw)
@@ -744,86 +833,72 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
                     except: pass
             if zone_ids: state["cleanZoneIds"] = zone_ids
 
-    # PbRobotConfig (field 17) — remote/control-level config, not zone config
+    # PbRobotConfig (field 17)
     rc = _sub(root, 17)
     if rc:
         cfg: dict[str, Any] = {}
         for fno, key in [
-            (2,"rcCutSpeed"),(3,"rcCutHeight"),(6,"audioVolume"),(8,"signal"),
-            (12,"camLedStatus"),(13,"vehLedStatus"),(16,"resumeBat"),
-            (19,"scheduleId"),(20,"schedulePathOffset"),(21,"timezoneOffset"),
+            (1,"cutHeight"),(5,"brushSpeed"),(6,"cutSpeed"),(7,"cleanMode"),
+            (8,"cleanDir"),(9,"pathSpacing"),(10,"perimeterMowLaps"),
+            (11,"perimeterMowDir"),(12,"noGoMowLaps"),(13,"obsDecMode"),
+            (15,"startProgress"),(16,"relativeCleanDir"),(19,"followDetectMode"),
         ]:
             v = _gv(rc, fno)
-            if v is not None: cfg[key] = _s32(v)
+            if v is not None: cfg[key] = v
         for fno, key in [
-            (4,"rcRaiseCutHeight"),(5,"rcLowerCutHeight"),(7,"isOpenLed"),
-            (10,"cmdCellularSwitch"),(11,"metric_4g"),(22,"dockOnError"),
+            (2,"raiseCutHeight"),(3,"lowerCutHeight"),(14,"pathOrder"),
+            (17,"lineFollowMode"),(18,"disableOuterDischarge"),
         ]:
             v = _gv(rc, fno)
             if v is not None: cfg[key] = bool(v)
+        f = _gf(rc, 4)
+        if f is not None: cfg["moveSpeed"] = f
         if cfg:
             state["robotConfig"] = cfg
-            # Compatibility aliases used by existing number/sensor entities.
-            if "rcCutHeight" in cfg:
-                state["cutHeight"] = cfg["rcCutHeight"]
-            if "rcCutSpeed" in cfg:
-                state["cutSpeed"] = cfg["rcCutSpeed"]
-
-    # PbPose / live robot pose in local ENU/map coordinates (field 14)
-    # This is the most useful live position field. The official app and other
-    # integrations derive GPS from this local pose + btMap.enuBasePoint.
-    pose14 = _sub(root, 14)
-    if pose14:
-        robot_pose = _decode_pose(pose14)
-        if robot_pose:
-            state["pose"] = robot_pose
-            state["robotLoc"] = robot_pose
+            if "cutHeight" in cfg: state["cutHeight"] = cfg["cutHeight"]
+            if "cleanMode" in cfg:
+                state["robotCleanMode"] = cfg["cleanMode"]
+                state["cleanMode"]      = CLEAN_MODE_INT.get(cfg["cleanMode"], "NONE")
 
     # outputCtrl (field 18)
     v = _gv(root, 18)
     if v is not None: state["outputCtrl"] = v
 
     # PbBtMap (field 23)
+    #
+    # MQTT QUERY_MAP / QUERY_PATH replies can be summary-only and may not
+    # include polygon points. Do not let those packets overwrite a complete
+    # S3 map.pb already loaded into state.
     for kind, btmap_val in root.get(23, []):
         if kind == "L":
             btmap = decode_btmap(btmap_val)
-            if btmap.get("zones") or btmap.get("zone_count") or btmap.get("enuBasePoint"):
-                state["btMap"] = btmap
-                # Convenience alias used by device_tracker/state helpers.
+            if btmap:
+                zones = btmap.get("zones") or []
+                zones_with_points = sum(1 for z in zones if z.get("points"))
+
+                if zones and zones_with_points == 0:
+                    state["btMapSummary"] = btmap
+                    safe_btmap: dict[str, Any] = {}
+                    for k in ("zone_count", "enuBasePoint"):
+                        if k in btmap:
+                            safe_btmap[k] = btmap[k]
+                    if safe_btmap:
+                        state["btMap"] = safe_btmap
+                else:
+                    state["btMap"] = btmap
+
                 if btmap.get("enuBasePoint"):
                     state["enu_base_point"] = btmap["enuBasePoint"]
             break
 
-    # chargingStationLoc / PbPose (field 24) — local map coordinates
+    # chargingStationLoc / PbPose (field 24)
     pose = _sub(root, 24)
     if pose:
-        dock = _decode_pose(pose)
-        if dock:
-            state["chargingStationLoc"] = dock
-
-    # PbRobotLLACoords / real GPS/RTK position (field 26)
-    lla = _sub(root, 26)
-    if lla:
-        robot_lla = _decode_lla(lla)
-        if robot_lla:
-            state["robotLlaCoords"] = robot_lla
-            # Home Assistant tracker-friendly aliases
-            if "latitude" in robot_lla:
-                state["latitude"] = robot_lla["latitude"]
-            if "longitude" in robot_lla:
-                state["longitude"] = robot_lla["longitude"]
-            if "altitude" in robot_lla:
-                state["altitude"] = robot_lla["altitude"]
-
-    # PbPoint / fallback robot position in local map coordinates (field 31)
-    rp = _sub(root, 31)
-    if rp:
-        robot_pose_pib = _decode_point(rp)
-        if robot_pose_pib:
-            state["robotPosePib"] = robot_pose_pib
-            # Prefer field 14 pose when present because it also carries heading/theta.
-            if "robotLoc" not in state:
-                state["robotLoc"] = robot_pose_pib
+        dock: dict[str, Any] = {}
+        for fno, key in [(1,"x"),(2,"y"),(3,"heading")]:
+            f = _gf(pose, fno)
+            if f is not None: dock[key] = f
+        if dock: state["chargingStationLoc"] = dock
 
     # PbNetDetailInfo (field 34)
     nd = _sub(root, 34)
@@ -837,12 +912,7 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
         for fno, key in [(2,"wifiName"),(3,"wifiIp"),(6,"simIp"),(10,"simIccid")]:
             s = _gs(nd, fno)
             if s: net[key] = s
-        if net:
-            state["netDetailInfo"] = net
-            if "wifiIp" in net and "ipAddress" not in state:
-                state["ipAddress"] = net["wifiIp"]
-            if "wifiName" in net and "wifiSsid" not in state:
-                state["wifiSsid"] = net["wifiName"]
+        if net: state["netDetailInfo"] = net
 
     # PbRtkDiagnosticL1 (field 35)
     rd = _sub(root, 35)
@@ -858,65 +928,19 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
             state["rtkDiagnosticL1"] = rtk
             if "rtkStatus" in rtk: state["rtkStatus"] = rtk["rtkStatus"]
 
-    # PbRtkDiagnosticL2 (field 36)
-    rd2 = _sub(root, 36)
-    if rd2:
-        rtk2: dict[str, Any] = {}
-        for fno, key in [
-            (2, "loraBps0"), (3, "loraBps1"), (4, "loraBps2"),
-            (8, "cwRatio0"), (9, "cwRatio1"), (10, "cwRatio2"),
-            (11, "antValue0"), (12, "antValue1"), (13, "antValue2"),
-        ]:
-            v = _gv(rd2, fno)
-            if v is not None:
-                rtk2[key] = _s32(v)
-        for fno, key in [
-            (1, "diffAge"), (5, "hwDc0"), (6, "hwDc1"), (7, "hwDc2"),
-        ]:
-            f = _gf(rd2, fno)
-            if f is not None:
-                rtk2[key] = f
-        if rtk2:
-            state["rtkDiagnosticL2"] = rtk2
-
-    # PbLocalizationInfo (field 6) — fallback RTK/location
+    # PbLocalizationInfo (field 6) — fallback RTK
     loc = _sub(root, 6)
     if loc and "rtkDiagnosticL1" not in state:
-        loc_info: dict[str, Any] = {}
-        v = _gv(loc, 1)
-        if v is not None:
-            loc_info["numSatellites"] = v
-            loc_info["satelliteCount"] = v
-        f = _gf(loc, 2)
-        if f is not None:
-            loc_info["horizontalAccuracy"] = f
-            loc_info["precision"] = f
-        f = _gf(loc, 3)
-        if f is not None:
-            loc_info["verticalAccuracy"] = f
-        v = _gv(loc, 4)
-        if v is not None:
-            loc_info["positionQuality"] = v
-            loc_info["rtkStatus"] = v
-        v = _gv(loc, 5)
-        if v is not None:
-            loc_info["locNodeStatus"] = v
-        if loc_info:
-            state["localizationInfo"] = loc_info
-            state["rtkDiagnosticL1"] = loc_info
-            if "rtkStatus" in loc_info:
-                state["rtkStatus"] = loc_info["rtkStatus"]
-
-    known_root = {1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 14, 16, 17, 18, 22, 23, 24, 26, 31, 34, 35, 36}
-    unknown = {k: v for k, v in root.items() if k not in known_root}
-    if unknown:
-        state["_unknown_root_fields"] = {
-            k: [
-                (kind, val.hex() if isinstance(val, (bytes, bytearray)) else val)
-                for kind, val in entries
-            ]
-            for k, entries in unknown.items()
-        }
+        rtk_loc: dict[str, Any] = {}
+        for fno, key in [(1,"satelliteCount"),(4,"rtkStatus"),(5,"baseStationStatus")]:
+            v = _gv(loc, fno)
+            if v is not None: rtk_loc[key] = v
+        for fno, key in [(2,"precision"),(3,"baseDataErrorRate")]:
+            f = _gf(loc, fno)
+            if f is not None: rtk_loc[key] = f
+        if rtk_loc:
+            state["rtkDiagnosticL1"] = rtk_loc
+            if "rtkStatus" in rtk_loc: state["rtkStatus"] = rtk_loc["rtkStatus"]
 
     return state
 

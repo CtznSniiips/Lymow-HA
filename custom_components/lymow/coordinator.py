@@ -114,10 +114,18 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ── Setup / teardown ────────────────────────────────────────
 
     async def async_setup(self) -> None:
-        """Authenticate, connect MQTT, fire startup queries."""
+        """Authenticate, load REST/S3 map fallback, connect MQTT, fire startup queries."""
         self._shutting_down = False
         await self.auth.ensure_valid(self._email, self._password)
+
+        # REST metadata first: device_info gives IP/firmware/location fallback.
         await self._do_rest_poll()
+
+        # Load S3 backup map before MQTT. This gives the SVG camera a full
+        # zone catalog even if MQTT QUERY_MAP only returns a summary without
+        # polygon points.
+        await self._load_backup_map()
+
         await self._connect_mqtt()
 
         self._rest_poll_task = self.hass.async_create_task(self._rest_poll_loop())
@@ -332,59 +340,182 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except Exception:
                 _LOGGER.exception("REST poll failed for %s", self.thing_name)
 
-    async def _load_backup_map(self) -> None:
-        """Load the latest/selected backup map from S3 and merge it into state.
+    def _backup_map_label(self, item: dict[str, Any]) -> str:
+        """Human-readable label for a backup map select option."""
+        name = (item.get("name") or "").strip()
+        map_file = item.get("map_file") or ""
+        filename = map_file.rsplit("/", 1)[-1] if map_file else "unknown"
+
+        # Keep labels unique/readable. Many backup names can be blank.
+        if name:
+            return f"{name} · {filename}"
+        return filename
+
+    def _backup_map_options(self) -> list[str]:
+        """Return labels for available backup maps."""
+        maps = self._state.get("backupMapList") or []
+        if not isinstance(maps, list):
+            return []
+        return [
+            self._backup_map_label(item)
+            for item in maps
+            if isinstance(item, dict) and isinstance(item.get("map_file"), str)
+        ]
+
+    def _backup_map_item_for_option(self, option: str) -> dict[str, Any] | None:
+        """Find backup map list item matching a select option label."""
+        maps = self._state.get("backupMapList") or []
+        if not isinstance(maps, list):
+            return None
+        for item in maps:
+            if isinstance(item, dict) and self._backup_map_label(item) == option:
+                return item
+        return None
+
+    @property
+    def backup_map_options(self) -> list[str]:
+        return self._backup_map_options()
+
+    @property
+    def current_backup_map_option(self) -> str | None:
+        loaded = self._state.get("loadedBackupMap")
+        if isinstance(loaded, dict):
+            return self._backup_map_label(loaded)
+        return None
+
+    async def async_select_backup_map(self, option: str) -> bool:
+        """Select and load a backup map from the HA select entity."""
+        item = self._backup_map_item_for_option(option)
+        if not item:
+            _LOGGER.warning("Unknown Lymow backup map option for %s: %s", self.thing_name, option)
+            return False
+        map_file = item.get("map_file")
+        if not isinstance(map_file, str):
+            return False
+        await self._load_backup_map(selected_map_file=map_file)
+        return self._state.get("backupMapDownloadError") is None
+
+    async def async_refresh_backup_maps(self) -> None:
+        """Refresh backup map list and keep current/default map loaded."""
+        await self._load_backup_map(selected_map_file=self._state.get("selectedBackupMapFile"))
+
+    async def _load_backup_map(self, selected_map_file: str | None = None) -> None:
+        """Load selected/default backup map from S3 and merge it into state.
 
         get_backup_map returns S3 keys such as ``device_xxx/map/map.pb``.
         The downloaded object is a standalone PbMap message, not a PbOutput and
-        not a PbBtMap wrapper. Loading it here gives the SVG camera zones, dock
-        position and enuBasePoint even when MQTT QUERY_MAP does not return the
-        full catalog.
+        not a PbBtMap wrapper.
+
+        If selected_map_file is None:
+          - keep previously selectedBackupMapFile if present;
+          - otherwise prefer current map.pb;
+          - otherwise first valid backup map.
         """
         try:
             await self.auth.ensure_valid(self._email, self._password)
             backup = await self.client.get_backup_map(self.thing_name)
             map_list = (backup or {}).get("mapList") if isinstance(backup, dict) else None
             if not isinstance(map_list, list) or not map_list:
-                self._merge_state({"backupMapList": [], "backupMapDownloadError": "empty_map_list"})
+                self._merge_state({
+                    "backupMapList": [],
+                    "backupMapOptions": [],
+                    "backupMapDownloadError": "empty_map_list",
+                })
+                self.async_set_updated_data(self._state)
                 return
 
-            # Prefer the current map.pb, otherwise use the first returned backup.
             selected = None
-            for item in map_list:
-                if isinstance(item, dict) and isinstance(item.get("map_file"), str) and item["map_file"].endswith("/map.pb"):
-                    selected = item
-                    break
+
+            desired_file = selected_map_file or self._state.get("selectedBackupMapFile")
+            if desired_file:
+                selected = next(
+                    (
+                        item for item in map_list
+                        if isinstance(item, dict) and item.get("map_file") == desired_file
+                    ),
+                    None,
+                )
+
+            # Prefer current map.pb by default.
             if selected is None:
-                selected = next((i for i in map_list if isinstance(i, dict) and isinstance(i.get("map_file"), str)), None)
+                selected = next(
+                    (
+                        item for item in map_list
+                        if (
+                            isinstance(item, dict)
+                            and isinstance(item.get("map_file"), str)
+                            and item["map_file"].endswith("/map.pb")
+                        )
+                    ),
+                    None,
+                )
+
+            if selected is None:
+                selected = next(
+                    (
+                        item for item in map_list
+                        if isinstance(item, dict) and isinstance(item.get("map_file"), str)
+                    ),
+                    None,
+                )
+
+            options = [
+                self._backup_map_label(item)
+                for item in map_list
+                if isinstance(item, dict) and isinstance(item.get("map_file"), str)
+            ]
+
             if not selected:
-                self._merge_state({"backupMapList": map_list, "backupMapDownloadError": "no_valid_map_file"})
+                self._merge_state({
+                    "backupMapList": map_list,
+                    "backupMapOptions": options,
+                    "backupMapDownloadError": "no_valid_map_file",
+                })
+                self.async_set_updated_data(self._state)
                 return
 
             map_file = selected["map_file"]
+            self._merge_state({
+                "backupMapList": map_list,
+                "backupMapOptions": options,
+                "selectedBackupMapFile": map_file,
+                "selectedBackupMapOption": self._backup_map_label(selected),
+                "backupMapDownloadError": None,
+            })
+            self.async_set_updated_data(self._state)
+
             raw = await self.client.download_s3_object(map_file)
             if not raw:
                 self._merge_state({
                     "backupMapList": map_list,
+                    "backupMapOptions": options,
                     "loadedBackupMap": selected,
                     "backupMapDownloadError": "download_failed",
                 })
+                self.async_set_updated_data(self._state)
                 return
 
             decoded = decode_pbmap(raw)
             if not decoded:
                 self._merge_state({
                     "backupMapList": map_list,
+                    "backupMapOptions": options,
                     "loadedBackupMap": selected,
                     "backupMapBytes": len(raw),
                     "backupMapDownloadError": "decode_failed",
                 })
+                self.async_set_updated_data(self._state)
                 return
 
             state_update: dict[str, Any] = {
                 "backupMapList": map_list,
+                "backupMapOptions": options,
+                "selectedBackupMapFile": map_file,
+                "selectedBackupMapOption": self._backup_map_label(selected),
                 "loadedBackupMap": selected,
                 "backupMapBytes": len(raw),
+                "backupMapDecodedZones": len(decoded.get("zones") or []),
+                "backupMapZonesWithPoints": sum(1 for z in (decoded.get("zones") or []) if z.get("points")),
                 "backupMapDownloadError": None,
                 "btMap": decoded,
             }
@@ -392,16 +523,24 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 state_update["enu_base_point"] = decoded["enuBasePoint"]
             if decoded.get("chargingStationLoc"):
                 state_update["chargingStationLoc"] = decoded["chargingStationLoc"]
+
             self._merge_state(state_update)
             self._derive_state()
+
             _LOGGER.info(
-                "Loaded Lymow backup map for %s: %s zones, %s bytes, key=%s",
-                self.thing_name, decoded.get("zone_count"), len(raw), map_file,
+                "Loaded Lymow backup map for %s: option=%s zones=%s bytes=%s key=%s",
+                self.thing_name,
+                self._backup_map_label(selected),
+                decoded.get("zone_count"),
+                len(raw),
+                map_file,
             )
             self.async_set_updated_data(self._state)
+
         except Exception:
             _LOGGER.debug("Backup map load failed for %s", self.thing_name, exc_info=True)
             self._merge_state({"backupMapDownloadError": "exception"})
+            self.async_set_updated_data(self._state)
 
     async def _do_rest_poll(self) -> None:
         try:

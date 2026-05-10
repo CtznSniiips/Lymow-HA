@@ -1,11 +1,8 @@
-"""Lymow camera platform.
-
-Two camera entities:
-  1. LymowMapCamera  — SVG map rendered from decoded PbMap / btMap zone data
-  2. LymowRTSPCamera — live video stream via RTSP (requires local network)
-"""
+"""Lymow camera platform — diagnostic PNG renderer."""
 from __future__ import annotations
 
+import io
+import logging
 import math
 from typing import Any
 
@@ -14,315 +11,106 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import (
-    DOMAIN,
-    F_CLEAN_ZONE_IDS,
-    F_IP_ADDRESS,
-    F_NET_DETAIL,
-    RTSP_PATH,
-    RTSP_PORT,
-    WORK_STATUS_OFFLINE,
-)
+from .const import DOMAIN, F_IP_ADDRESS, F_NET_DETAIL, RTSP_PATH, RTSP_PORT
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
 
-_CANVAS = 500
-_PADDING = 28
+_LOGGER = logging.getLogger(__name__)
 
-_C_BG = "#111827"
-_C_LAWN = "#1a3a1a"
-_C_BOUNDARY = "#4ade80"
-_C_ZONE_IDLE = "#22c55e"
-_C_ZONE_ACTIVE = "#86efac"
-_C_CHARGING = "#f59e0b"
-_C_DOCK = "#fbbf24"
-_C_ROBOT = "#f97316"
-_C_TEXT = "white"
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception as exc:
+    Image = ImageDraw = ImageFont = None
+    _PIL_ERROR = repr(exc)
+else:
+    _PIL_ERROR = None
 
-_STATUS_COLOR = {
-    -1: "#374151", 0: "#6b7280", 1: "#6b7280",
-     2: "#16a34a", 3: "#9333ea", 4: "#2563eb",
-     5: "#d97706", 6: "#0891b2", 7: "#dc2626",
-     8: "#16a34a", 9: "#16a34a", 10: "#2563eb",
-    11: "#d97706", 12: "#0891b2", 13: "#dc2626",
-    14: "#9333ea", 15: "#6b7280",
-}
-_STATUS_LABEL = {
-    -1: "OFFLINE", 0: "IDLE", 1: "WAITING", 2: "MOWING",
-     3: "PAUSED", 4: "DOCKING", 5: "CHARGING", 6: "REMOTE",
-     7: "ERROR", 8: "RESUMING", 9: "MAPPING", 10: "DOCKING",
-    11: "UPDATE", 12: "CHARGED", 13: "E-STOP", 14: "ESCAPING",
-}
+W = H = 800
+PAD = 40
+BG = (17, 24, 39)
+GREEN = (34, 197, 94, 110)
+GREEN_LINE = (134, 239, 172, 230)
+WHITE = (255, 255, 255, 255)
+GREY = (156, 163, 175, 255)
+ORANGE = (249, 115, 22, 255)
+YELLOW = (251, 191, 36, 255)
+
+FALLBACK_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+    b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+)
 
 
 def _get_robot_ip(data: dict) -> str | None:
-    return data.get(F_IP_ADDRESS) or (data.get(F_NET_DETAIL) or {}).get("wifiIp")
+    return data.get(F_IP_ADDRESS) or (data.get(F_NET_DETAIL) or {}).get("wifiIp") or data.get("rest_ip_address")
 
 
-def _get_robot_loc(data: dict) -> dict | None:
-    for key in ("pose", "robotLoc", "robotPosePib"):
-        value = data.get(key)
-        if isinstance(value, dict) and value.get("x") is not None and value.get("y") is not None:
-            return value
-    return None
-
-
-async def async_setup_entry(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
-        [LymowMapCamera(coord), LymowRTSPCamera(coord)],
-        update_before_add=False,
-    )
+    async_add_entities([LymowMapCamera(coord), LymowRTSPCamera(coord)], update_before_add=False)
 
 
 class LymowMapCamera(LymowEntity, Camera):
-    """SVG map from decoded map data."""
-
     _attr_name = "Map"
     _attr_icon = "mdi:map"
-    _attr_content_type = "image/svg+xml"
+    _attr_content_type = "image/png"
     _attr_supported_features = CameraEntityFeature(0)
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
         LymowEntity.__init__(self, coordinator, "map")
         Camera.__init__(self)
+        self._render_error: str | None = None
+        self._render_debug: dict[str, Any] = {}
 
     @property
     def available(self) -> bool:
         return self.coordinator.last_update_success
 
-    async def async_camera_image(
-        self, width: int | None = None, height: int | None = None
-    ) -> bytes | None:
-        d = self.coordinator.data or {}
-        svg = render_svg(
-            btmap=d.get("btMap"),
-            charging_loc=d.get("chargingStationLoc"),
-            active_zone_ids=set(d.get(F_CLEAN_ZONE_IDS) or []),
-            robot_loc=_get_robot_loc(d),
-            work_status=d.get("workStatus", WORK_STATUS_OFFLINE),
-            rtk_status=d.get("rtkStatus"),
-            battery=d.get("battery"),
-        )
-        return svg.encode("utf-8")
+    def _render(self) -> bytes:
+        try:
+            img, dbg = build_map_png(self.coordinator.data or {})
+            self._render_debug = dbg
+            self._render_error = None
+            return png_bytes(img)
+        except Exception as exc:
+            self._render_error = f"{type(exc).__name__}: {exc}"
+            _LOGGER.exception("Lymow diagnostic map render failed")
+            return text_png("Lymow map render failed", self._render_error)
+
+    def camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
+        return self._render()
+
+    async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
+        return self._render()
 
     @property
     def extra_state_attributes(self) -> dict:
         d = self.coordinator.data or {}
         btmap = d.get("btMap") or {}
-        attrs: dict[str, Any] = {}
-
-        if btmap.get("zone_count"):
-            attrs["zone_count"] = btmap["zone_count"]
-        zones = btmap.get("zones", [])
-        if zones:
-            attrs["zones"] = [
-                {"hashId": z.get("hashId"), "name": z.get("name") or z.get("hashId", "")}
-                for z in zones
-                if isinstance(z, dict) and z.get("hashId")
-            ]
-        if channels := btmap.get("channels"):
-            attrs["channel_count"] = len(channels)
-        if ma := d.get("mapArea"):
-            attrs["map_area_m2"] = ma
-        if pose := _get_robot_loc(d):
-            attrs["robot_local_position"] = pose
-        if ebp := (btmap.get("enuBasePoint") or d.get("enu_base_point")):
-            attrs["enu_base_point"] = ebp
-        if loaded := d.get("loadedBackupMap"):
-            attrs["loaded_backup_map"] = loaded
-        if bytes_count := d.get("backupMapBytes"):
-            attrs["backup_map_bytes"] = bytes_count
-        if err := d.get("backupMapDownloadError"):
-            attrs["backup_map_download_error"] = err
-        return attrs
-
-
-def render_svg(
-    btmap: dict | None,
-    charging_loc: dict | None,
-    active_zone_ids: set[str],
-    robot_loc: dict | None,
-    work_status: int,
-    rtk_status: int | None,
-    battery: int | None,
-) -> str:
-    parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {_CANVAS} {_CANVAS}" '
-        f'width="{_CANVAS}" height="{_CANVAS}">',
-        f'<rect width="{_CANVAS}" height="{_CANVAS}" fill="{_C_BG}"/>',
-    ]
-
-    zones = (btmap or {}).get("zones", [])
-    drawable = [z for z in zones if isinstance(z, dict) and z.get("points") and len(z["points"]) >= 2]
-
-    all_pts: list[tuple[float, float]] = []
-    for z in drawable:
-        all_pts.extend([(float(x), float(y)) for x, y in z["points"]])
-    if charging_loc and charging_loc.get("x") is not None and charging_loc.get("y") is not None:
-        all_pts.append((float(charging_loc.get("x", 0)), float(charging_loc.get("y", 0))))
-    if robot_loc and robot_loc.get("x") is not None and robot_loc.get("y") is not None:
-        all_pts.append((float(robot_loc.get("x", 0)), float(robot_loc.get("y", 0))))
-
-    if not all_pts:
-        parts += _placeholder()
-        parts.append("</svg>")
-        return "\n".join(parts)
-
-    min_x = min(p[0] for p in all_pts)
-    max_x = max(p[0] for p in all_pts)
-    min_y = min(p[1] for p in all_pts)
-    max_y = max(p[1] for p in all_pts)
-    w = max_x - min_x or 1
-    h = max_y - min_y or 1
-    scale = (_CANVAS - _PADDING * 2) / max(w, h)
-
-    def tx(x: float) -> float:
-        return (x - min_x) * scale + _PADDING
-
-    def ty(y: float) -> float:
-        return (y - min_y) * scale + _PADDING
-
-    def poly(pts: list[tuple[float, float]]) -> str:
-        return " ".join(f"{tx(float(x)):.1f},{ty(float(y)):.1f}" for x, y in pts)
-
-    if len(all_pts) >= 3:
-        cx = sum(p[0] for p in all_pts) / len(all_pts)
-        cy = sum(p[1] for p in all_pts) / len(all_pts)
-        hull = sorted(all_pts, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
-        parts.append(
-            f'<polygon points="{poly(hull)}" fill="{_C_LAWN}" '
-            f'stroke="{_C_BOUNDARY}" stroke-width="1.5" stroke-dasharray="4 2"/>'
-        )
-
-    zone_alphas = ["99", "aa", "bb", "99", "88", "aa"]
-    for i, zone in enumerate(drawable):
-        pts = [(float(x), float(y)) for x, y in zone["points"]]
-        z_id = zone.get("hashId", "")
-        name = zone.get("name", "")
-        is_charging_area = name == "charging_area"
-        is_active = z_id in active_zone_ids
-
-        if is_charging_area:
-            color, alpha, stroke_w = _C_CHARGING, "66", "1"
-        elif is_active:
-            color, alpha, stroke_w = _C_ZONE_ACTIVE, "cc", "2.5"
-        else:
-            color, alpha, stroke_w = _C_ZONE_IDLE, zone_alphas[i % len(zone_alphas)], "1.5"
-
-        parts.append(
-            f'<polygon points="{poly(pts)}" fill="{color}{alpha}" '
-            f'stroke="{color}" stroke-width="{stroke_w}"/>'
-        )
-
-        if len(pts) >= 2:
-            lcx = sum(p[0] for p in pts) / len(pts)
-            lcy = sum(p[1] for p in pts) / len(pts)
-            label = name if name and name != "charging_area" else (z_id[:6] if z_id else "")
-            if label:
-                parts.append(
-                    f'<text x="{tx(lcx):.1f}" y="{ty(lcy):.1f}" text-anchor="middle" '
-                    f'dominant-baseline="middle" font-size="10" font-family="sans-serif" '
-                    f'fill="{_C_TEXT}" fill-opacity="0.8">{label}</text>'
-                )
-
-    if charging_loc:
-        dx = tx(float(charging_loc.get("x", 0)))
-        dy = ty(float(charging_loc.get("y", 0)))
-        hdg = charging_loc.get("heading", charging_loc.get("theta", 0)) or 0
-        parts.append(
-            f'<circle cx="{dx:.1f}" cy="{dy:.1f}" r="10" fill="{_C_DOCK}" '
-            f'fill-opacity="0.9" stroke="white" stroke-width="2"/>'
-        )
-        parts.append(
-            f'<text x="{dx:.1f}" y="{dy:.1f}" text-anchor="middle" dominant-baseline="middle" '
-            f'font-size="11" font-family="sans-serif">⚡</text>'
-        )
-        if hdg:
-            ang = float(hdg) if abs(float(hdg)) <= 6.2832 else math.radians(float(hdg))
-            ax = dx + 15 * math.sin(ang)
-            ay = dy - 15 * math.cos(ang)
-            parts.append(
-                f'<line x1="{dx:.1f}" y1="{dy:.1f}" x2="{ax:.1f}" y2="{ay:.1f}" '
-                f'stroke="{_C_DOCK}" stroke-width="2" stroke-dasharray="3 2"/>'
-            )
-
-    if robot_loc:
-        rx = tx(float(robot_loc.get("x", 0)))
-        ry = ty(float(robot_loc.get("y", 0)))
-        heading = robot_loc.get("heading", robot_loc.get("theta", 0)) or 0
-        parts.append(
-            f'<circle cx="{rx:.1f}" cy="{ry:.1f}" r="9" fill="{_C_ROBOT}" '
-            f'stroke="white" stroke-width="2"/>'
-        )
-        if heading:
-            ang = float(heading) if abs(float(heading)) <= 6.2832 else math.radians(float(heading))
-            ax = rx + 18 * math.sin(ang)
-            ay = ry - 18 * math.cos(ang)
-            parts.append(
-                f'<line x1="{rx:.1f}" y1="{ry:.1f}" x2="{ax:.1f}" y2="{ay:.1f}" '
-                f'stroke="{_C_ROBOT}" stroke-width="3" stroke-linecap="round"/>'
-            )
-
-    sc = _STATUS_COLOR.get(work_status, "#374151")
-    sl = _STATUS_LABEL.get(work_status, "?")
-    parts += [
-        f'<rect x="6" y="6" width="90" height="22" rx="5" fill="{sc}" fill-opacity="0.92"/>',
-        f'<text x="51" y="20" text-anchor="middle" dominant-baseline="middle" '
-        f'font-size="11" font-family="sans-serif" fill="white" font-weight="bold">{sl}</text>',
-    ]
-
-    if battery is not None:
-        bc = "#4ade80" if battery > 30 else ("#facc15" if battery > 15 else "#f87171")
-        parts += [
-            '<rect x="104" y="6" width="58" height="22" rx="5" fill="#1f2937" fill-opacity="0.9"/>',
-            f'<text x="133" y="20" text-anchor="middle" dominant-baseline="middle" '
-            f'font-size="11" font-family="sans-serif" fill="{bc}" font-weight="bold">🔋{battery}%</text>',
-        ]
-
-    if rtk_status is not None:
-        rl = {0: "RTK ✗", 1: "RTK ~", 2: "RTK ✓", 3: "RTK ✓"}
-        rc = {0: "#dc2626", 1: "#d97706", 2: "#16a34a", 3: "#16a34a"}
-        parts += [
-            f'<rect x="170" y="6" width="54" height="22" rx="5" '
-            f'fill="{rc.get(rtk_status, "#374151")}" fill-opacity="0.9"/>',
-            f'<text x="197" y="20" text-anchor="middle" dominant-baseline="middle" '
-            f'font-size="11" font-family="sans-serif" fill="white" font-weight="bold">'
-            f'{rl.get(rtk_status, "RTK ?")}</text>',
-        ]
-
-    zcount = (btmap or {}).get("zone_count")
-    if zcount:
-        parts.append(
-            f'<text x="{_CANVAS - 6}" y="{_CANVAS - 8}" text-anchor="end" '
-            f'font-size="10" font-family="sans-serif" fill="#6b7280">{zcount} zones</text>'
-        )
-
-    parts.append("</svg>")
-    return "\n".join(parts)
-
-
-def _placeholder() -> list[str]:
-    return [
-        f'<text x="{_CANVAS//2}" y="{_CANVAS//2 - 12}" text-anchor="middle" '
-        f'font-size="15" font-family="sans-serif" fill="#4b5563">Map not available</text>',
-        f'<text x="{_CANVAS//2}" y="{_CANVAS//2 + 12}" text-anchor="middle" '
-        f'font-size="11" font-family="sans-serif" fill="#374151">'
-        f'Waiting for MQTT map data or S3 backup map...</text>',
-    ]
+        zones = btmap.get("zones") or []
+        return {
+            "render_mode": "diagnostic_png",
+            "pil_available": Image is not None,
+            "pil_error": _PIL_ERROR,
+            "render_error": self._render_error,
+            "render_debug": self._render_debug,
+            "zone_count": btmap.get("zone_count"),
+            "zones_total": len(zones),
+            "zones_with_points": sum(1 for z in zones if z.get("points")),
+            "drawable_zone_count": sum(1 for z in zones if z.get("points") and len(z.get("points") or []) >= 2),
+            "first_zone_points_count": len(zones[0].get("points") or []) if zones else 0,
+            "loadedBackupMap": d.get("loadedBackupMap"),
+            "backupMapBytes": d.get("backupMapBytes"),
+            "backupMapDownloadError": d.get("backupMapDownloadError"),
+        }
 
 
 class LymowRTSPCamera(LymowEntity, Camera):
-    """Exposes the robot RTSP stream URL via attributes."""
-
     _attr_name = "Live Camera"
     _attr_icon = "mdi:cctv"
-    _attr_content_type = "image/jpeg"
-    _attr_supported_features = CameraEntityFeature(0)
+    _attr_content_type = "image/png"
+    _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
         LymowEntity.__init__(self, coordinator, "rtsp_camera")
@@ -332,16 +120,155 @@ class LymowRTSPCamera(LymowEntity, Camera):
     def available(self) -> bool:
         return bool(_get_robot_ip(self.coordinator.data or {}))
 
-    @property
-    def extra_state_attributes(self) -> dict:
-        ip = _get_robot_ip(self.coordinator.data or {})
-        if not ip:
-            return {}
-        return {
-            "rtsp_url": f"rtsp://{ip}:{RTSP_PORT}/{RTSP_PATH}",
-            "robot_ip": ip,
-        }
-
-    async def stream_source(self) -> str | None:
+    def _rtsp_url(self) -> str | None:
         ip = _get_robot_ip(self.coordinator.data or {})
         return f"rtsp://{ip}:{RTSP_PORT}/{RTSP_PATH}" if ip else None
+
+    async def stream_source(self) -> str | None:
+        return self._rtsp_url()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {"rtsp_url": self._rtsp_url()} if self._rtsp_url() else {}
+
+    def camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
+        return text_png("Lymow RTSP Camera", self._rtsp_url() or "Waiting for robot IP")
+
+    async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
+        return self.camera_image(width, height)
+
+
+def build_map_png(data: dict):
+    if Image is None or ImageDraw is None:
+        raise RuntimeError(f"Pillow not available: {_PIL_ERROR}")
+
+    img = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    btmap = data.get("btMap") or {}
+    zones = btmap.get("zones") or []
+    drawable = [z for z in zones if z.get("points") and len(z.get("points") or []) >= 2]
+
+    dbg = {
+        "zones": len(zones),
+        "drawable": len(drawable),
+        "first_points": len(zones[0].get("points") or []) if zones else 0,
+        "loaded": data.get("loadedBackupMap"),
+    }
+
+    draw_text(draw, "Lymow Map Diagnostic", 20, 16, 22, WHITE)
+    draw_text(draw, f"zones={len(zones)} drawable={len(drawable)} first_points={dbg['first_points']}", 20, 46, 15, GREY)
+
+    if not drawable:
+        draw_text(draw, "No drawable polygons in state", 20, 100, 18, (248, 113, 113, 255))
+        return img, dbg
+
+    all_pts = []
+    for z in drawable:
+        all_pts.extend(safe_points(z.get("points") or []))
+
+    if not all_pts:
+        draw_text(draw, "Drawable zones exist but points failed to parse", 20, 100, 18, (248, 113, 113, 255))
+        return img, dbg
+
+    min_x = min(x for x, y in all_pts)
+    max_x = max(x for x, y in all_pts)
+    min_y = min(y for x, y in all_pts)
+    max_y = max(y for x, y in all_pts)
+    dbg.update({"min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y})
+
+    scale = (W - PAD * 2) / max(max_x - min_x or 1, max_y - min_y or 1)
+
+    def sx(x): return (x - min_x) * scale + PAD
+    def sy(y): return H - ((y - min_y) * scale + PAD)
+
+    for idx, zone in enumerate(drawable):
+        pts = safe_points(zone.get("points") or [])
+        if len(pts) > 300:
+            step = max(1, math.ceil(len(pts) / 300))
+            pts = pts[::step]
+        xy = [(sx(x), sy(y)) for x, y in pts]
+        if len(xy) >= 3:
+            draw.polygon(xy, fill=GREEN, outline=GREEN_LINE)
+            cx = sum(p[0] for p in xy) / len(xy)
+            cy = sum(p[1] for p in xy) / len(xy)
+            draw_center(draw, str(zone.get("name") or zone.get("hashId") or idx)[:16], cx, cy, 10, WHITE)
+
+    dock = data.get("chargingStationLoc")
+    if isinstance(dock, dict):
+        x, y = to_float(dock.get("x")), to_float(dock.get("y"))
+        if x is not None and y is not None:
+            dx, dy = sx(x), sy(y)
+            draw.ellipse((dx - 10, dy - 10, dx + 10, dy + 10), fill=YELLOW, outline=WHITE, width=2)
+            draw_center(draw, "D", dx, dy, 11, (0, 0, 0, 255))
+
+    robot = data.get("robotLoc") or data.get("pose") or data.get("robotPosePib")
+    if isinstance(robot, dict):
+        x, y = to_float(robot.get("x")), to_float(robot.get("y"))
+        if x is not None and y is not None:
+            rx, ry = sx(x), sy(y)
+            draw.ellipse((rx - 9, ry - 9, rx + 9, ry + 9), fill=ORANGE, outline=WHITE, width=2)
+            draw_center(draw, "R", rx, ry, 11, WHITE)
+
+    return img, dbg
+
+
+def text_png(title: str, subtitle: str) -> bytes:
+    if Image is None or ImageDraw is None:
+        return FALLBACK_PNG
+    img = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img, "RGBA")
+    draw_center(draw, title, W / 2, H / 2 - 16, 22, WHITE)
+    draw_center(draw, subtitle, W / 2, H / 2 + 18, 13, GREY)
+    return png_bytes(img)
+
+
+def png_bytes(img) -> bytes:
+    bio = io.BytesIO()
+    img.save(bio, format="PNG")
+    return bio.getvalue()
+
+
+def font(size: int):
+    if ImageFont is None:
+        return None
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def draw_text(draw, text, x, y, size, fill):
+    draw.text((x, y), str(text), font=font(size), fill=fill)
+
+
+def draw_center(draw, text, x, y, size, fill):
+    f = font(size)
+    text = str(text)
+    try:
+        box = draw.textbbox((0, 0), text, font=f)
+        tw, th = box[2] - box[0], box[3] - box[1]
+    except Exception:
+        tw, th = len(text) * size * 0.6, size
+    draw.text((x - tw / 2, y - th / 2), text, font=f, fill=fill)
+
+
+def to_float(v: Any) -> float | None:
+    try:
+        return None if v is None else float(v)
+    except Exception:
+        return None
+
+
+def safe_points(points: list[Any]) -> list[tuple[float, float]]:
+    out = []
+    for p in points:
+        if isinstance(p, dict):
+            x, y = to_float(p.get("x")), to_float(p.get("y"))
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            x, y = to_float(p[0]), to_float(p[1])
+        else:
+            continue
+        if x is not None and y is not None:
+            out.append((x, y))
+    return out
