@@ -632,6 +632,29 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
                     },
                     "geometry": {"type": "Point", "coordinates": coords},
                 })
+                
+        # Mow path (current/last session)
+        mow_path = getattr(self.coordinator, "mow_path", [])
+        if len(mow_path) >= 2:
+            if has_origin:
+                line_coords = []
+                for x, y in mow_path:
+                    lat, lon = _enu_to_latlon(x, y, lat0, lon0)
+                    line_coords.append([round(lon, 8), round(lat, 8)])
+            else:
+                line_coords = [[p[0], p[1]] for p in mow_path]
+            features.append({
+                "type": "Feature",
+                "properties": {
+                    "type":        "mow_path",
+                    "name":        "Mow Path",
+                    "point_count": len(mow_path),
+                },
+                "geometry": {
+                    "type":        "LineString",
+                    "coordinates": line_coords,
+                },
+            })
 
         return {
             "geojson": {"type": "FeatureCollection", "features": features},

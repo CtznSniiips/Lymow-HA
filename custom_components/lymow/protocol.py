@@ -749,6 +749,7 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
              4 remainCleanTime int32 (s)
              5 cleanPercent    float
              6 mapArea         float (m²)
+     14  PbPose pose           → state["pose"] + state["robotLoc"]  (live position)
      17  PbRobotConfig (after QUERY_ROBOT_CONFIG):
              1 cutHeight → state["cutHeight"]
              7 cleanMode → state["robotCleanMode"] + state["cleanMode"] (string)
@@ -756,6 +757,7 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
      18  outputCtrl        int32
      23  PbBtMap           → state["btMap"] = decode_btmap(...)
      24  PbPose chargingStationLoc → state["chargingStationLoc"]
+     31  PbPoint robotPosePib  → state["robotPosePib"]               (alt position)
      34  PbNetDetailInfo   → state["netDetailInfo"]
      35  PbRtkDiagnosticL1 → state["rtkDiagnosticL1"] + state["rtkStatus"]
     """
@@ -899,6 +901,31 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
             f = _gf(pose, fno)
             if f is not None: dock[key] = f
         if dock: state["chargingStationLoc"] = dock
+    
+    # pose (field 14) — robot ENU position, broadcast in real-time while operating
+    pose_rt = _sub(root, 14)
+    if pose_rt:
+        p: dict[str, Any] = {}
+        for fno, key in [(1, "x"), (2, "y")]:
+            f = _gf(pose_rt, fno)
+            if f is not None: p[key] = f
+        h = _gf(pose_rt, 3)
+        if h is not None: p["heading"] = h; p["theta"] = h
+        if p:
+            state["pose"]     = p
+            state["robotLoc"] = p
+
+    # robotPosePib (field 31) — alternative position format (point only, no heading)
+    pib = _sub(root, 31)
+    if pib:
+        p2: dict[str, Any] = {}
+        x = _gf(pib, 1)
+        y = _gf(pib, 2)
+        if x is not None: p2["x"] = x
+        if y is not None: p2["y"] = y
+        if p2:
+            state.setdefault("robotPosePib", p2)
+            state.setdefault("robotLoc",     p2)   # fallback se pose assente
 
     # PbNetDetailInfo (field 34)
     nd = _sub(root, 34)

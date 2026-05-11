@@ -98,6 +98,9 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.device_info_data: dict = {}
         self.history: list[dict]    = []
 
+        self._mow_path: list[tuple[float, float]] = []
+        self._mow_session_active: bool = False
+
         self._rest_online: bool    = False
         self._last_mqtt_ts: float  = 0.0
         self._prev_work_status: int | None = None
@@ -198,6 +201,11 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             or self._state.get(F_DEVICE_STATE) == "online"
             or self.work_status not in (WORK_STATUS_OFFLINE, -1)
         )
+    
+    @property
+    def mow_path(self) -> list[tuple[float, float]]:
+        """ENU points accumulated during the current/last mowing session."""
+        return self._mow_path
 
     @property
     def state_dict(self) -> dict[str, Any]:
@@ -263,6 +271,34 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if (ws := new_state.get("workStatus")) is not None:
             self._prev_work_status = ws
+
+        # ── Mow path tracking ──────────────────────────────────
+        ws = new_state.get("workStatus")
+        if ws is not None:
+            is_mowing = ws == 2  # WORK_STATUS_MOWING
+            if is_mowing:
+                self._mow_session_active = True
+                robot = (
+                    new_state.get("pose")
+                    or new_state.get("robotLoc")
+                    or self._state.get("pose")
+                    or self._state.get("robotLoc")
+                )
+                if isinstance(robot, dict):
+                    x = robot.get("x")
+                    y = robot.get("y")
+                    if x is not None and y is not None:
+                        # Deduplicate: skip if same as last point
+                        pt = (round(float(x), 3), round(float(y), 3))
+                        if not self._mow_path or self._mow_path[-1] != pt:
+                            self._mow_path.append(pt)
+            elif self._mow_session_active and ws not in (2, 3, 8):
+                # Ended (not mowing, paused, or resuming) → keep path but mark inactive
+                self._mow_session_active = False
+            # Full reset only on dock/idle/offline
+            if ws in (0, 5, 12, -1):  # Idle, Charging, FullyCharged, Offline
+                self._mow_path = []
+                self._mow_session_active = False
 
         _LOGGER.debug(
             "State update %s: workStatus=%s battery=%s",
