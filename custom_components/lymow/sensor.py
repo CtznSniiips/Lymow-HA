@@ -1,6 +1,7 @@
 """Lymow sensor platform."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -445,6 +446,55 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
 )
 
 
+# ── ENU → WGS84 helpers (used by LymowMapGeoJsonSensor) ───────
+
+_WGS84_A = 6_378_137.0   # equatorial radius [m]
+
+
+def _enu_to_latlon(
+    east_m: float, north_m: float, lat0_deg: float, lon0_deg: float
+) -> tuple[float, float]:
+    """Convert ENU metres to WGS84 lat/lon (accurate to < 1 cm at garden scale)."""
+    lat0 = math.radians(lat0_deg)
+    dlat = math.degrees(north_m / _WGS84_A)
+    dlon = math.degrees(east_m  / (_WGS84_A * math.cos(lat0)))
+    return lat0_deg + dlat, lon0_deg + dlon
+
+
+def _sf(v: Any) -> float | None:
+    try:
+        return None if v is None else float(v)
+    except Exception:
+        return None
+
+
+def _safe_pts(points: list[Any]) -> list[tuple[float, float]]:
+    """Normalise zone points: dicts {x,y} or tuples/lists (x, y)."""
+    out: list[tuple[float, float]] = []
+    for p in points:
+        if isinstance(p, dict):
+            x, y = _sf(p.get("x")), _sf(p.get("y"))
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            x, y = _sf(p[0]), _sf(p[1])
+        else:
+            continue
+        if x is not None and y is not None:
+            out.append((x, y))
+    return out
+
+
+def _pts_to_ring(
+    pts: list[tuple[float, float]], lat0: float, lon0: float
+) -> list[list[float]]:
+    ring = []
+    for x, y in pts:
+        lat, lon = _enu_to_latlon(x, y, lat0, lon0)
+        ring.append([round(lon, 8), round(lat, 8)])
+    if ring and ring[0] != ring[-1]:
+        ring.append(ring[0])
+    return ring
+
+
 # ── Platform setup ────────────────────────────────────────────
 
 async def async_setup_entry(
@@ -454,7 +504,7 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowSensor(coord, desc) for desc in SENSORS],
+        [LymowSensor(coord, desc) for desc in SENSORS] + [LymowMapGeoJsonSensor(coord)],
         update_before_add=False,
     )
 
@@ -478,3 +528,114 @@ class LymowSensor(LymowEntity, SensorEntity):
         if fn := self.entity_description.transform:
             return fn(raw)
         return raw
+
+
+class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
+    """Exposes the Lymow zone map as a GeoJSON FeatureCollection.
+
+    State  : "<N> zones"
+    Attr   : geojson → FeatureCollection (WGS84 when enuBasePoint available)
+
+    Consumed by custom Lovelace map cards and by the Flutter control app
+    via HA WebSocket / REST.
+    """
+
+    _attr_name = "Map GeoJSON"
+    _attr_icon = "mdi:map-marker-path"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "map_geojson")
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.last_update_success
+
+    @property
+    def native_value(self) -> str:
+        btmap = (self.coordinator.data or {}).get("btMap") or {}
+        zones = btmap.get("zones") or []
+        drawable = sum(1 for z in zones if z.get("points") and len(z.get("points") or []) >= 3)
+        return f"{drawable} zones"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data  = self.coordinator.data or {}
+        btmap = data.get("btMap") or {}
+        zones = btmap.get("zones") or []
+
+        # enuBasePoint: {latitude, longitude, altitude} — set by _decode_lla_dict
+        ebp  = btmap.get("enuBasePoint") or data.get("enu_base_point") or {}
+        lat0 = _sf(ebp.get("latitude"))
+        lon0 = _sf(ebp.get("longitude"))
+        has_origin = lat0 is not None and lon0 is not None
+
+        features: list[dict[str, Any]] = []
+
+        # Zone polygons
+        for idx, zone in enumerate(zones):
+            pts = _safe_pts(zone.get("points") or [])
+            if len(pts) < 3:
+                continue
+            props: dict[str, Any] = {
+                "type":     "zone",
+                "name":     zone.get("name") or zone.get("hashId") or str(idx),
+                "hashId":   zone.get("hashId"),
+                "zoneType": zone.get("zoneType"),
+            }
+            if cfg := zone.get("zoneConfig"):
+                props["zoneConfig"] = cfg
+            if has_origin:
+                geometry: dict[str, Any] = {
+                    "type":        "Polygon",
+                    "coordinates": [_pts_to_ring(pts, lat0, lon0)],
+                }
+            else:
+                geometry = {
+                    "type":        "Polygon",
+                    "coordinates": [[[p[0], p[1]] for p in pts] + [list(pts[0])]],
+                    "_crs":        "ENU_metres",
+                }
+            features.append({"type": "Feature", "properties": props, "geometry": geometry})
+
+        # Dock
+        dock = data.get("chargingStationLoc")
+        if isinstance(dock, dict):
+            x, y = _sf(dock.get("x")), _sf(dock.get("y"))
+            if x is not None and y is not None:
+                if has_origin:
+                    lat, lon = _enu_to_latlon(x, y, lat0, lon0)
+                    coords: list[float] = [round(lon, 8), round(lat, 8)]
+                else:
+                    coords = [x, y]
+                features.append({
+                    "type": "Feature",
+                    "properties": {"type": "dock", "name": "Dock", "heading": _sf(dock.get("heading"))},
+                    "geometry": {"type": "Point", "coordinates": coords},
+                })
+
+        # Robot position
+        robot = data.get("robotLoc") or data.get("pose") or data.get("robotPosePib")
+        if isinstance(robot, dict):
+            x, y = _sf(robot.get("x")), _sf(robot.get("y"))
+            if x is not None and y is not None:
+                if has_origin:
+                    lat, lon = _enu_to_latlon(x, y, lat0, lon0)
+                    coords = [round(lon, 8), round(lat, 8)]
+                else:
+                    coords = [x, y]
+                features.append({
+                    "type": "Feature",
+                    "properties": {
+                        "type":    "robot",
+                        "name":    "Robot",
+                        "heading": _sf(robot.get("heading") or robot.get("theta")),
+                    },
+                    "geometry": {"type": "Point", "coordinates": coords},
+                })
+
+        return {
+            "geojson": {"type": "FeatureCollection", "features": features},
+            "zone_count":      len(features),
+            "has_gps_origin":  has_origin,
+            "enu_base_point":  ebp or None,
+        }

@@ -1,4 +1,11 @@
-"""Lymow camera platform — diagnostic PNG renderer."""
+"""Lymow camera platform.
+
+Two cameras:
+  - LymowMapCamera   : diagnostic PNG rendered with Pillow (executor-safe).
+  - LymowRTSPCamera  : live RTSP stream via HA's built-in `stream` component.
+                       The camera card in Lovelace will show a live HLS feed
+                       as long as the robot IP is reachable from the HA host.
+"""
 from __future__ import annotations
 
 import io
@@ -27,13 +34,16 @@ else:
 
 W = H = 800
 PAD = 40
-BG = (17, 24, 39)
-GREEN = (34, 197, 94, 110)
-GREEN_LINE = (134, 239, 172, 230)
-WHITE = (255, 255, 255, 255)
-GREY = (156, 163, 175, 255)
-ORANGE = (249, 115, 22, 255)
-YELLOW = (251, 191, 36, 255)
+# All colours as RGBA tuples (image is created in RGBA mode and converted to RGB at save time)
+BG          = (17,  24,  39, 255)
+GREEN       = (34, 197,  94, 110)
+GREEN_LINE  = (134, 239, 172, 230)
+WHITE       = (255, 255, 255, 255)
+GREY        = (156, 163, 175, 255)
+ORANGE      = (249, 115,  22, 255)
+YELLOW      = (251, 191,  36, 255)
+RED         = (248, 113, 113, 255)
+BLACK       = (  0,   0,   0, 255)
 
 FALLBACK_PNG = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -43,13 +53,26 @@ FALLBACK_PNG = (
 
 
 def _get_robot_ip(data: dict) -> str | None:
-    return data.get(F_IP_ADDRESS) or (data.get(F_NET_DETAIL) or {}).get("wifiIp") or data.get("rest_ip_address")
+    return (
+        data.get(F_IP_ADDRESS)
+        or (data.get(F_NET_DETAIL) or {}).get("wifiIp")
+        or data.get("rest_ip_address")
+    )
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([LymowMapCamera(coord), LymowRTSPCamera(coord)], update_before_add=False)
+    async_add_entities(
+        [LymowMapCamera(coord), LymowRTSPCamera(coord)],
+        update_before_add=False,
+    )
 
+
+# ── Diagnostic map camera ────────────────────────────────────────────────────
 
 class LymowMapCamera(LymowEntity, Camera):
     _attr_name = "Map"
@@ -67,6 +90,8 @@ class LymowMapCamera(LymowEntity, Camera):
     def available(self) -> bool:
         return self.coordinator.last_update_success
 
+    # ── sync render (always called in executor) ──────────────────
+
     def _render(self) -> bytes:
         try:
             img, dbg = build_map_png(self.coordinator.data or {})
@@ -78,11 +103,19 @@ class LymowMapCamera(LymowEntity, Camera):
             _LOGGER.exception("Lymow diagnostic map render failed")
             return text_png("Lymow map render failed", self._render_error)
 
-    def camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
+    # ── camera interface ─────────────────────────────────────────
+
+    def camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
+        # Sync path kept for compatibility; HA rarely calls this directly.
         return self._render()
 
-    async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
-        return self._render()
+    async def async_camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
+        # Pillow is CPU-bound + blocking I/O → offload to executor thread.
+        return await self.hass.async_add_executor_job(self._render)
 
     @property
     def extra_state_attributes(self) -> dict:
@@ -98,7 +131,9 @@ class LymowMapCamera(LymowEntity, Camera):
             "zone_count": btmap.get("zone_count"),
             "zones_total": len(zones),
             "zones_with_points": sum(1 for z in zones if z.get("points")),
-            "drawable_zone_count": sum(1 for z in zones if z.get("points") and len(z.get("points") or []) >= 2),
+            "drawable_zone_count": sum(
+                1 for z in zones if z.get("points") and len(z.get("points") or []) >= 2
+            ),
             "first_zone_points_count": len(zones[0].get("points") or []) if zones else 0,
             "loadedBackupMap": d.get("loadedBackupMap"),
             "backupMapBytes": d.get("backupMapBytes"),
@@ -106,7 +141,16 @@ class LymowMapCamera(LymowEntity, Camera):
         }
 
 
+# ── RTSP live camera ─────────────────────────────────────────────────────────
+
 class LymowRTSPCamera(LymowEntity, Camera):
+    """Live camera via RTSP → HLS transcoding by HA's stream component.
+
+    Once the robot IP is known, the camera card in Lovelace will display
+    a live video feed without any extra configuration.  The `stream`
+    integration (enabled by default in HA) handles the RTSP→HLS leg.
+    """
+
     _attr_name = "Live Camera"
     _attr_icon = "mdi:cctv"
     _attr_content_type = "image/png"
@@ -125,51 +169,68 @@ class LymowRTSPCamera(LymowEntity, Camera):
         return f"rtsp://{ip}:{RTSP_PORT}/{RTSP_PATH}" if ip else None
 
     async def stream_source(self) -> str | None:
+        """Return the RTSP URL consumed by HA's stream component."""
         return self._rtsp_url()
 
     @property
     def extra_state_attributes(self) -> dict:
-        return {"rtsp_url": self._rtsp_url()} if self._rtsp_url() else {}
+        url = self._rtsp_url()
+        return {"rtsp_url": url} if url else {}
 
-    def camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
-        return text_png("Lymow RTSP Camera", self._rtsp_url() or "Waiting for robot IP")
+    def camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
+        # Fallback still image shown before the stream is available.
+        return text_png("Lymow Live Camera", self._rtsp_url() or "Waiting for robot IP…")
 
-    async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
-        return self.camera_image(width, height)
+    async def async_camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
+        return await self.hass.async_add_executor_job(self.camera_image, width, height)
 
 
-def build_map_png(data: dict):
+# ── Rendering helpers ────────────────────────────────────────────────────────
+
+def build_map_png(data: dict) -> tuple:
     if Image is None or ImageDraw is None:
         raise RuntimeError(f"Pillow not available: {_PIL_ERROR}")
 
-    img = Image.new("RGB", (W, H), BG)
+    # Use RGBA throughout; convert to RGB only when saving.
+    img  = Image.new("RGBA", (W, H), BG)
     draw = ImageDraw.Draw(img, "RGBA")
 
-    btmap = data.get("btMap") or {}
-    zones = btmap.get("zones") or []
-    drawable = [z for z in zones if z.get("points") and len(z.get("points") or []) >= 2]
+    btmap    = data.get("btMap") or {}
+    zones    = btmap.get("zones") or []
+    drawable = [
+        z for z in zones
+        if z.get("points") and len(z.get("points") or []) >= 2
+    ]
 
     dbg = {
-        "zones": len(zones),
-        "drawable": len(drawable),
+        "zones":        len(zones),
+        "drawable":     len(drawable),
         "first_points": len(zones[0].get("points") or []) if zones else 0,
-        "loaded": data.get("loadedBackupMap"),
+        "loaded":       data.get("loadedBackupMap"),
     }
 
     draw_text(draw, "Lymow Map Diagnostic", 20, 16, 22, WHITE)
-    draw_text(draw, f"zones={len(zones)} drawable={len(drawable)} first_points={dbg['first_points']}", 20, 46, 15, GREY)
+    draw_text(
+        draw,
+        f"zones={len(zones)} drawable={len(drawable)} first_pts={dbg['first_points']}",
+        20, 46, 15, GREY,
+    )
 
     if not drawable:
-        draw_text(draw, "No drawable polygons in state", 20, 100, 18, (248, 113, 113, 255))
-        return img, dbg
+        draw_text(draw, "No drawable polygons in state", 20, 100, 18, RED)
+        return img.convert("RGB"), dbg
 
-    all_pts = []
+    all_pts: list[tuple[float, float]] = []
     for z in drawable:
         all_pts.extend(safe_points(z.get("points") or []))
 
     if not all_pts:
-        draw_text(draw, "Drawable zones exist but points failed to parse", 20, 100, 18, (248, 113, 113, 255))
-        return img, dbg
+        draw_text(draw, "Drawable zones exist but points failed to parse", 20, 100, 18, RED)
+        return img.convert("RGB"), dbg
 
     min_x = min(x for x, y in all_pts)
     max_x = max(x for x, y in all_pts)
@@ -179,20 +240,21 @@ def build_map_png(data: dict):
 
     scale = (W - PAD * 2) / max(max_x - min_x or 1, max_y - min_y or 1)
 
-    def sx(x): return (x - min_x) * scale + PAD
-    def sy(y): return H - ((y - min_y) * scale + PAD)
+    def sx(x: float) -> float: return (x - min_x) * scale + PAD
+    def sy(y: float) -> float: return H - ((y - min_y) * scale + PAD)
 
     for idx, zone in enumerate(drawable):
         pts = safe_points(zone.get("points") or [])
         if len(pts) > 300:
             step = max(1, math.ceil(len(pts) / 300))
-            pts = pts[::step]
+            pts  = pts[::step]
         xy = [(sx(x), sy(y)) for x, y in pts]
         if len(xy) >= 3:
             draw.polygon(xy, fill=GREEN, outline=GREEN_LINE)
             cx = sum(p[0] for p in xy) / len(xy)
             cy = sum(p[1] for p in xy) / len(xy)
-            draw_center(draw, str(zone.get("name") or zone.get("hashId") or idx)[:16], cx, cy, 10, WHITE)
+            label = str(zone.get("name") or zone.get("hashId") or idx)[:16]
+            draw_center(draw, label, cx, cy, 10, WHITE)
 
     dock = data.get("chargingStationLoc")
     if isinstance(dock, dict):
@@ -200,7 +262,7 @@ def build_map_png(data: dict):
         if x is not None and y is not None:
             dx, dy = sx(x), sy(y)
             draw.ellipse((dx - 10, dy - 10, dx + 10, dy + 10), fill=YELLOW, outline=WHITE, width=2)
-            draw_center(draw, "D", dx, dy, 11, (0, 0, 0, 255))
+            draw_center(draw, "D", dx, dy, 11, BLACK)
 
     robot = data.get("robotLoc") or data.get("pose") or data.get("robotPosePib")
     if isinstance(robot, dict):
@@ -210,17 +272,17 @@ def build_map_png(data: dict):
             draw.ellipse((rx - 9, ry - 9, rx + 9, ry + 9), fill=ORANGE, outline=WHITE, width=2)
             draw_center(draw, "R", rx, ry, 11, WHITE)
 
-    return img, dbg
+    return img.convert("RGB"), dbg
 
 
 def text_png(title: str, subtitle: str) -> bytes:
     if Image is None or ImageDraw is None:
         return FALLBACK_PNG
-    img = Image.new("RGB", (W, H), BG)
+    img  = Image.new("RGBA", (W, H), BG)
     draw = ImageDraw.Draw(img, "RGBA")
-    draw_center(draw, title, W / 2, H / 2 - 16, 22, WHITE)
+    draw_center(draw, title,    W / 2, H / 2 - 16, 22, WHITE)
     draw_center(draw, subtitle, W / 2, H / 2 + 18, 13, GREY)
-    return png_bytes(img)
+    return png_bytes(img.convert("RGB"))
 
 
 def png_bytes(img) -> bytes:
@@ -238,16 +300,16 @@ def font(size: int):
         return ImageFont.load_default()
 
 
-def draw_text(draw, text, x, y, size, fill):
+def draw_text(draw, text: str, x: float, y: float, size: int, fill) -> None:
     draw.text((x, y), str(text), font=font(size), fill=fill)
 
 
-def draw_center(draw, text, x, y, size, fill):
-    f = font(size)
+def draw_center(draw, text: str, x: float, y: float, size: int, fill) -> None:
+    f    = font(size)
     text = str(text)
     try:
-        box = draw.textbbox((0, 0), text, font=f)
-        tw, th = box[2] - box[0], box[3] - box[1]
+        box     = draw.textbbox((0, 0), text, font=f)
+        tw, th  = box[2] - box[0], box[3] - box[1]
     except Exception:
         tw, th = len(text) * size * 0.6, size
     draw.text((x - tw / 2, y - th / 2), text, font=f, fill=fill)
@@ -261,7 +323,12 @@ def to_float(v: Any) -> float | None:
 
 
 def safe_points(points: list[Any]) -> list[tuple[float, float]]:
-    out = []
+    """Normalise zone points regardless of storage format.
+
+    Stored as dicts {x, y} from older MQTT path or as tuples (x, y)
+    from decode_map_fields / S3 backup map.
+    """
+    out: list[tuple[float, float]] = []
     for p in points:
         if isinstance(p, dict):
             x, y = to_float(p.get("x")), to_float(p.get("y"))
