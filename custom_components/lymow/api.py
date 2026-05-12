@@ -2,13 +2,12 @@
 Lymow async API client.
 
 Auth:  pycognito (USER_SRP_AUTH)
-REST:  aiohttp + Cognito AccessToken header
-MQTT:  paho-mqtt via mqtt.py (replaces all IoT HTTPS shadow calls)
+REST:  aiohttp + Cognito AccessToken header (device list, device info,
+       clean history, backup map list, S3 download)
+MQTT:  paho-mqtt via mqtt.py — all commands and config writes (blade height,
+       clean mode, etc.) go through MQTT pbinput only.
 
-Shadow HTTPS calls have been removed — the robot does not respond reliably
-to shadow writes for commands. All commands go through MQTT pbinput.
-Configuration writes (blade height, clean mode) use shadow HTTPS because
-those are persistent settings, not real-time commands.
+IoT shadow writes have been removed entirely.
 """
 
 from __future__ import annotations
@@ -45,7 +44,7 @@ S3_BUCKETS: dict[str, str] = {
 
 
 # ─────────────────────────────────────────────
-# SigV4 (used only for shadow config writes)
+# SigV4 (used for S3 signed downloads)
 # ─────────────────────────────────────────────
 
 def _sign(key: bytes, msg: str) -> bytes:
@@ -303,14 +302,13 @@ class CognitoAuth:
 # ─────────────────────────────────────────────
 
 class LymowClient:
-    """REST API client. Commands go through MQTT (see coordinator.py)."""
+    """REST API client — device info, S3 map downloads. Commands via MQTT."""
 
     def __init__(self, region: str, auth: CognitoAuth, session: aiohttp.ClientSession) -> None:
         self._region  = region
         self._auth    = auth
         self._session = session
         self._ep      = API_ENDPOINTS[region]
-        self._iot_host = self._ep["iotDomain"].replace("https://", "").rstrip("/")
 
     # ── Auth helpers ────────────────────────────────────────────
 
@@ -319,19 +317,6 @@ class LymowClient:
             "Content-Type":    "application/json",
             "Accept-Encoding": "gzip, deflate, br",
             "Authorization":   self._auth.access_token,
-        }
-
-    def _iot_headers(self, method: str, url: str, payload: bytes) -> dict:
-        return {
-            **_sigv4_headers(
-                method=method, url=url, payload=payload,
-                service="iotdevicegateway",
-                region=self._region,
-                access_key=self._auth.access_key_id,
-                secret_key=self._auth.secret_access_key,
-                session_token=self._auth.session_token,
-            ),
-            "Content-Type": "application/json",
         }
 
     # ── REST API ────────────────────────────────────────────────
@@ -439,33 +424,6 @@ class LymowClient:
     async def check_update(self, thing_name: str) -> dict:
         data = await self._api_get("checkUpdateApi", f"/check-update?deviceThingName={thing_name}")
         return data or {}
-
-    # ── Shadow writes (config only — blade height, clean mode) ──
-
-    async def _shadow_update(self, thing_name: str, desired: dict) -> bool:
-        """Write desired state to AWS IoT shadow (config, not commands)."""
-        url  = f"https://{self._iot_host}/things/{thing_name}/shadow"
-        body = json.dumps({"state": {"desired": desired}}).encode()
-        hdrs = self._iot_headers("POST", url, body)
-        try:
-            async with self._session.post(url, data=body, headers=hdrs) as r:
-                if r.status >= 400:
-                    text = await r.text()
-                    _LOGGER.warning("Shadow update failed %s: %s", r.status, text)
-                    return False
-                return True
-        except Exception as e:
-            _LOGGER.warning("Shadow update error: %s", e)
-            return False
-
-    async def cmd_set_blade_height(self, thing_name: str, height_mm: int) -> bool:
-        return await self._shadow_update(thing_name, {
-            "cutHeight":     height_mm,
-            "cuttingHeight": height_mm,
-        })
-
-    async def cmd_set_clean_mode(self, thing_name: str, mode: str) -> bool:
-        return await self._shadow_update(thing_name, {"cleanMode": mode})
 
 
 # ─────────────────────────────────────────────

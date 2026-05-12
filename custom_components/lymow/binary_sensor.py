@@ -119,13 +119,6 @@ BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
         entity_registry_enabled_default=False,
     ),
     LymowBinDesc(
-        key="find_robot_enabled",
-        name="Find Robot Enabled",
-        icon="mdi:map-marker-question",
-        value_fn=lambda d: bool(d.get("findRobotSwitch")),
-        entity_registry_enabled_default=False,
-    ),
-    LymowBinDesc(
         key="lifted",
         name="Lifted",
         device_class=BinarySensorDeviceClass.TAMPER,

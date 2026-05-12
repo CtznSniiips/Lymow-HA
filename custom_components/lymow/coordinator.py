@@ -29,6 +29,7 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.core import callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .api import CognitoAuth, LymowClient, LymowError
@@ -51,6 +52,7 @@ from .protocol import (
     USER_CTRL_RESUME_DOCK,
     build_initial_query_packets,
     build_refresh_query_packets,
+    encode_query_robot_config,
     decode_pboutput_envelope,
     decode_pbmap,
     encode_start_zones,
@@ -131,8 +133,12 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         await self._connect_mqtt()
 
-        self._rest_poll_task = self.hass.async_create_task(self._rest_poll_loop())
-        self._refresh_task   = self.hass.async_create_task(self._refresh_loop())
+        self._rest_poll_task = self.hass.async_create_background_task(
+            self._rest_poll_loop(), name=f"lymow_rest_poll_{self.thing_name}"
+        )
+        self._refresh_task = self.hass.async_create_background_task(
+            self._refresh_loop(), name=f"lymow_refresh_{self.thing_name}"
+        )
 
     async def async_shutdown(self) -> None:
         """Disconnect MQTT and cancel all background tasks."""
@@ -162,7 +168,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self.mqtt = MqttClient(
             thing_name=self.thing_name,
-            host=self.client._iot_host,
+            host=self.client._ep["iotDomain"].replace("https://", "").rstrip("/"),
             region=self._region,
             on_pboutput=self._handle_pboutput,
             on_notify_app=self._handle_notify_app,
@@ -180,11 +186,18 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Publish all startup queries. Also called after reconnect."""
         for raw in build_initial_query_packets(client_uuid=self._client_uuid):
             self._publish(raw)
+        # Robot only responds to robotConfig query after being online for a few seconds
+        self.hass.async_create_task(self._delayed_robot_config(1))
+        self.hass.async_create_task(self._delayed_robot_config(5))
 
     def _fire_refresh_queries(self) -> None:
         """Periodic refresh — keeps IP, signal, RTK and config up to date."""
         for raw in build_refresh_query_packets(client_uuid=self._client_uuid):
             self._publish(raw)
+    
+    async def _delayed_robot_config(self, delay: int) -> None:
+        """Send robot config query with delay — mirrors app behavior (1s + 5s)."""
+        self._publish(encode_query_robot_config())
 
     # ── Properties ──────────────────────────────────────────────
 
@@ -255,6 +268,21 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if zone:
             self._state["currentZone"] = zone
 
+        # Flatten runTimeConfig from btMap to top-level (blade height sensor)
+        btmap = self._state.get("btMap") or {}
+        import logging
+        _LOGGER.warning(
+            "DEBUG derive_state: cutHeight_top=%s btMap_cutHeight=%s btMap_keys=%s runTimeConfig=%s",
+            self._state.get("cutHeight"),
+            btmap.get("cutHeight"),
+            list(btmap.keys())[:10],
+            btmap.get("runTimeConfig"),
+        )
+        for k in ("cutHeight", "cutSpeed", "moveSpeed"):
+            if btmap.get(k) is not None and self._state.get(k) is None:
+                self._state[k] = btmap[k]
+
+
     # ── Inbound MQTT handlers ────────────────────────────────────
 
     def _handle_pboutput(self, raw_envelope: bytes) -> None:
@@ -275,7 +303,8 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ── Mow path tracking ──────────────────────────────────
         ws = new_state.get("workStatus")
         if ws is not None:
-            is_mowing = ws == 2  # WORK_STATUS_MOWING
+            is_mowing = new_state.get("robotStatus") == 2  # CLEANING
+
             if is_mowing:
                 self._mow_session_active = True
                 robot = (
@@ -285,20 +314,19 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     or self._state.get("robotLoc")
                 )
                 if isinstance(robot, dict):
-                    x = robot.get("x")
-                    y = robot.get("y")
+                    x, y = robot.get("x"), robot.get("y")
                     if x is not None and y is not None:
-                        # Deduplicate: skip if same as last point
                         pt = (round(float(x), 3), round(float(y), 3))
                         if not self._mow_path or self._mow_path[-1] != pt:
                             self._mow_path.append(pt)
-            elif self._mow_session_active and ws not in (2, 3, 8):
-                # Ended (not mowing, paused, or resuming) → keep path but mark inactive
-                self._mow_session_active = False
-            # Full reset only on dock/idle/offline
-            if ws in (0, 5, 12, -1):  # Idle, Charging, FullyCharged, Offline
+
+            # Reset SOLO quando è al dock (sessione terminata)
+            robot_status = new_state.get("robotStatus")
+            if robot_status in (0, 5, 12):   # NONE, CHARGING, CHARGING_FULL
                 self._mow_path = []
                 self._mow_session_active = False
+            elif robot_status in (1, 3, 8, 4, 10):  # WAITING, PAUSE, RESUME, DOCKING, PAUSE_DOCKING
+                self._mow_session_active = False     # congela ma preserva path
 
         _LOGGER.debug(
             "State update %s: workStatus=%s battery=%s",
@@ -334,8 +362,9 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         # Schedule reconnect in the HA event loop (we're in paho's thread here)
         if self._reconnect_task is None or self._reconnect_task.done():
-            self._reconnect_task = self.hass.async_create_task(
-                self._reconnect_with_fresh_creds()
+            self._reconnect_task = self.hass.async_create_background_task(
+                self._reconnect_with_fresh_creds(),
+                name=f"lymow_reconnect_{self.thing_name}"
             )
 
     async def _reconnect_with_fresh_creds(self) -> None:
@@ -542,6 +571,13 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 })
                 self.async_set_updated_data(self._state)
                 return
+            
+            _LOGGER.warning(
+                "DEBUG map decode: keys=%s cutHeight=%s runTimeConfig=%s",
+                list(decoded.keys()),
+                decoded.get("cutHeight"),
+                decoded.get("runTimeConfig"),
+            )
 
             state_update: dict[str, Any] = {
                 "backupMapList": map_list,
@@ -559,6 +595,10 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 state_update["enu_base_point"] = decoded["enuBasePoint"]
             if decoded.get("chargingStationLoc"):
                 state_update["chargingStationLoc"] = decoded["chargingStationLoc"]
+            # Flatten runTimeConfig values to state root for blade_height sensor
+            for k in ("cutHeight", "cutSpeed", "moveSpeed"):
+                if decoded.get(k) is not None:
+                    state_update[k] = decoded[k]
 
             self._merge_state(state_update)
             self._derive_state()
@@ -632,6 +672,27 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._rest_online = False
         except Exception:
             _LOGGER.debug("REST poll error for %s", self.thing_name, exc_info=True)
+
+        # ── Firmware update check (outside main try so REST errors don't skip it)
+        try:
+            update_info = await self.client.check_update(self.thing_name)
+            if isinstance(update_info, dict):
+                latest = (
+                    update_info.get("latestFw")
+                    or update_info.get("latest_fw")
+                    or update_info.get("version")
+                )
+                note = (
+                    update_info.get("releaseNote")
+                    or update_info.get("release_note")
+                    or update_info.get("releaseNotes")
+                    or ""
+                )
+                if latest:
+                    self._merge_state({"latestFw": latest, "releaseNote": note})
+        except Exception:
+            _LOGGER.debug("Firmware update check failed for %s", self.thing_name, exc_info=True)
+
         self.async_set_updated_data(self._state)
 
     # ── Publish helpers ──────────────────────────────────────────
@@ -703,13 +764,40 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._wait_state_update()
         return ok
 
-    async def async_set_blade_height(self, height_mm: int) -> bool:
-        await self.auth.ensure_valid(self._email, self._password)
-        return await self.client.cmd_set_blade_height(self.thing_name, height_mm)
+    async def async_set_blade_height(self, height_mm: int) -> None:
+        """Set global blade cut height via PbMap.runTimeConfig."""
+        from .protocol import encode_set_cut_height
+        self._publish(encode_set_cut_height(height_mm))
+        # Aggiorna lo stato locale immediatamente (ottimistic update)
+        if self.data:
+            self.data["cutHeight"] = height_mm
+            btmap = self.data.get("btMap") or {}
+            btmap["cutHeight"] = height_mm
+            self.data["btMap"] = btmap
+        self.async_update_listeners()
 
     async def async_set_clean_mode(self, mode: str) -> bool:
-        await self.auth.ensure_valid(self._email, self._password)
-        return await self.client.cmd_set_clean_mode(self.thing_name, mode)
+        """Set global clean mode via PbInput.robotConfig (MQTT only).
+
+        PbInput.robotConfig = field 13, PbRobotConfig.cleanMode = field 7.
+        """
+        from .protocol import _enc_i32, _enc_len, PB_VERSION_4_9
+        _CLEAN_MODE_INT = {
+            "ZIGZAG_MODE": 1, "CHESS_BOARD_MODE": 2,
+            "PERIMETER_LAPS_ONLY_MODE": 3, "ADAPTIVE_ZIGZAG_MODE": 4,
+        }
+        mode_int = _CLEAN_MODE_INT.get(mode)
+        if mode_int is None:
+            _LOGGER.warning("Unknown clean mode: %s", mode)
+            return False
+        rc = _enc_i32(7, mode_int)          # PbRobotConfig.cleanMode
+        raw = _enc_i32(2, PB_VERSION_4_9) + _enc_len(13, rc)
+        self._publish(raw)
+        if self.data:
+            self.data["cleanMode"] = mode
+            self.data["robotCleanMode"] = mode_int
+        self.async_update_listeners()
+        return True
 
     async def async_set_schedule(self, schedules: list[dict]) -> bool:
         _LOGGER.warning("set_schedule not implemented for MQTT path yet")

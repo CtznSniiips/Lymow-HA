@@ -100,6 +100,13 @@ WORK_STATUS_RTT            = 15  # factory RTT test mode
 # Virtual status (not in protobuf enum, set locally when shadow absent)
 WORK_STATUS_OFFLINE        = -1
 
+USER_CTRL_RECHARGE_DOCK    = 33   # dock + keep task progress
+USER_CTRL_FORCE_REINIT     = 28   # cancel task, stop in place
+USER_CTRL_PAUSE_DOCK       = 21   # pause while docking
+USER_CTRL_RESUME_DOCK      = 22   # resume docking
+USER_CTRL_RESUME           = 4    # resume from pause
+USER_CTRL_DOCK                   = 2
+
 # Statuses that map to LawnMowerActivity.MOWING
 MOWING_STATUSES    = {WORK_STATUS_MOWING, WORK_STATUS_RESUME, WORK_STATUS_ZONE_PARTITION}
 # Statuses that map to LawnMowerActivity.RETURNING

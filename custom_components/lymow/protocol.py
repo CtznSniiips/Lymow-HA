@@ -10,6 +10,8 @@ import base64
 import json
 import struct
 from typing import Any
+import logging
+_LOGGER = logging.getLogger(__name__)
 
 PB_VERSION_4_9 = 40
 
@@ -196,6 +198,21 @@ def encode_start_zones(zone_hash_ids: list[str]) -> bytes:
     if map_pb:
         pb += _enc_len(12, map_pb)
     return pb
+
+
+def encode_set_cut_height(cut_height_mm: int) -> bytes:
+    """Set global blade cut height via PbInput.map.runTimeConfig.
+
+    PbInput.map            = field 12 (PbMap)
+    PbMap.runTimeConfig    = field 13 (PbRunTimeConfig)
+    PbRunTimeConfig.cutHeight = field 1 (int32, mm)
+    """
+    rtc   = _enc_i32(1, int(cut_height_mm))
+    pbmap = _enc_len(13, rtc)
+    return (
+        _enc_i32(2, PB_VERSION_4_9)
+        + _enc_len(12, pbmap)
+    )
 
 
 def build_initial_query_packets(
@@ -585,6 +602,25 @@ def decode_map_fields(map_data: dict) -> dict[str, Any]:
         if dp:
             out["chargingStationLoc"] = dp
 
+    # PbRunTimeConfig (field 13) — global cutHeight / cutSpeed / moveSpeed
+    # This is the authoritative source for blade height, NOT PbRobotConfig.
+    # Arrives with every QUERY_MAP response.
+    rtc = _sub(map_data, 13)
+    if rtc:
+        rtc_out: dict[str, Any] = {}
+        v = _gv(rtc, 1)
+        if v is not None: rtc_out["cutHeight"] = v
+        f = _gf(rtc, 4)
+        if f is not None: rtc_out["moveSpeed"] = f
+        v = _gv(rtc, 6)
+        if v is not None: rtc_out["cutSpeed"]  = v
+        if rtc_out:
+            out["runTimeConfig"] = rtc_out
+            # Flatten to top-level for easy sensor access
+            for k in ("cutHeight", "cutSpeed", "moveSpeed"):
+                if k in rtc_out:
+                    out[k] = rtc_out[k]
+
     for kind, zval in map_data.get(1, []):
         if kind != "L":
             continue
@@ -749,7 +785,6 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
              4 remainCleanTime int32 (s)
              5 cleanPercent    float
              6 mapArea         float (m²)
-     14  PbPose pose           → state["pose"] + state["robotLoc"]  (live position)
      17  PbRobotConfig (after QUERY_ROBOT_CONFIG):
              1 cutHeight → state["cutHeight"]
              7 cleanMode → state["robotCleanMode"] + state["cleanMode"] (string)
@@ -757,12 +792,32 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
      18  outputCtrl        int32
      23  PbBtMap           → state["btMap"] = decode_btmap(...)
      24  PbPose chargingStationLoc → state["chargingStationLoc"]
-     31  PbPoint robotPosePib  → state["robotPosePib"]               (alt position)
      34  PbNetDetailInfo   → state["netDetailInfo"]
      35  PbRtkDiagnosticL1 → state["rtkDiagnosticL1"] + state["rtkStatus"]
     """
     state: dict[str, Any] = {}
     root = _wire_parse(raw)
+
+    # DEBUG TEMPORANEO — rimuovi dopo
+    _LOGGER.warning(
+        "PbOutput root fields: %s | field7_present=%s field17_present=%s",
+        sorted(root.keys()),
+        7 in root,
+        17 in root,
+    )
+    if 7 in root:
+        bo = _sub(root, 7)
+        _LOGGER.warning("PbBaseOutput fields: %s | cutHeight(f4)=%s", sorted(bo.keys()), _gv(bo, 4))
+    if 17 in root:
+        rc = _sub(root, 17)
+        _LOGGER.warning("PbRobotConfig ALL fields raw: %s", {k: root[17] for k in [17]})
+        _LOGGER.warning("PbRobotConfig sub fields: %s", sorted(rc.keys()))
+        for fno in range(1, 25):
+            v = _gv(rc, fno)
+            f = _gf(rc, fno)
+            s = _gs(rc, fno)
+            if v is not None or f is not None or s is not None:
+                _LOGGER.warning("  PbRobotConfig field %d: varint=%s float=%s str=%s", fno, v, f, s)
 
     for fno, key in [(1, "msgId"), (2, "version")]:
         v = _gv(root, fno)
@@ -802,6 +857,13 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
             s = _gs(dp, fno)
             if s: state[key] = s
 
+    # PbBaseOutput (field 7) — real-time broadcast includes cutHeight
+    # PbBaseOutput.cutHeight = field 4 (int, mm) — most reliable source
+    bo = _sub(root, 7)
+    if bo:
+        v = _gv(bo, 4)
+        if v is not None: state["cutHeight"] = v
+
     # PbMap (field 11) — direct full map branch
     direct_map = _sub(root, 11)
     if direct_map:
@@ -840,7 +902,7 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
     if rc:
         cfg: dict[str, Any] = {}
         for fno, key in [
-            (1,"cutHeight"),(5,"brushSpeed"),(6,"cutSpeed"),(7,"cleanMode"),
+            (3,"cutHeight"),(5,"brushSpeed"),(6,"cutSpeed"),(7,"cleanMode"),  # field 3 = rcCutHeight
             (8,"cleanDir"),(9,"pathSpacing"),(10,"perimeterMowLaps"),
             (11,"perimeterMowDir"),(12,"noGoMowLaps"),(13,"obsDecMode"),
             (15,"startProgress"),(16,"relativeCleanDir"),(19,"followDetectMode"),
@@ -891,6 +953,10 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
 
                 if btmap.get("enuBasePoint"):
                     state["enu_base_point"] = btmap["enuBasePoint"]
+                # Flatten runTimeConfig values from btMap S3 path
+                for k in ("cutHeight", "cutSpeed", "moveSpeed"):
+                    if btmap.get(k) is not None:
+                        state[k] = btmap[k]
             break
 
     # chargingStationLoc / PbPose (field 24)
@@ -901,31 +967,6 @@ def decode_pboutput(raw: bytes) -> dict[str, Any]:
             f = _gf(pose, fno)
             if f is not None: dock[key] = f
         if dock: state["chargingStationLoc"] = dock
-    
-    # pose (field 14) — robot ENU position, broadcast in real-time while operating
-    pose_rt = _sub(root, 14)
-    if pose_rt:
-        p: dict[str, Any] = {}
-        for fno, key in [(1, "x"), (2, "y")]:
-            f = _gf(pose_rt, fno)
-            if f is not None: p[key] = f
-        h = _gf(pose_rt, 3)
-        if h is not None: p["heading"] = h; p["theta"] = h
-        if p:
-            state["pose"]     = p
-            state["robotLoc"] = p
-
-    # robotPosePib (field 31) — alternative position format (point only, no heading)
-    pib = _sub(root, 31)
-    if pib:
-        p2: dict[str, Any] = {}
-        x = _gf(pib, 1)
-        y = _gf(pib, 2)
-        if x is not None: p2["x"] = x
-        if y is not None: p2["y"] = y
-        if p2:
-            state.setdefault("robotPosePib", p2)
-            state.setdefault("robotLoc",     p2)   # fallback se pose assente
 
     # PbNetDetailInfo (field 34)
     nd = _sub(root, 34)

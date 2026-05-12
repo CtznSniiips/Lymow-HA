@@ -30,7 +30,6 @@ from .const import (
     F_FW_VERSION,
     F_IP_ADDRESS,
     F_LTE_SIGNAL,
-    F_MAC,
     F_MCU_VERSION,
     F_NET_DETAIL,
     F_RTK_STATUS,
@@ -97,12 +96,6 @@ def _rtk(key: str) -> Callable[[dict], Any]:
 def _robot_ip(d: dict) -> str | None:
     """Robot IP — top-level ipAddress, fallback netDetailInfo.wifiIp."""
     return d.get(F_IP_ADDRESS) or (d.get(F_NET_DETAIL) or {}).get("wifiIp")
-
-def _pose(key: str) -> Callable[[dict], Any]:
-    return lambda d: (d.get("pose") or d.get("robotLoc") or d.get("robotPosePib") or {}).get(key)
-
-def _enu(key: str) -> Callable[[dict], Any]:
-    return lambda d: (d.get("enu_base_point") or (d.get("btMap") or {}).get("enuBasePoint") or {}).get(key)
 
 def _history_summary(key: str) -> Callable[[dict], Any]:
     return lambda d: (d.get("cleanHistorySummary") or {}).get(key)
@@ -183,7 +176,6 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:progress-check",
         value_source="cleanPercent",
-        entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
         key="session_remain",
@@ -277,15 +269,6 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
-        key="sim_iccid",
-        name="SIM ICCID",
-        icon="mdi:sim",
-        value_source=_net("simIccid"),
-        entity_registry_enabled_default=False,
-    ),
-
-    # ── Firmware / Device identity ────────────────────────────────────────
-    LymowSensorDesc(
         key="fw_version",
         name="Firmware",
         icon="mdi:chip",
@@ -307,98 +290,10 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
-        key="mac_address",
-        name="MAC Address",
-        icon="mdi:ethernet",
-        value_source=F_MAC,
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="wheel_version",
-        name="Wheel Version",
-        icon="mdi:tire",
-        value_source="wheelVer",
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="knife_version",
-        name="Blade Version",
-        icon="mdi:scissors-cutting",
-        value_source="knifeVer",
-        entity_registry_enabled_default=False,
-    ),
-
-
-    # ── Position / Map frame ───────────────────────────────────────────────
-    LymowSensorDesc(
-        key="derived_latitude",
-        name="Derived Latitude",
-        icon="mdi:latitude",
-        value_source="derivedLatitude",
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="derived_longitude",
-        name="Derived Longitude",
-        icon="mdi:longitude",
-        value_source="derivedLongitude",
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="robot_local_x",
-        name="Robot Local X",
-        native_unit_of_measurement=UnitOfLength.METERS,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:axis-x-arrow",
-        value_source=_pose("x"),
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="robot_local_y",
-        name="Robot Local Y",
-        native_unit_of_measurement=UnitOfLength.METERS,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:axis-y-arrow",
-        value_source=_pose("y"),
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="robot_heading",
-        name="Robot Heading",
-        icon="mdi:compass",
-        value_source=lambda d: (d.get("pose") or d.get("robotLoc") or {}).get("heading")
-            or (d.get("pose") or d.get("robotLoc") or {}).get("theta"),
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
         key="current_zone",
         name="Current Zone",
         icon="mdi:map-marker-radius",
         value_source="currentZone",
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="enu_base_latitude",
-        name="RTK Base Latitude",
-        icon="mdi:satellite-uplink",
-        value_source=_enu("latitude"),
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="enu_base_longitude",
-        name="RTK Base Longitude",
-        icon="mdi:satellite-uplink",
-        value_source=_enu("longitude"),
-        entity_registry_enabled_default=False,
-    ),
-
-    # ── REST history / cloud summary ───────────────────────────────────────
-    LymowSensorDesc(
-        key="clean_history_records",
-        name="Clean History Records",
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:history",
-        value_source="cleanHistoryTotalRecords",
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
@@ -534,10 +429,16 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
     """Exposes the Lymow zone map as a GeoJSON FeatureCollection.
 
     State  : "<N> zones"
-    Attr   : geojson → FeatureCollection (WGS84 when enuBasePoint available)
+    Attr   : geojson -> FeatureCollection (WGS84 when enuBasePoint available)
 
     Consumed by custom Lovelace map cards and by the Flutter control app
     via HA WebSocket / REST.
+
+    Performance:
+    - Cache: rebuilds only when (zone_count, mow_path_len, has_origin) changes,
+      avoiding repeated ENU->WGS84 conversions on every MQTT push (~1 s).
+    - Decimation: max 150 pts/zone, max 500 pts for mow path to stay under
+      HA's 16 KB attribute limit with 52+ zones.
     """
 
     _attr_name = "Map GeoJSON"
@@ -545,6 +446,8 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
         super().__init__(coordinator, "map_geojson")
+        self._geojson_cache: dict | None = None
+        self._cache_key: tuple | None = None  # (zone_count, mow_path_len, has_origin)
 
     @property
     def available(self) -> bool:
@@ -563,27 +466,36 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
         btmap = data.get("btMap") or {}
         zones = btmap.get("zones") or []
 
-        # enuBasePoint: {latitude, longitude, altitude} — set by _decode_lla_dict
         ebp  = btmap.get("enuBasePoint") or data.get("enu_base_point") or {}
         lat0 = _sf(ebp.get("latitude"))
         lon0 = _sf(ebp.get("longitude"))
         has_origin = lat0 is not None and lon0 is not None
 
+        mow_path = getattr(self.coordinator, "mow_path", [])
+
+        # Only rebuild when something meaningful actually changed.
+        cache_key = (len(zones), len(mow_path), has_origin)
+        if cache_key == self._cache_key and self._geojson_cache is not None:
+            return self._geojson_cache
+
         features: list[dict[str, Any]] = []
 
-        # Zone polygons
+        # Zone polygons — decimated to max 150 pts each
         for idx, zone in enumerate(zones):
             pts = _safe_pts(zone.get("points") or [])
             if len(pts) < 3:
                 continue
+            if len(pts) > 150:
+                step = max(1, len(pts) // 150)
+                pts  = pts[::step]
+                if pts[0] != pts[-1]:
+                    pts.append(pts[0])
             props: dict[str, Any] = {
                 "type":     "zone",
                 "name":     zone.get("name") or zone.get("hashId") or str(idx),
                 "hashId":   zone.get("hashId"),
                 "zoneType": zone.get("zoneType"),
             }
-            if cfg := zone.get("zoneConfig"):
-                props["zoneConfig"] = cfg
             if has_origin:
                 geometry: dict[str, Any] = {
                     "type":        "Polygon",
@@ -632,17 +544,20 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
                     },
                     "geometry": {"type": "Point", "coordinates": coords},
                 })
-                
-        # Mow path (current/last session)
-        mow_path = getattr(self.coordinator, "mow_path", [])
+
+        # Mow path — decimated to max 500 pts
         if len(mow_path) >= 2:
+            path_pts = mow_path
+            if len(path_pts) > 500:
+                step     = max(1, len(path_pts) // 500)
+                path_pts = path_pts[::step]
             if has_origin:
                 line_coords = []
-                for x, y in mow_path:
+                for x, y in path_pts:
                     lat, lon = _enu_to_latlon(x, y, lat0, lon0)
                     line_coords.append([round(lon, 8), round(lat, 8)])
             else:
-                line_coords = [[p[0], p[1]] for p in mow_path]
+                line_coords = [[p[0], p[1]] for p in path_pts]
             features.append({
                 "type": "Feature",
                 "properties": {
@@ -656,9 +571,12 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
                 },
             })
 
-        return {
-            "geojson": {"type": "FeatureCollection", "features": features},
-            "zone_count":      len(features),
-            "has_gps_origin":  has_origin,
-            "enu_base_point":  ebp or None,
+        result = {
+            "geojson":        {"type": "FeatureCollection", "features": features},
+            "zone_count":     len(features),
+            "has_gps_origin": has_origin,
+            "enu_base_point": ebp or None,
         }
+        self._geojson_cache = result
+        self._cache_key     = cache_key
+        return result
