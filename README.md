@@ -16,12 +16,16 @@ Control your robot, monitor its status, view zones and map — all from Home Ass
 
 ## Features
 
-- 🤖 **Lawn Mower entity** — start, pause, dock via standard HA lawn mower card
-- 🔋 **Sensors** — battery, work status, blade height, mow mode, RTK GPS, WiFi/4G signal, firmware version, session area, mow duration
-- 🟢 **Binary sensors** — online, charging, mowing, error, rain delay, WiFi/4G connected
-- 🗺️ **Map camera** — live SVG map rendered from zone and obstacle data with robot position, RTK and battery HUD
-- 🎛️ **Controls** — blade height slider (20–60 mm), mow mode selector
-- 📅 **Services** — start specific zones, set blade height, configure weekly schedule
+- 🤖 **Lawn Mower entity** — start, pause, dock via the standard HA lawn mower card
+- 🔘 **Command buttons** — individual Start, Pause, Dock, Cancel Task and Dock & Cancel buttons for use anywhere in Lovelace
+- 🔋 **Sensors** — battery, work status, blade height, mow mode, RTK GPS, WiFi/4G signal, firmware version, session area, session progress, mow duration
+- 🟢 **Binary sensors** — online, charging, mowing, error, lifted, rain delay, WiFi/4G connected
+- 🗺️ **Map camera** — diagnostic PNG rendered from S3 backup map with zone polygons, robot position, dock location and mow path overlay
+- 📡 **Live camera** — RTSP stream from the robot's onboard camera, transcoded to HLS by HA's built-in `stream` component
+- 🌍 **GeoJSON sensor** — full zone map as a GeoJSON FeatureCollection (WGS84) for use with custom Lovelace map cards or external apps
+- 🎛️ **Mow mode selector** — change cutting pattern (Zigzag, Chess Board, Perimeter Only, Adaptive Zigzag)
+- 📦 **Firmware update notifications** — HA Updates panel shows available OTA versions with release notes
+- 📋 **Session history events** — `event.lymow_session_completed` fires on every completed mow with area, duration, battery and zones
 - 🔄 **Multi-region** — Europe, Asia Pacific (Sydney & Hong Kong), US East
 - 🔁 **Token auto-refresh** — stays logged in, no manual intervention needed
 
@@ -85,66 +89,163 @@ Or manually:
 
 ## Entities
 
+### Controls
+
 | Entity | Type | Description |
 |--------|------|-------------|
-| Lymow Robot | `lawn_mower` | Main control entity |
-| Battery | `sensor` | Battery level % |
+| Lymow Robot | `lawn_mower` | Main control entity (Start / Pause / Dock) |
+| Start Mowing | `button` | Start or resume mowing (state-aware) |
+| Pause | `button` | Pause mowing or docking |
+| Dock | `button` | Return to dock, keep task progress |
+| Cancel Task | `button` | Stop in place and reset to waiting |
+| Dock & Cancel | `button` | Return to dock and abandon current task |
+| Mow Mode | `select` | Cutting pattern selector |
+| Backup Map | `select` | Choose which S3 backup map to load |
+| Blade Height | `number` | Current cutting height in mm (read-only, from zone config) |
+
+### Sensors
+
+| Entity | Type | Description |
+|--------|------|-------------|
 | Status | `sensor` | Work status (Mowing, Docked, Charging…) |
-| Mow Mode | `sensor` / `select` | Current cutting pattern |
-| Blade Height | `sensor` / `number` | Cutting height in mm |
+| Battery | `sensor` | Battery level % |
 | RTK GPS | `sensor` | GPS fix quality (Not Ready / Float / Fixed) |
 | Session Area | `sensor` | Area mowed in current session (m²) |
-| WiFi Signal | `sensor` | WiFi RSSI (dBm) |
-| 4G Signal | `sensor` | LTE RSSI (dBm) |
+| Session Progress | `sensor` | Mowing progress % |
+| Mow Mode | `sensor` | Active cutting pattern |
+| Blade Height | `sensor` | Cutting height in mm |
 | Firmware | `sensor` | Current firmware version |
-| Online | `binary_sensor` | Robot connectivity |
-| Charging | `binary_sensor` | Whether robot is charging |
-| Mowing | `binary_sensor` | Whether robot is actively mowing |
-| Error | `binary_sensor` | Whether an error is active |
-| Map | `camera` | SVG map with zones, obstacles and robot position |
+| IP Address | `sensor` | Robot LAN IP (used for RTSP camera) |
+| Camera URL | `sensor` | Full RTSP URL for use with external tools |
+| Map GeoJSON | `sensor` | Zone map as GeoJSON FeatureCollection |
+
+Additional sensors (disabled by default, enable in entity settings):
+
+| Entity | Description |
+|--------|-------------|
+| Session Duration | Mowing time in current session |
+| Session Remaining | Estimated remaining time |
+| Map Total Area | Total mapped area (m²) |
+| Zone Count | Number of zones in the map |
+| RTK Precision | GPS position accuracy (m) |
+| RTK Satellites | Number of satellites tracked |
+| WiFi Signal | WiFi RSSI (dBm) |
+| 4G Signal | LTE RSSI (dBm) |
+| Network Type | Active network (WiFi / LTE) |
+| WiFi Network | Connected WiFi SSID |
+| MCU Version | MCU firmware string |
+| Serial Number | Robot serial number |
+| Total Clean Time | Cumulative mowing time |
+| Total Clean Area | Cumulative mowed area |
+
+### Binary sensors
+
+| Entity | Type | Default | Description |
+|--------|------|---------|-------------|
+| Online | `binary_sensor` | ✅ | Robot connectivity |
+| Charging | `binary_sensor` | ✅ | Whether robot is charging |
+| Mowing | `binary_sensor` | ✅ | Whether robot is actively mowing |
+| Error | `binary_sensor` | ✅ | Whether an error is active |
+| Lifted | `binary_sensor` | ✅ | Lift/tamper detection |
+| WiFi Connected | `binary_sensor` | — | WiFi active |
+| 4G Connected | `binary_sensor` | — | LTE active |
+| Rain Delay | `binary_sensor` | — | Rain delay active |
+| Theft Detection | `binary_sensor` | — | Theft detection enabled |
+| Theft Lock | `binary_sensor` | — | Device lock active |
+
+### Cameras
+
+| Entity | Type | Description |
+|--------|------|-------------|
+| Map | `camera` | Diagnostic PNG — zones, robot, dock, mow path |
+| Live Camera | `camera` | RTSP → HLS live stream (requires LAN access) |
+
+### Other
+
+| Entity | Type | Description |
+|--------|------|-------------|
+| Last Session | `event` | Fires `lymow_session_completed` on mow completion |
+| Firmware | `update` | OTA update notification with release notes |
 
 ---
 
 ## Services
 
-### `lymow.start_zone`
-Start mowing one or more specific zones.
+### `lymow.start_zones`
+Start mowing one or more specific zones by hashId or name.
 
 ```yaml
-service: lymow.start_zone
+service: lymow.start_zones
 data:
-  zone_ids:
-    - "zone_hash_id_1"
-    - "zone_hash_id_2"
+  zones:
+    - "vfW8PgjE"       # hashId
+    - "Front Lawn"     # or zone name
 ```
 
-### `lymow.set_blade_height`
-Set the cutting blade height (20–60 mm, step 5).
+### `lymow.dock_cancel_task`
+Return to dock **and cancel** the current task (no recharge-resume).
 
 ```yaml
-service: lymow.set_blade_height
-data:
-  height_mm: 40
+service: lymow.dock_cancel_task
 ```
 
-### `lymow.set_schedule`
-Configure the weekly mowing schedule.
+### `lymow.cancel_task`
+Stop the robot in place and reset to waiting state (equivalent to "Cancel task" in the app).
 
 ```yaml
-service: lymow.set_schedule
-data:
-  schedules:
-    - day: 1        # 0=Sun, 1=Mon … 6=Sat
-      startHour: 9
-      startMin: 0
-      duration: 120  # minutes
-    - day: 4
-      startHour: 10
-      startMin: 0
-      duration: 90
+service: lymow.cancel_task
 ```
 
-> If you have more than one robot, add `entry_id: <config_entry_id>` to target a specific one.
+> For integrations with multiple robots, add `device_id: <device_id>` to target a specific one.
+
+---
+
+## Session history automations
+
+The `event.lymow_session_completed` entity fires whenever a new completed session is detected. Use it to send a notification when mowing finishes:
+
+```yaml
+automation:
+  trigger:
+    platform: state
+    entity_id: event.lymow_session_completed
+  action:
+    service: notify.mobile_app
+    data:
+      title: "Mowing complete"
+      message: >
+        Mowed {{ state_attr('event.lymow_session_completed', 'area_m2') }} m²
+        in {{ (state_attr('event.lymow_session_completed', 'duration_s') / 60) | round }} min.
+        Used {{ state_attr('event.lymow_session_completed', 'used_battery') }}% battery.
+```
+
+---
+
+## Map card (GeoJSON)
+
+The `sensor.lymow_map_geojson` attribute `geojson` contains a standard GeoJSON FeatureCollection with zone polygons, dock position and robot position (WGS84). Use it with a custom Lovelace map card:
+
+```yaml
+type: custom:map-card
+fit_to_markers: true
+entities:
+  - entity: sensor.lymow_map_geojson
+    geojson:
+      attribute: geojson
+      filter:
+        property: type
+        value: zone
+      color: "#00c853"
+      fill_opacity: 0.25
+  - entity: sensor.lymow_map_geojson
+    geojson:
+      attribute: geojson
+      filter:
+        property: type
+        value: mow_path
+      color: "#ff6f00"
+      fill_opacity: 0
+```
 
 ---
 
@@ -161,7 +262,7 @@ logger:
     custom_components.lymow: debug
 ```
 
-Logs will appear in **Settings → System → Logs**. They include the full shadow state payload from the robot, which is useful for diagnosing missing or incorrect sensor values.
+Logs will appear in **Settings → System → Logs**.
 
 ### Common issues
 
@@ -174,10 +275,16 @@ Logs will appear in **Settings → System → Logs**. They include the full shad
 
 **All sensors unavailable**  
 → The robot may be offline or out of WiFi/4G range. Check the **Online** binary sensor.  
-→ Enable debug logging and check for shadow fetch errors.
+→ Enable debug logging and look for connection errors.
 
 **Map is empty**  
-→ The robot needs to have completed at least one mapping session. The map is fetched from the shadow and backup S3 data — it may take one polling cycle to appear.
+→ The robot needs to have completed at least one mapping session. The map is loaded from the S3 backup map and may take one polling cycle to appear after restart.
+
+**Live camera not working**  
+→ The robot's IP must be reachable from the HA host (same LAN or VPN). Check `sensor.lymow_camera_url` for the RTSP address. A DHCP reservation for the robot is recommended.
+
+**Blade height shows Unknown**  
+→ The firmware does not expose a global blade height. The value is read from the first zone's configuration and becomes available after the map is loaded.
 
 ---
 
@@ -187,7 +294,7 @@ Join the community Discord server for help, feedback and discussion:
 
 [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white)](https://discord.gg/8kmYsP6ZRv)
 
-If you find this integration useful and want to support its development, you can buy me a coffee:
+If you find this integration useful, you can support its development:
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/d3dfantasy99)
 
@@ -197,4 +304,4 @@ To report a bug or request a feature, please [open an issue](https://github.com/
 
 ## Disclaimer
 
-This integration communicates directly with Lymow's AWS infrastructure (Cognito, API Gateway, IoT Shadow) using credentials obtained by reverse engineering the official Android app. Use at your own risk. The API may change at any time without notice.
+This integration communicates with Lymow's AWS infrastructure (Cognito, API Gateway, IoT MQTT, S3) using credentials obtained by reverse engineering the official Android app. All commands are sent over MQTT — no IoT shadow writes are used. Use at your own risk. The API may change at any time without notice.
