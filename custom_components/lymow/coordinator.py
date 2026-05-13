@@ -678,15 +678,10 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_info = await self.client.check_update(self.thing_name)
             if isinstance(update_info, dict):
                 latest = (
-                    update_info.get("latestFw")
-                    or update_info.get("latest_fw")
-                    or update_info.get("version")
+                    update_info.get("latestVersion")
                 )
                 note = (
                     update_info.get("releaseNote")
-                    or update_info.get("release_note")
-                    or update_info.get("releaseNotes")
-                    or ""
                 )
                 if latest:
                     self._merge_state({"latestFw": latest, "releaseNote": note})

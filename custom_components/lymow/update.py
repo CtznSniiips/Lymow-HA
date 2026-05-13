@@ -62,9 +62,7 @@ class LymowFirmwareUpdate(LymowEntity, UpdateEntity):
     def installed_version(self) -> str | None:
         d = self.coordinator.data or {}
         return (
-            d.get("appFwVersion")
-            or d.get("fwVersion")
-            or d.get("softwareVersion")
+            d.get("softwareVersion") or ""
         )
 
     # ── latest version (from check_update REST call) ─────────────
@@ -81,18 +79,18 @@ class LymowFirmwareUpdate(LymowEntity, UpdateEntity):
 
     @property
     def release_notes(self) -> str | None:
-        return (self.coordinator.data or {}).get("releaseNote") or None
-
-    async def async_release_notes(self) -> str | None:
-        return self.release_notes
-
+        note = (self.coordinator.data or {}).get("releaseNote")
+        if not note:
+            return None
+        # API returns literal \n instead of real newlines
+        return note.replace("\\n", "\n")
     # ── extra attributes ─────────────────────────────────────────
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         d = self.coordinator.data or {}
         return {
-            "mcu_version":      d.get("mcuVersion") or d.get("mcuFwVersion"),
+            "mcu_version":      d.get("softwareVersion"),
             "latest_fw":        d.get("latestFw"),
             "release_note":     d.get("releaseNote"),
         }
