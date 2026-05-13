@@ -77,12 +77,11 @@ class LymowFirmwareUpdate(LymowEntity, UpdateEntity):
 
     # ── release notes ────────────────────────────────────────────
 
-    @property
-    def release_notes(self) -> str | None:
-        note = (self.coordinator.data or {}).get("releaseNote")
+    async def async_release_notes(self) -> str | None:
+        d = self.coordinator.data or {}
+        note = d.get("releaseNote")
         if not note:
             return None
-        # API returns literal \n instead of real newlines
         return note.replace("\\n", "\n")
     # ── extra attributes ─────────────────────────────────────────
 
