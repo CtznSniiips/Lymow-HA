@@ -1,12 +1,14 @@
 {
   "domain": "lymow",
   "name": "Lymow HA Integration",
-  "version": "2.1.5",
+  "version": "2.1.7",
   "config_flow": true,
-  "documentation": "https://github.com/d3dfantasy99/Lymow-HA",
+  "documentation": "https://github.com/d3dfantasy99/Lymow-HA/Wiki",
+  "issue_tracker": "https://github.com/d3dfantasy99/Lymow-HA/issues",
   "requirements": [
     "pycognito==2024.5.1",
-    "paho-mqtt>=1.6.1"
+    "paho-mqtt>=1.6.1",
+    "protobuf>=5.26.1"
   ],
   "dependencies": [],
   "codeowners": [
@@ -14,5 +16,5 @@
   ],
   "iot_class": "local_push",
   "single_config_entry": false,
-  "hacs": "2.1.5"
+  "hacs": "2.1.7"
 }

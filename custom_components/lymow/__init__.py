@@ -36,6 +36,8 @@ PLATFORMS = [
     Platform.CAMERA,
     Platform.DEVICE_TRACKER,
     Platform.UPDATE,
+    Platform.SWITCH,
+    Platform.TIME
 ]
 
 

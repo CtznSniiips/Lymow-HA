@@ -22,6 +22,19 @@ from .entity_base import LymowEntity
 from .state import get_enu_base_point, robot_gps_from_state
 
 
+def _read_float(obj, key: str) -> float | None:
+    if obj is None:
+        return None
+    try:
+        value = obj.get(key) if isinstance(obj, dict) else getattr(obj, key)
+    except Exception:
+        return None
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class _LymowTrackerBase(LymowEntity, TrackerEntity, RestoreEntity):
     """Base tracker with RestoreEntity fallback after HA restart."""
 
@@ -57,15 +70,17 @@ class LymowRtkBaseTracker(_LymowTrackerBase):
     @property
     def latitude(self) -> float | None:
         ebp = get_enu_base_point(self.coordinator.data or {})
-        if ebp and ebp.get("latitude") is not None:
-            return float(ebp["latitude"])
+        lat = _read_float(ebp, "latitude")
+        if lat is not None:
+            return lat
         return self._restored_lat
 
     @property
     def longitude(self) -> float | None:
         ebp = get_enu_base_point(self.coordinator.data or {})
-        if ebp and ebp.get("longitude") is not None:
-            return float(ebp["longitude"])
+        lon = _read_float(ebp, "longitude")
+        if lon is not None:
+            return lon
         return self._restored_lon
 
 

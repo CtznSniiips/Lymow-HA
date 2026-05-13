@@ -1,16 +1,24 @@
-"""Lymow protobuf encode/decode — raw bytes, no compiled pb2 required.
+"""Lymow protocol layer — protobuf-first encode/decode + btMap wire parser.
 
-Field numbers confirmed from decompiled.js encoders + live wire captures.
+This module uses the generated protobuf classes for normal PbInput/PbOutput
+handling and keeps the low-level wire parser only for Lymow's nested btMap
+queryAck blobs, where parts of the recovered .proto are incomplete/opaque.
 
-PbOutput root field map (see full docstring in decode_pboutput).
+Generated protobuf module location expected by this integration:
+    custom_components/lymow/proto/lymow_pb2.py
 """
 from __future__ import annotations
 
 import base64
 import json
-import struct
-from typing import Any
 import logging
+import re
+import struct
+from dataclasses import dataclass, field
+from typing import Any
+
+from .proto import lymow_pb2 as pb
+
 _LOGGER = logging.getLogger(__name__)
 
 PB_VERSION_4_9 = 40
@@ -34,6 +42,7 @@ USER_CTRL_QUERY_NET_DETAIL       = 53
 USER_CTRL_QUERY_RTK_L1           = 57
 USER_CTRL_QUERY_RTK_L2           = 58
 
+# cleanMode int -> string (PbZoneConfig.cleanMode values)
 CLEAN_MODE_INT = {
     0: "NONE",
     1: "ZIGZAG_MODE",
@@ -41,11 +50,136 @@ CLEAN_MODE_INT = {
     3: "PERIMETER_LAPS_ONLY_MODE",
     4: "ADAPTIVE_ZIGZAG_MODE",
 }
+CLEAN_MODE_STR = {v: k for k, v in CLEAN_MODE_INT.items() if k != 0}
 
 
-# ── Wire encoder ───────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Dataclasses used by HA entities/camera/selects
+# ---------------------------------------------------------------------------
 
-def _enc_varint(value: int) -> bytes:
+@dataclass(slots=True)
+class ZoneInfo:
+    hash_id: str
+    name: str
+    mow_order: int = 0
+    is_enabled: bool = True
+    polygon_points: list[tuple[float, float]] = field(default_factory=list)
+    zone_config: dict[str, Any] = field(default_factory=dict)
+    text_pos: tuple[float, float] | None = None
+    zone_type: int | None = None
+    area: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "hashId": self.hash_id,
+            "name": self.name,
+            "mowOrder": self.mow_order,
+            "isEnabled": self.is_enabled,
+            "points": self.polygon_points,
+            "points_count": len(self.polygon_points),
+        }
+        if self.zone_type is not None:
+            out["zoneType"] = self.zone_type
+        if self.zone_config:
+            out["zoneConfig"] = self.zone_config
+        if self.text_pos is not None:
+            out["textPos"] = {"x": self.text_pos[0], "y": self.text_pos[1]}
+        if self.area is not None:
+            out["area"] = self.area
+        return out
+
+
+@dataclass(slots=True)
+class ChannelInfo:
+    hash_id: str
+    zone1: str = ""
+    zone2: str = ""
+    is_valid: bool | None = None
+    is_docking_channel: bool = False
+    polygon_points: list[tuple[float, float]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "hashId": self.hash_id,
+            "zone1": self.zone1,
+            "zone2": self.zone2,
+            "isDockingChannel": self.is_docking_channel,
+            "points": self.polygon_points,
+            "points_count": len(self.polygon_points),
+        }
+        if self.is_valid is not None:
+            out["isValid"] = self.is_valid
+        return out
+
+
+@dataclass(slots=True)
+class ZoneCatalog:
+    zones: list[ZoneInfo] = field(default_factory=list)
+    channels: list[ChannelInfo] = field(default_factory=list)
+    zones_by_hashid: dict[str, ZoneInfo] = field(default_factory=dict)
+    runtime_config: dict[str, Any] | None = None
+    enu_base_point: dict[str, Any] | None = None
+    charging_station_loc: dict[str, Any] | None = None
+
+    def to_btmap_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "zones": [z.to_dict() for z in self.zones],
+            "zone_count": len(self.zones),
+            "zones_with_points": sum(1 for z in self.zones if z.polygon_points),
+            "channels": [c.to_dict() for c in self.channels],
+            "channels_with_points": sum(1 for c in self.channels if c.polygon_points),
+        }
+        if self.runtime_config:
+            out["runTimeConfig"] = self.runtime_config
+            for k in ("cutHeight", "cutSpeed", "moveSpeed"):
+                if k in self.runtime_config:
+                    out[k] = self.runtime_config[k]
+        if self.enu_base_point:
+            out["enuBasePoint"] = self.enu_base_point
+        if self.charging_station_loc:
+            out["chargingStationLoc"] = self.charging_station_loc
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Envelope helpers
+# ---------------------------------------------------------------------------
+
+def wrap_envelope(raw: bytes) -> str:
+    """Wrap raw protobuf bytes in Lymow/AWS IoT JSON envelope."""
+    return json.dumps({"message": base64.b64encode(raw).decode("ascii")})
+
+
+def unwrap_envelope(envelope_bytes: bytes) -> bytes | None:
+    """Unwrap JSON {message:<base64>} or accept raw/base64 payloads."""
+    if not envelope_bytes:
+        return None
+    stripped = envelope_bytes.lstrip()
+    if stripped.startswith(b"{"):
+        try:
+            obj = json.loads(envelope_bytes.decode("utf-8"))
+            for key in ("message", "value", "data", "payload"):
+                v = obj.get(key)
+                if isinstance(v, str):
+                    return base64.b64decode(v)
+        except Exception:
+            _LOGGER.debug("Failed to unwrap JSON MQTT envelope", exc_info=True)
+            return None
+    try:
+        return base64.b64decode(envelope_bytes, validate=True)
+    except Exception:
+        # Some tests/callers may already pass raw protobuf bytes.
+        return envelope_bytes
+
+
+
+
+# ---------------------------------------------------------------------------
+# Minimal raw encoder fallback for fields that are not correctly represented
+# by the recovered .proto. Keep this limited: normal commands use pb.PbInput.
+# ---------------------------------------------------------------------------
+
+def _raw_enc_varint(value: int) -> bytes:
     if value < 0:
         value &= (1 << 64) - 1
     out = bytearray()
@@ -56,41 +190,46 @@ def _enc_varint(value: int) -> bytes:
         if not value:
             return bytes(out)
 
-def _enc_i32(field_no: int, value: int) -> bytes:
-    return _enc_varint((field_no << 3) | 0) + _enc_varint(value)
+def _raw_enc_i32(field_no: int, value: int) -> bytes:
+    return _raw_enc_varint((field_no << 3) | 0) + _raw_enc_varint(value)
 
-def _enc_bool(field_no: int, value: bool = True) -> bytes:
-    return _enc_i32(field_no, 1 if value else 0)
-
-def _enc_len(field_no: int, data: bytes) -> bytes:
-    return _enc_varint((field_no << 3) | 2) + _enc_varint(len(data)) + data
+def _raw_enc_len(field_no: int, data: bytes) -> bytes:
+    return _raw_enc_varint((field_no << 3) | 2) + _raw_enc_varint(len(data)) + data
 
 
-# ── PbInput encoders ───────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# PbInput encoders — protobuf first
+# ---------------------------------------------------------------------------
+
+def _new_input() -> pb.PbInput:
+    msg = pb.PbInput()
+    msg.version = PB_VERSION_4_9
+    return msg
+
 
 def encode_userctrl(user_ctrl: int) -> bytes:
-    """PbInput {version=40, userCtrl=N}."""
-    return _enc_i32(2, PB_VERSION_4_9) + _enc_i32(5, user_ctrl)
+    """Encode PbInput {version=40, userCtrl=N}."""
+    msg = _new_input()
+    msg.userCtrl = int(user_ctrl)
+    return msg.SerializeToString()
 
 
 def encode_query_map(query_index: int = 0) -> bytes:
     """Query full map via PbInput.btMap.queryMap."""
-    btmap = _enc_i32(1, query_index) + _enc_i32(4, 1)
-    return (
-        _enc_i32(2, PB_VERSION_4_9)
-        + _enc_i32(5, USER_CTRL_QUERY_MAP)
-        + _enc_len(23, btmap)
-    )
+    msg = _new_input()
+    msg.userCtrl = USER_CTRL_QUERY_MAP
+    msg.btMap.queryIndex = int(query_index)
+    msg.btMap.queryMap = True
+    return msg.SerializeToString()
 
 
 def encode_query_path(query_index: int = 0) -> bytes:
     """Query path data via PbInput.btMap.queryPath."""
-    btmap = _enc_i32(1, query_index) + _enc_i32(3, 1)
-    return (
-        _enc_i32(2, PB_VERSION_4_9)
-        + _enc_i32(5, USER_CTRL_QUERY_PATH)
-        + _enc_len(23, btmap)
-    )
+    msg = _new_input()
+    msg.userCtrl = USER_CTRL_QUERY_PATH
+    msg.btMap.queryIndex = int(query_index)
+    msg.btMap.queryPath = True
+    return msg.SerializeToString()
 
 
 def encode_query_schedules() -> bytes:
@@ -134,124 +273,128 @@ def encode_debug_setting(
     upload_task_config: bool = False,
     exec_cmd: str | None = None,
 ) -> bytes:
-    """Encode PbInput.debugSetting.
-
-    PbInput.debugSetting = field 9. Known PbDebugSetting fields:
-      1  uploadLog
-      2  uploadVersion
-      5  queryWifiConfig
-      10 uploadRobotConfig
-      11 uploadTaskConfig
-      12 execCmd
-    """
-    dbg = b""
+    """Encode PbInput.debugSetting payload."""
+    msg = _new_input()
     if upload_log:
-        dbg += _enc_bool(1, True)
+        msg.debugSetting.uploadLog = True
     if upload_version:
-        dbg += _enc_bool(2, True)
+        msg.debugSetting.uploadVersion = True
     if query_wifi_config:
-        dbg += _enc_bool(5, True)
+        msg.debugSetting.queryWifiConfig = True
     if upload_robot_config:
-        dbg += _enc_bool(10, True)
+        msg.debugSetting.uploadRobotConfig = True
     if upload_task_config:
-        dbg += _enc_bool(11, True)
+        msg.debugSetting.uploadTaskConfig = True
     if exec_cmd:
-        dbg += _enc_len(12, exec_cmd.encode("utf-8"))
-
-    return _enc_i32(2, PB_VERSION_4_9) + _enc_len(9, dbg)
+        msg.debugSetting.execCmd = exec_cmd
+    return msg.SerializeToString()
 
 
 def encode_query_device_profile() -> bytes:
-    """Ask the robot to upload firmware/device profile details."""
     return encode_debug_setting(upload_version=True, upload_robot_config=True)
 
 
 def encode_query_wifi_config_debug() -> bytes:
-    """Ask the robot to upload WiFi config/status details."""
     return encode_debug_setting(query_wifi_config=True)
 
 
-def encode_app_connect(client_uuid: str) -> bytes:
-    """Encode app-connect presence packet.
+def encode_upload_robot_config() -> bytes:
+    """Trigger robotConfig broadcast without userCtrl."""
+    return encode_debug_setting(upload_robot_config=True)
 
-    PbInput.appConnect = field 7, PbInput.uuid = field 27.
-    """
-    return (
-        _enc_i32(2, PB_VERSION_4_9)
-        + _enc_i32(7, 1)
-        + _enc_len(27, client_uuid.encode("utf-8"))
-    )
+
+def encode_app_connect(client_uuid: str) -> bytes:
+    msg = _new_input()
+    msg.appConnect = 1
+    msg.uuid = client_uuid
+    return msg.SerializeToString()
 
 
 def encode_start_zones(zone_hash_ids: list[str]) -> bytes:
     """Start mowing selected zones using PbInput.map.goZones."""
-    pb = _enc_i32(2, PB_VERSION_4_9) + _enc_i32(5, USER_CTRL_CLEAN)
-    map_pb = b""
-
+    msg = _new_input()
+    msg.userCtrl = USER_CTRL_CLEAN
     for i, hash_id in enumerate(zone_hash_ids, start=1):
         if not hash_id:
             continue
-        basic_info = _enc_len(3, hash_id.encode("utf-8")) + _enc_i32(8, i)
-        zone = _enc_len(1, basic_info)
-        map_pb += _enc_len(1, zone)
-
-    if map_pb:
-        pb += _enc_len(12, map_pb)
-    return pb
+        zone = msg.map.goZones.add()
+        zone.basicInfo.hashId = hash_id
+        zone.basicInfo.mowOrder = i
+    return msg.SerializeToString()
 
 
 def encode_set_cut_height(cut_height_mm: int) -> bytes:
-    """Set global blade cut height via PbInput.map.runTimeConfig.
+    msg = _new_input()
+    msg.map.runTimeConfig.cutHeight = int(cut_height_mm)
+    return msg.SerializeToString()
 
-    PbInput.map            = field 12 (PbMap)
-    PbMap.runTimeConfig    = field 13 (PbRunTimeConfig)
-    PbRunTimeConfig.cutHeight = field 1 (int32, mm)
+
+def encode_set_clean_mode(mode_int: int) -> bytes:
+    """Set global mowing mode.
+
+    This is intentionally encoded with the tiny raw fallback instead of
+    ``pb.PbInput().robotConfig``: the recovered Python schema maps
+    PbRobotConfig field 7 as ``isOpenLed``, while live captures from the app
+    showed the clean-mode command using PbInput.robotConfig field 7 as an int.
+    Using pb2 here would turn the value into a boolean and could toggle LED
+    state instead of setting the mowing mode.
     """
-    rtc   = _enc_i32(1, int(cut_height_mm))
-    pbmap = _enc_len(13, rtc)
-    return (
-        _enc_i32(2, PB_VERSION_4_9)
-        + _enc_len(12, pbmap)
-    )
+    robot_config = _raw_enc_i32(7, int(mode_int))
+    return _raw_enc_i32(2, PB_VERSION_4_9) + _raw_enc_len(13, robot_config)
+
+
+def encode_set_rr_config(
+    *,
+    enable_rr: bool,
+    recharge_bat: int | None = None,
+    resume_bat: int | None = None,
+    period_start_hour: int | None = None,
+    period_start_minute: int | None = None,
+    period_end_hour: int | None = None,
+    period_end_minute: int | None = None,
+) -> bytes:
+    """Encode no-userCtrl robotConfig.rrConfig update."""
+    msg = _new_input()
+    rr = msg.robotConfig.rrConfig
+    rr.enableRr = bool(enable_rr)
+    if recharge_bat is not None:
+        rr.rechargeBat = int(recharge_bat)
+    if resume_bat is not None:
+        rr.resumeBat = int(resume_bat)
+    if period_start_hour is not None:
+        rr.resumePeriodStart.hour = int(period_start_hour)
+    if period_start_minute is not None:
+        rr.resumePeriodStart.minute = int(period_start_minute)
+    if period_end_hour is not None:
+        rr.resumePeriodEnd.hour = int(period_end_hour)
+    if period_end_minute is not None:
+        rr.resumePeriodEnd.minute = int(period_end_minute)
+    msg.debugSetting.uploadRobotConfig = True
+    return msg.SerializeToString()
 
 
 def build_initial_query_packets(
     query_index: int = 0,
     client_uuid: str | None = None,
 ) -> list[bytes]:
-    """Queries to send after MQTT subscribe/reconnect."""
+    """Startup packet set. Kept compatible with old coordinator imports."""
     packets: list[bytes] = []
-
     if client_uuid:
         packets.append(encode_app_connect(client_uuid))
-
     packets.extend([
-        encode_query_device_profile(),
-        encode_query_wifi_config_debug(),
         encode_query_map(query_index),
-        encode_query_path(query_index),
         encode_query_schedules(),
-        encode_query_cleaning_info(),
-        encode_query_cleaning_summary(),
-        encode_query_net_detail(),
-        encode_query_robot_config(),
-        encode_query_wifi_4g(),
-        encode_query_rtk_l1(),
-        encode_query_rtk_l2(),
+        encode_upload_robot_config(),
     ])
     return packets
 
 
 def build_refresh_query_packets(client_uuid: str | None = None) -> list[bytes]:
-    """Periodic refresh for app-only/profile/network data."""
+    """Light periodic refresh packet set."""
     packets: list[bytes] = []
-
     if client_uuid:
         packets.append(encode_app_connect(client_uuid))
-
     packets.extend([
-        encode_query_device_profile(),
-        encode_query_wifi_config_debug(),
         encode_query_cleaning_info(),
         encode_query_net_detail(),
         encode_query_robot_config(),
@@ -262,78 +405,90 @@ def build_refresh_query_packets(client_uuid: str | None = None) -> list[bytes]:
     return packets
 
 
-# ── Envelope ───────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# PbOutput decode — protobuf first
+# ---------------------------------------------------------------------------
 
-def wrap_envelope(raw: bytes) -> str:
-    return json.dumps({"message": base64.b64encode(raw).decode("ascii")})
+def decode_pboutput(raw: bytes) -> pb.PbOutput:
+    """Parse raw protobuf bytes as PbOutput."""
+    msg = pb.PbOutput()
+    msg.ParseFromString(raw)
+    return msg
 
-def unwrap_envelope(envelope_bytes: bytes) -> bytes | None:
-    try:
-        obj = json.loads(envelope_bytes.decode("utf-8"))
-        for key in ("message", "value", "data", "payload"):
-            v = obj.get(key)
-            if isinstance(v, str):
-                return base64.b64decode(v)
-    except Exception:
-        pass
-    try:
-        return base64.b64decode(envelope_bytes, validate=True)
-    except Exception:
+
+def decode_pboutput_envelope(envelope_bytes: bytes) -> pb.PbOutput | None:
+    """Decode JSON-enveloped/raw payload into PbOutput."""
+    raw = unwrap_envelope(envelope_bytes)
+    if not raw:
         return None
+    return decode_pboutput(raw)
 
 
-# ── Wire decoder ───────────────────────────────────────────────
+def populated_fields(msg: pb.PbOutput) -> list[str]:
+    return [field.name for field, _ in msg.ListFields()]
+
+
+# ---------------------------------------------------------------------------
+# Low-level wire parser for opaque btMap/queryAck blobs
+# ---------------------------------------------------------------------------
 
 def _dec_varint(buf: bytes, pos: int) -> tuple[int, int]:
     result = shift = 0
     for _ in range(10):
         if pos >= len(buf):
             raise ValueError("truncated varint")
-        b = buf[pos]; pos += 1
+        b = buf[pos]
+        pos += 1
         result |= (b & 0x7F) << shift
         if not (b & 0x80):
             return result, pos
         shift += 7
     raise ValueError("varint overflow")
 
-def _wire_parse(buf: bytes) -> dict[int, list]:
+
+def _wire_parse(buf: bytes) -> dict[int, list[tuple[str, Any]]]:
     if not isinstance(buf, (bytes, bytearray)) or not buf:
         return {}
-    out: dict[int, list] = {}
+    out: dict[int, list[tuple[str, Any]]] = {}
     pos = 0
     while pos < len(buf):
         try:
             tag, pos = _dec_varint(buf, pos)
-        except Exception:
-            break
-        fno, wt = tag >> 3, tag & 7
-        try:
+            fno, wt = tag >> 3, tag & 7
             if wt == 0:
                 v, pos = _dec_varint(buf, pos)
                 out.setdefault(fno, []).append(("v", v))
             elif wt == 1:
-                out.setdefault(fno, []).append(("f64", buf[pos:pos+8])); pos += 8
+                out.setdefault(fno, []).append(("f64", buf[pos:pos + 8]))
+                pos += 8
             elif wt == 2:
                 ln, pos = _dec_varint(buf, pos)
-                out.setdefault(fno, []).append(("L", buf[pos:pos+ln])); pos += ln
+                out.setdefault(fno, []).append(("L", buf[pos:pos + ln]))
+                pos += ln
             elif wt == 5:
-                out.setdefault(fno, []).append(("f32", buf[pos:pos+4])); pos += 4
+                out.setdefault(fno, []).append(("f32", buf[pos:pos + 4]))
+                pos += 4
             else:
                 break
         except Exception:
             break
     return out
 
+
 def _gv(f: dict, n: int) -> int | None:
     e = f.get(n)
     return e[0][1] if e and e[0][0] == "v" else None
 
+
 def _gs(f: dict, n: int) -> str | None:
     e = f.get(n)
     if e and e[0][0] == "L":
-        try: return e[0][1].decode("utf-8")
-        except: pass
+        try:
+            return e[0][1].decode("utf-8")
+        except Exception:
+            return None
     return None
+
 
 def _gf(f: dict, n: int) -> float | None:
     e = f.get(n)
@@ -341,112 +496,24 @@ def _gf(f: dict, n: int) -> float | None:
         return round(struct.unpack("<f", e[0][1])[0], 4)
     return None
 
+
 def _sub(f: dict, n: int) -> dict:
     e = f.get(n)
     return _wire_parse(e[0][1]) if e and e[0][0] == "L" else {}
 
+
 def _s32(v: int) -> int:
-    return v - (1 << 64) if v >= (1 << 31) else v
-
-def _packed_ints(fields: dict, fno: int) -> list[int]:
-    result: list[int] = []
-    for kind, val in fields.get(fno, []):
-        if kind == "v":
-            result.append(val)
-        elif kind == "L" and isinstance(val, (bytes, bytearray)):
-            p = 0
-            while p < len(val):
-                try:
-                    v, p = _dec_varint(val, p)
-                    result.append(v)
-                except Exception:
-                    break
-    return result
+    return v - (1 << 64) if v >= (1 << 63) else v
 
 
-# ── PbBtMap decoder ────────────────────────────────────────────
-
-def decode_btmap(raw: bytes) -> dict[str, Any]:
-    """Decode PbBtMap (field 23) — extract zone list with hashIds and names.
-
-    Zone summary (field 3 of zone container):
-        field 1 = hashId  (8-char string) — used in encode_start_zones()
-        field 2 = mapId   (8-char string)
-        field 3 = name    (string) for special zones, or type (varint=0) for regular
-        field 5 = simplified boundary points
-    """
-    zones: list[dict] = []
-    zone_count = 0
-    root = _wire_parse(raw)
-
-    for kind, map_val in root.get(2, []):
-        if kind != "L":
-            continue
-        map_data = _wire_parse(map_val)
-        for kind2, zc_val in map_data.get(3, []):
-            if kind2 != "L":
-                continue
-            zc = _wire_parse(zc_val)
-            # Count full zone blocks
-            for kind3, zb_val in zc.get(1, []):
-                if kind3 == "L":
-                    zone_count += len(_wire_parse(zb_val).get(1, []))
-            # Parse zone summaries
-            for kind3, zs_val in zc.get(3, []):
-                if kind3 != "L":
-                    continue
-                zs = _wire_parse(zs_val)
-                zone: dict[str, Any] = {}
-                h = _gs(zs, 1)
-                m = _gs(zs, 2)
-                if h: zone["hashId"] = h
-                if m: zone["mapId"]  = m
-                for k3, v3 in zs.get(3, []):
-                    if k3 == "L":
-                        try: zone["name"] = v3.decode("utf-8")
-                        except: pass
-                    elif k3 == "v":
-                        zone["zoneType"] = v3
-                # field 5 = simplified boundary points (repeated PbPoint sub-messages)
-                pts: list[tuple[float, float]] = []
-                for k5, v5 in zs.get(5, []):
-                    if k5 != "L":
-                        continue
-                    # Each point is a sub-message: field 1 (wire 5) = x, field 2 (wire 5) = y
-                    pb = _wire_parse(v5)
-                    px = _gf(pb, 1)
-                    py = _gf(pb, 2)
-                    if px is not None and py is not None:
-                        pts.append((round(px, 3), round(py, 3)))
-                if pts:
-                    zone["points"] = pts
-                zones.append(zone)
-
-    return {"zones": zones, "zone_count": zone_count or len(zones)}
-
-
-
-
-# ── Standalone PbMap decoder for S3 backup maps ─────────────────
-
-def _field_debug(fields: dict, *, max_values: int = 4) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for fno, entries in sorted(fields.items()):
-        vals: list[Any] = []
-        for kind, val in entries[:max_values]:
-            if kind == "L":
-                vals.append({
-                    "wire": kind,
-                    "len": len(val),
-                    "first16": val[:16].hex(),
-                    "sub_fields": sorted(_wire_parse(val).keys()),
-                })
-            elif isinstance(val, (bytes, bytearray)):
-                vals.append({"wire": kind, "hex": val[:16].hex(), "len": len(val)})
-            else:
-                vals.append({"wire": kind, "value": val})
-        out[str(fno)] = vals
-    return out
+def _wire_str(blob: bytes) -> str | None:
+    try:
+        s = blob.decode("utf-8")
+        if s.isprintable():
+            return s
+    except Exception:
+        pass
+    return None
 
 
 def _decode_point_dict(fields: dict) -> dict[str, Any]:
@@ -495,7 +562,7 @@ def _decode_polygon_points(fields: dict) -> list[tuple[float, float]]:
         x = _gf(pf, 1)
         y = _gf(pf, 2)
         if x is not None and y is not None:
-            pts.append((round(x, 3), round(y, 3)))
+            pts.append((round(x, 4), round(y, 4)))
     return pts
 
 
@@ -520,7 +587,7 @@ def _decode_zone_config_fields(fields: dict) -> dict[str, Any]:
     ]:
         v = _gv(fields, fno)
         if v is not None:
-            cfg[key] = v
+            cfg[key] = _s32(v) if key in {"cleanDir"} else v
     for fno, key in [
         (2, "raiseCutHeight"), (3, "lowerCutHeight"), (14, "pathOrder"),
         (17, "lineFollowMode"), (18, "disableOuterDischarge"),
@@ -534,35 +601,27 @@ def _decode_zone_config_fields(fields: dict) -> dict[str, Any]:
     return cfg
 
 
-def _decode_pp_basic_info(fields: dict) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-
-    b00 = _sub(fields, 1)
-    if b00:
-        p = _decode_point_dict(b00)
+def _parse_pbzone_basicinfo(buf: bytes) -> dict[str, Any]:
+    f = _wire_parse(buf)
+    out: dict[str, Any] = {
+        "type": _gv(f, 1),
+        "name": _gs(f, 2) or "",
+        "hashId": _gs(f, 3) or "",
+        "isEnabled": bool(_gv(f, 4)) if _gv(f, 4) is not None else True,
+        "zoneRename": _gs(f, 6) or "",
+        "updateTime": _gv(f, 7),
+        "mowOrder": _gv(f, 8) or 0,
+        "polygon": [],
+        "textPos": None,
+    }
+    poly = _sub(f, 5)
+    if poly:
+        out["polygon"] = _decode_polygon_points(poly)
+    text_pos = _sub(f, 9)
+    if text_pos:
+        p = _decode_point_dict(text_pos)
         if "x" in p and "y" in p:
-            out["bound_00"] = (p["x"], p["y"])
-
-    b11 = _sub(fields, 2)
-    if b11:
-        p = _decode_point_dict(b11)
-        if "x" in p and "y" in p:
-            out["bound_11"] = (p["x"], p["y"])
-
-    area = _gv(fields, 3)
-    if area is not None:
-        out["ppArea"] = area
-
-    cw = _gv(fields, 4)
-    if cw is not None:
-        out["isClockwise"] = bool(cw)
-
-    inner = _sub(fields, 5)
-    if inner:
-        p = _decode_point_dict(inner)
-        if "x" in p and "y" in p:
-            out["innerPoint"] = (p["x"], p["y"])
-
+            out["textPos"] = (p["x"], p["y"])
     return out
 
 
@@ -572,450 +631,195 @@ def _rectangle_from_bounds(b00: Any, b11: Any) -> list[tuple[float, float]]:
         x2, y2 = float(b11[0]), float(b11[1])
     except Exception:
         return []
-
     if x1 == x2 or y1 == y2:
         return []
-
     return [
-        (round(x1, 3), round(y1, 3)),
-        (round(x2, 3), round(y1, 3)),
-        (round(x2, 3), round(y2, 3)),
-        (round(x1, 3), round(y2, 3)),
+        (round(x1, 4), round(y1, 4)),
+        (round(x2, 4), round(y1, 4)),
+        (round(x2, 4), round(y2, 4)),
+        (round(x1, 4), round(y2, 4)),
     ]
 
 
-def decode_map_fields(map_data: dict) -> dict[str, Any]:
-    """Decode a direct PbMap message from PbOutput.map or S3 map.pb."""
-    zones: list[dict[str, Any]] = []
-    channels: list[dict[str, Any]] = []
+def _decode_pp_basic_info(fields: dict) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    b00 = _sub(fields, 1)
+    if b00:
+        p = _decode_point_dict(b00)
+        if "x" in p and "y" in p:
+            out["bound_00"] = (p["x"], p["y"])
+    b11 = _sub(fields, 2)
+    if b11:
+        p = _decode_point_dict(b11)
+        if "x" in p and "y" in p:
+            out["bound_11"] = (p["x"], p["y"])
+    area = _gv(fields, 3)
+    if area is not None:
+        out["ppArea"] = area
+    cw = _gv(fields, 4)
+    if cw is not None:
+        out["isClockwise"] = bool(cw)
+    inner = _sub(fields, 5)
+    if inner:
+        p = _decode_point_dict(inner)
+        if "x" in p and "y" in p:
+            out["innerPoint"] = (p["x"], p["y"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# PbMap/PbBtMap catalog parsers
+# ---------------------------------------------------------------------------
+
+def parse_map_fields(map_data: dict[int, list[tuple[str, Any]]]) -> ZoneCatalog:
+    """Parse a PbMap wire dict into ZoneCatalog."""
+    catalog = ZoneCatalog()
 
     enu = _sub(map_data, 7)
     if enu:
-        ebp = _decode_lla_dict(enu)
-        if ebp:
-            out["enuBasePoint"] = ebp
+        catalog.enu_base_point = _decode_lla_dict(enu) or None
 
     dock = _sub(map_data, 4)
     if dock:
-        dp = _decode_pose_dict(dock)
-        if dp:
-            out["chargingStationLoc"] = dp
+        catalog.charging_station_loc = _decode_pose_dict(dock) or None
 
-    # PbRunTimeConfig (field 13) — global cutHeight / cutSpeed / moveSpeed
-    # This is the authoritative source for blade height, NOT PbRobotConfig.
-    # Arrives with every QUERY_MAP response.
     rtc = _sub(map_data, 13)
     if rtc:
-        rtc_out: dict[str, Any] = {}
+        runtime: dict[str, Any] = {}
         v = _gv(rtc, 1)
-        if v is not None: rtc_out["cutHeight"] = v
+        if v is not None:
+            runtime["cutHeight"] = v
         f = _gf(rtc, 4)
-        if f is not None: rtc_out["moveSpeed"] = f
+        if f is not None:
+            runtime["moveSpeed"] = f
         v = _gv(rtc, 6)
-        if v is not None: rtc_out["cutSpeed"]  = v
-        if rtc_out:
-            out["runTimeConfig"] = rtc_out
-            # Flatten to top-level for easy sensor access
-            for k in ("cutHeight", "cutSpeed", "moveSpeed"):
-                if k in rtc_out:
-                    out[k] = rtc_out[k]
+        if v is not None:
+            runtime["cutSpeed"] = v
+        if runtime:
+            catalog.runtime_config = runtime
 
+    # PbMap.goZones (field 1)
+    hash_re = re.compile(r"^[A-Za-z0-9_]{4,32}$")
     for kind, zval in map_data.get(1, []):
         if kind != "L":
             continue
-
         z = _wire_parse(zval)
-        zone: dict[str, Any] = {}
-
         basic = _sub(z, 1)
-        if basic:
-            if (v := _gv(basic, 1)) is not None:
-                zone["zoneType"] = v
-            if (name := _gs(basic, 2)):
-                zone["name"] = name
-            if (hid := _gs(basic, 3)):
-                zone["hashId"] = hid
-            if (v := _gv(basic, 4)) is not None:
-                zone["isEnabled"] = bool(v)
+        if not basic:
+            continue
+        bi = _parse_pbzone_basicinfo(z[1][0][1])
+        hash_id = bi.get("hashId") or ""
+        if not hash_id or not hash_re.match(hash_id):
+            continue
+        points = list(bi.get("polygon") or [])
 
-            poly = _sub(basic, 5)
-            if poly:
-                pts = _decode_polygon_points(poly)
-                zone["polygon_debug"] = {
-                    "field_keys": sorted(poly.keys()),
-                    "point_entries": len(poly.get(1, [])),
-                }
-                if pts:
-                    zone["points"] = pts
-                    zone["points_count"] = len(pts)
-                    zone["points_source"] = "basicInfo.polygon"
-                    zone["area"] = round(_polygon_area(pts), 3)
-                else:
-                    zone["polygon_debug"]["fields"] = _field_debug(poly, max_values=2)
-            else:
-                zone["polygon_debug"] = {
-                    "missing": True,
-                    "basic_fields": sorted(basic.keys()),
-                }
+        # Fallback from ppBasicInfo bounds if no polygon points exist.
+        pp = _sub(z, 3)
+        if not points and pp:
+            pp_info = _decode_pp_basic_info(pp)
+            if pp_info.get("bound_00") and pp_info.get("bound_11"):
+                points = _rectangle_from_bounds(pp_info["bound_00"], pp_info["bound_11"])
 
-            if (rename := _gs(basic, 6)):
-                zone["zoneRename"] = rename
-                zone.setdefault("name", rename)
-
-            if (v := _gv(basic, 8)) is not None:
-                zone["mowOrder"] = v
-
+        zone_cfg: dict[str, Any] = {}
         zcfg = _sub(z, 2)
         if zcfg:
-            cfg = _decode_zone_config_fields(zcfg)
-            if cfg:
-                zone["zoneConfig"] = cfg
+            zone_cfg = _decode_zone_config_fields(zcfg)
 
-        pp = _sub(z, 3)
-        if pp:
-            pp_info = _decode_pp_basic_info(pp)
-            zone.update(pp_info)
-            if not zone.get("points") and pp_info.get("bound_00") and pp_info.get("bound_11"):
-                rect = _rectangle_from_bounds(pp_info["bound_00"], pp_info["bound_11"])
-                if rect:
-                    zone["points"] = rect
-                    zone["points_count"] = len(rect)
-                    zone["points_source"] = "ppBasicInfo.bounds_fallback"
-                    zone["area"] = round(_polygon_area(rect), 3)
+        name = bi.get("name") or bi.get("zoneRename") or hash_id
+        text_pos = bi.get("textPos")
+        zi = ZoneInfo(
+            hash_id=hash_id,
+            name=name,
+            mow_order=int(bi.get("mowOrder") or 0),
+            is_enabled=bool(bi.get("isEnabled")),
+            polygon_points=points,
+            zone_config=zone_cfg,
+            text_pos=text_pos if isinstance(text_pos, tuple) else None,
+            zone_type=bi.get("type"),
+            area=round(_polygon_area(points), 3) if points else None,
+        )
+        catalog.zones.append(zi)
+        catalog.zones_by_hashid[zi.hash_id] = zi
 
-        if zone and "points_count" not in zone:
-            zone["points_count"] = len(zone.get("points") or [])
-            zone["points_source"] = zone.get("points_source")
-
-        if zone:
-            zones.append(zone)
-
+    # PbMap.channels (field 3)
     for kind, cval in map_data.get(3, []):
         if kind != "L":
             continue
-
         chf = _wire_parse(cval)
-        ch: dict[str, Any] = {}
-
-        for fno, key in [(1, "hashId"), (2, "zone1"), (3, "zone2")]:
-            if (v := _gs(chf, fno)):
-                ch[key] = v
-
-        for fno, key in [(4, "isValid"), (6, "isDockingChannel")]:
-            if (v := _gv(chf, fno)) is not None:
-                ch[key] = bool(v)
-
+        hash_id = _gs(chf, 1) or ""
+        if not hash_id:
+            continue
         poly = _sub(chf, 5)
-        if poly:
-            pts = _decode_polygon_points(poly)
-            if pts:
-                ch["points"] = pts
-                ch["points_count"] = len(pts)
+        pts = _decode_polygon_points(poly) if poly else []
+        is_valid_raw = _gv(chf, 4)
+        catalog.channels.append(ChannelInfo(
+            hash_id=hash_id,
+            zone1=_gs(chf, 2) or "",
+            zone2=_gs(chf, 3) or "",
+            is_valid=bool(is_valid_raw) if is_valid_raw is not None else None,
+            is_docking_channel=bool(_gv(chf, 6)) if _gv(chf, 6) is not None else False,
+            polygon_points=pts,
+        ))
 
-        if ch:
-            channels.append(ch)
+    return catalog
 
-    if zones:
-        out["zones"] = zones
-        out["zone_count"] = len(zones)
-        out["zones_with_points"] = sum(1 for z in zones if z.get("points"))
-        out["zones_with_polygon"] = sum(
-            1 for z in zones
-            if z.get("points_source") == "basicInfo.polygon"
-        )
-        out["zones_with_bounds_fallback"] = sum(
-            1 for z in zones
-            if z.get("points_source") == "ppBasicInfo.bounds_fallback"
-        )
 
-    if channels:
-        out["channels"] = channels
-        out["channels_with_points"] = sum(1 for c in channels if c.get("points"))
+def parse_zone_catalog(bt_map: pb.PbBtMap) -> ZoneCatalog:
+    """Parse PbBtMap QUERY_MAP response into ZoneCatalog.
 
-    return out
+    The rich map is usually hidden inside:
+      PbBtMap.queryAck -> queryAck field 3 -> PbMap blob
+    """
+    if bt_map is None or bt_map.ByteSize() == 0:
+        return ZoneCatalog()
+
+    root = _wire_parse(bt_map.SerializeToString())
+
+    # Path used by real QUERY_MAP response: btMap field 2 = queryAck.
+    try:
+        if 2 in root and root[2][0][0] == "L":
+            qa = _wire_parse(root[2][0][1])
+            if 3 in qa and qa[3][0][0] == "L":
+                inner = _wire_parse(qa[3][0][1])
+                return parse_map_fields(inner)
+    except Exception:
+        _LOGGER.debug("Failed parsing btMap.queryAck map blob", exc_info=True)
+
+    # Fallback: sometimes the bytes may already look like PbMap-ish fields.
+    return parse_map_fields(root)
+
+
+def decode_btmap(raw: bytes) -> dict[str, Any]:
+    """Backward-compatible function returning btMap as dict."""
+    if not raw:
+        return {}
+    # raw may be PbBtMap bytes, not PbMap bytes.
+    msg = pb.PbBtMap()
+    try:
+        msg.ParseFromString(raw)
+        return parse_zone_catalog(msg).to_btmap_dict()
+    except Exception:
+        return parse_map_fields(_wire_parse(raw)).to_btmap_dict()
 
 
 def decode_pbmap(raw: bytes) -> dict[str, Any]:
     """Decode standalone PbMap file downloaded from S3 backup maps."""
     if not raw:
         return {}
-    return decode_map_fields(_wire_parse(raw))
+    return parse_map_fields(_wire_parse(raw)).to_btmap_dict()
 
-# ── PbOutput decoder ───────────────────────────────────────────
 
-def decode_pboutput(raw: bytes) -> dict[str, Any]:
-    """Parse raw PbOutput bytes into a flat state dict.
+# ---------------------------------------------------------------------------
+# Schedule decoder placeholder-compatible functions
+# ---------------------------------------------------------------------------
 
-    Field mapping (confirmed from decompiled.js + live wire):
+def decode_schedules(schedule_msg: Any) -> list[dict[str, Any]]:
+    """Best-effort schedule decoder placeholder.
 
-    Root:
-      1  msgId             int32
-      2  version           int32
-      3  errorCodes        packed int32
-      4  warningCodes      packed int32
-      5  PbRobotInfo       FLAT (no nested PbRobotStatus):
-             1 robotStatus       int32 (signed)
-             2 battery           int32  0-100%
-             3 wifiSignalQuality int32  dBm signed
-             4 lteSignalQuality  int32  dBm signed
-             5 btSignalQuality   int32  dBm signed
-             6 workStatus        int32
-             7 isRecharging      bool
-             8 isCharging        bool
-             9 wifiWorking       bool
-            10 lteWorking        bool
-      6  PbLocalizationInfo  (RTK fallback when field 35 absent)
-      9  PbDebugSetting      (mostly 0 — ignored)
-     10  PbDeviceProfile     (after QUERY_ROBOT_CONFIG):
-             2 → fwVersion    (app fw string, also aliased to "fwVersion")
-             3 → mcuVersion   (MCU fw string, also aliased to "mcuVersion")
-             4 → brand        ("Lymow")
-             5 → ipAddress
-             6 → macAddress
-             7 → sn
-             8 → rtkSn
-             9 → simId
-            10 → wheelVer
-            11 → knifeVer
-     12  PbCleanInfo:
-             1 cleanTime       int32 (s)
-             2 cleanArea       float (m²)
-             3 areaInfo → cleanZoneIds
-             4 remainCleanTime int32 (s)
-             5 cleanPercent    float
-             6 mapArea         float (m²)
-     17  PbRobotConfig (after QUERY_ROBOT_CONFIG):
-             1 cutHeight → state["cutHeight"]
-             7 cleanMode → state["robotCleanMode"] + state["cleanMode"] (string)
-             ... (full config in state["robotConfig"])
-     18  outputCtrl        int32
-     23  PbBtMap           → state["btMap"] = decode_btmap(...)
-     24  PbPose chargingStationLoc → state["chargingStationLoc"]
-     34  PbNetDetailInfo   → state["netDetailInfo"]
-     35  PbRtkDiagnosticL1 → state["rtkDiagnosticL1"] + state["rtkStatus"]
+    PbSchedule appears as an empty placeholder in the recovered schema, so this
+    keeps a safe return type for entities. We can expand this once schedules are
+    needed with full wire parsing.
     """
-    state: dict[str, Any] = {}
-    root = _wire_parse(raw)
-
-    # DEBUG TEMPORANEO — rimuovi dopo
-    _LOGGER.warning(
-        "PbOutput root fields: %s | field7_present=%s field17_present=%s",
-        sorted(root.keys()),
-        7 in root,
-        17 in root,
-    )
-    if 7 in root:
-        bo = _sub(root, 7)
-        _LOGGER.warning("PbBaseOutput fields: %s | cutHeight(f4)=%s", sorted(bo.keys()), _gv(bo, 4))
-    if 17 in root:
-        rc = _sub(root, 17)
-        _LOGGER.warning("PbRobotConfig ALL fields raw: %s", {k: root[17] for k in [17]})
-        _LOGGER.warning("PbRobotConfig sub fields: %s", sorted(rc.keys()))
-        for fno in range(1, 25):
-            v = _gv(rc, fno)
-            f = _gf(rc, fno)
-            s = _gs(rc, fno)
-            if v is not None or f is not None or s is not None:
-                _LOGGER.warning("  PbRobotConfig field %d: varint=%s float=%s str=%s", fno, v, f, s)
-
-    for fno, key in [(1, "msgId"), (2, "version")]:
-        v = _gv(root, fno)
-        if v is not None: state[key] = v
-
-    err = _packed_ints(root, 3)
-    if err: state["errorCodes"] = err; state["errorCode"] = err[0]
-    warn = _packed_ints(root, 4)
-    if warn: state["warningCodes"] = warn
-
-    # PbRobotInfo (field 5) — flat
-    ri = _sub(root, 5)
-    if ri:
-        for fno, key in [
-            (1,"robotStatus"),(2,"battery"),(3,"wifiSignalQuality"),
-            (4,"lteSignalQuality"),(5,"btSignalQuality"),(6,"workStatus"),
-        ]:
-            v = _gv(ri, fno)
-            if v is not None: state[key] = _s32(v)
-        for fno, key in [(7,"isRecharging"),(8,"isCharging"),(9,"wifiWorking"),(10,"lteWorking")]:
-            v = _gv(ri, fno)
-            if v is not None: state[key] = bool(v)
-    if "workStatus" in state: state["isOnline"] = True
-
-    # PbDeviceProfile (field 10)
-    dp = _sub(root, 10)
-    if dp:
-        s = _gs(dp, 2)
-        if s: state["appFwVersion"] = s; state["fwVersion"] = s
-        s = _gs(dp, 3)
-        if s: state["mcuFwVersion"] = s; state["mcuVersion"] = s
-        s = _gs(dp, 4)
-        if s: state["brand"] = s
-        s = _gs(dp, 5)
-        if s: state["ipAddress"] = s
-        for fno, key in [(6,"macAddress"),(7,"sn"),(8,"rtkSn"),(9,"simId"),(10,"wheelVer"),(11,"knifeVer")]:
-            s = _gs(dp, fno)
-            if s: state[key] = s
-
-    # PbBaseOutput (field 7) — real-time broadcast includes cutHeight
-    # PbBaseOutput.cutHeight = field 4 (int, mm) — most reliable source
-    bo = _sub(root, 7)
-    if bo:
-        v = _gv(bo, 4)
-        if v is not None: state["cutHeight"] = v
-
-    # PbMap (field 11) — direct full map branch
-    direct_map = _sub(root, 11)
-    if direct_map:
-        mp = decode_map_fields(direct_map)
-        if mp:
-            state["btMap"] = {**state.get("btMap", {}), **mp}
-            if mp.get("enuBasePoint"):
-                state["enu_base_point"] = mp["enuBasePoint"]
-            if mp.get("chargingStationLoc"):
-                state["chargingStationLoc"] = mp["chargingStationLoc"]
-
-    # PbCleanInfo (field 12)
-    ci = _sub(root, 12)
-    if ci:
-        v = _gv(ci, 1)
-        if v is not None: state["cleanTime"] = v
-        f = _gf(ci, 2)
-        if f is not None: state["cleanArea"] = f
-        v = _gv(ci, 4)
-        if v is not None: state["remainCleanTime"] = v
-        f = _gf(ci, 5)
-        if f is not None: state["cleanPercent"] = f
-        f = _gf(ci, 6)
-        if f is not None: state["mapArea"] = f
-        ai = _sub(ci, 3)
-        if ai:
-            zone_ids: list[str] = []
-            for kind, val in ai.get(2, []):
-                if kind == "L":
-                    try: zone_ids.append(val.decode("utf-8"))
-                    except: pass
-            if zone_ids: state["cleanZoneIds"] = zone_ids
-
-    # PbRobotConfig (field 17)
-    rc = _sub(root, 17)
-    if rc:
-        cfg: dict[str, Any] = {}
-        for fno, key in [
-            (3,"cutHeight"),(5,"brushSpeed"),(6,"cutSpeed"),(7,"cleanMode"),  # field 3 = rcCutHeight
-            (8,"cleanDir"),(9,"pathSpacing"),(10,"perimeterMowLaps"),
-            (11,"perimeterMowDir"),(12,"noGoMowLaps"),(13,"obsDecMode"),
-            (15,"startProgress"),(16,"relativeCleanDir"),(19,"followDetectMode"),
-        ]:
-            v = _gv(rc, fno)
-            if v is not None: cfg[key] = v
-        for fno, key in [
-            (2,"raiseCutHeight"),(3,"lowerCutHeight"),(14,"pathOrder"),
-            (17,"lineFollowMode"),(18,"disableOuterDischarge"),
-        ]:
-            v = _gv(rc, fno)
-            if v is not None: cfg[key] = bool(v)
-        f = _gf(rc, 4)
-        if f is not None: cfg["moveSpeed"] = f
-        if cfg:
-            state["robotConfig"] = cfg
-            if "cutHeight" in cfg: state["cutHeight"] = cfg["cutHeight"]
-            if "cleanMode" in cfg:
-                state["robotCleanMode"] = cfg["cleanMode"]
-                state["cleanMode"]      = CLEAN_MODE_INT.get(cfg["cleanMode"], "NONE")
-
-    # outputCtrl (field 18)
-    v = _gv(root, 18)
-    if v is not None: state["outputCtrl"] = v
-
-    # PbBtMap (field 23)
-    #
-    # MQTT QUERY_MAP / QUERY_PATH replies can be summary-only and may not
-    # include polygon points. Do not let those packets overwrite a complete
-    # S3 map.pb already loaded into state.
-    for kind, btmap_val in root.get(23, []):
-        if kind == "L":
-            btmap = decode_btmap(btmap_val)
-            if btmap:
-                zones = btmap.get("zones") or []
-                zones_with_points = sum(1 for z in zones if z.get("points"))
-
-                if zones and zones_with_points == 0:
-                    state["btMapSummary"] = btmap
-                    safe_btmap: dict[str, Any] = {}
-                    for k in ("zone_count", "enuBasePoint"):
-                        if k in btmap:
-                            safe_btmap[k] = btmap[k]
-                    if safe_btmap:
-                        state["btMap"] = safe_btmap
-                else:
-                    state["btMap"] = btmap
-
-                if btmap.get("enuBasePoint"):
-                    state["enu_base_point"] = btmap["enuBasePoint"]
-                # Flatten runTimeConfig values from btMap S3 path
-                for k in ("cutHeight", "cutSpeed", "moveSpeed"):
-                    if btmap.get(k) is not None:
-                        state[k] = btmap[k]
-            break
-
-    # chargingStationLoc / PbPose (field 24)
-    pose = _sub(root, 24)
-    if pose:
-        dock: dict[str, Any] = {}
-        for fno, key in [(1,"x"),(2,"y"),(3,"heading")]:
-            f = _gf(pose, fno)
-            if f is not None: dock[key] = f
-        if dock: state["chargingStationLoc"] = dock
-
-    # PbNetDetailInfo (field 34)
-    nd = _sub(root, 34)
-    if nd:
-        net: dict[str, Any] = {}
-        for fno, key in [(1,"currentNet"),(4,"wifiSignal"),(5,"simCardStatus"),(7,"simSignal"),(8,"simRegistration")]:
-            v = _gv(nd, fno)
-            if v is not None: net[key] = v
-        v = _gv(nd, 9)
-        if v is not None: net["simConnection"] = bool(v)
-        for fno, key in [(2,"wifiName"),(3,"wifiIp"),(6,"simIp"),(10,"simIccid")]:
-            s = _gs(nd, fno)
-            if s: net[key] = s
-        if net: state["netDetailInfo"] = net
-
-    # PbRtkDiagnosticL1 (field 35)
-    rd = _sub(root, 35)
-    if rd:
-        rtk: dict[str, Any] = {}
-        for fno, key in [(1,"rtkStatus"),(3,"satelliteCount"),(10,"baseStationStatus")]:
-            v = _gv(rd, fno)
-            if v is not None: rtk[key] = v
-        for fno, key in [(2,"precision"),(11,"baseDataErrorRate")]:
-            f = _gf(rd, fno)
-            if f is not None: rtk[key] = f
-        if rtk:
-            state["rtkDiagnosticL1"] = rtk
-            if "rtkStatus" in rtk: state["rtkStatus"] = rtk["rtkStatus"]
-
-    # PbLocalizationInfo (field 6) — fallback RTK
-    loc = _sub(root, 6)
-    if loc and "rtkDiagnosticL1" not in state:
-        rtk_loc: dict[str, Any] = {}
-        for fno, key in [(1,"satelliteCount"),(4,"rtkStatus"),(5,"baseStationStatus")]:
-            v = _gv(loc, fno)
-            if v is not None: rtk_loc[key] = v
-        for fno, key in [(2,"precision"),(3,"baseDataErrorRate")]:
-            f = _gf(loc, fno)
-            if f is not None: rtk_loc[key] = f
-        if rtk_loc:
-            state["rtkDiagnosticL1"] = rtk_loc
-            if "rtkStatus" in rtk_loc: state["rtkStatus"] = rtk_loc["rtkStatus"]
-
-    return state
-
-
-def decode_pboutput_envelope(envelope_bytes: bytes) -> dict[str, Any]:
-    """Decode a JSON-enveloped PbOutput message into a flat state dict."""
-    raw = unwrap_envelope(envelope_bytes)
-    if raw is None:
-        return {}
-    return decode_pboutput(raw)
+    if schedule_msg is None or getattr(schedule_msg, "ByteSize", lambda: 0)() == 0:
+        return []
+    return [{"rawByteSize": schedule_msg.ByteSize()}]

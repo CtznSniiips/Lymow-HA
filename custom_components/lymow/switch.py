@@ -1,0 +1,204 @@
+"""Lymow switch platform.
+
+Currently exposes only switches that can be written safely with the known
+MQTT/protobuf command set.
+
+Switches:
+  - Auto Recharge: toggles robotConfig.rrConfig.enableRr while carrying forward
+    the existing RR thresholds and time window.
+
+Read-only booleans such as Online, Charging, WiFi/LTE connected, Theft Lock,
+and Lifted belong in binary_sensor.py, not switch.py.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from .const import DOMAIN
+from .coordinator import LymowCoordinator
+from .entity_base import LymowEntity
+from .protocol import encode_set_rr_config
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    """Read key from dict or attribute object."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _has_field(obj: Any, key: str) -> bool:
+    """Return True when a protobuf field or dict key is present."""
+    if obj is None:
+        return False
+    if isinstance(obj, dict):
+        return key in obj and obj.get(key) is not None
+    has_field = getattr(obj, "HasField", None)
+    if callable(has_field):
+        try:
+            return bool(has_field(key))
+        except Exception:
+            # Proto3 scalar fields may not support HasField depending on codegen.
+            return getattr(obj, key, None) is not None
+    return getattr(obj, key, None) is not None
+
+
+def _time_part(obj: Any, key: str, default: int = 0) -> int:
+    value = _get(obj, key, default)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _rr_config_from_state(data: dict[str, Any]) -> Any | None:
+    """Return rrConfig object/dict from coordinator state, if available."""
+    robot_config = data.get("robotConfig")
+    rr = _get(robot_config, "rrConfig")
+    if rr is not None:
+        return rr
+
+    # Some merge paths may expose a flattened robotConfig dict.
+    if isinstance(robot_config, dict):
+        rr = robot_config.get("rrConfig")
+        if rr is not None:
+            return rr
+
+    return None
+
+
+def _rr_bool(data: dict[str, Any]) -> bool | None:
+    """Current auto-recharge switch state."""
+    if data.get("rrEnabled") is not None:
+        return bool(data.get("rrEnabled"))
+    rr = _rr_config_from_state(data)
+    if rr is None:
+        return None
+    if _has_field(rr, "enableRr"):
+        return bool(_get(rr, "enableRr"))
+    return None
+
+
+@dataclass(frozen=True, kw_only=True)
+class LymowSwitchDesc(SwitchEntityDescription):
+    value_fn: Callable[[dict[str, Any]], bool | None]
+    turn_on_fn: Callable[[LymowCoordinator], Any]
+    turn_off_fn: Callable[[LymowCoordinator], Any]
+
+
+async def _set_auto_recharge(coordinator: LymowCoordinator, enabled: bool) -> None:
+    """Toggle rrConfig.enableRr without resetting the other RR fields.
+
+    The firmware treats rrConfig as a replace-style write for nested fields, so
+    we carry forward recharge/resume thresholds and resumePeriodStart/End.
+    """
+    data = coordinator.data or {}
+    rr = _rr_config_from_state(data)
+
+    # Prefer coordinator helper if your coordinator already provides it.
+    for method_name in ("async_set_auto_recharge", "cmd_set_auto_recharge"):
+        method = getattr(coordinator, method_name, None)
+        if callable(method):
+            await method(enabled)
+            return
+
+    if rr is None:
+        raise HomeAssistantError(
+            "rrConfig is not available yet. Wait for robotConfig to arrive, "
+            "or press Refresh Robot Config, then retry."
+        )
+
+    recharge_bat = _get(rr, "rechargeBat", data.get("rrRechargeBat"))
+    resume_bat = _get(rr, "resumeBat", data.get("rrResumeBat"))
+
+    period_start = _get(rr, "resumePeriodStart")
+    period_end = _get(rr, "resumePeriodEnd")
+
+    raw = encode_set_rr_config(
+        enable_rr=enabled,
+        recharge_bat=int(recharge_bat) if recharge_bat is not None else None,
+        resume_bat=int(resume_bat) if resume_bat is not None else None,
+        period_start_hour=_time_part(period_start, "hour", 0),
+        period_start_minute=_time_part(period_start, "minute", 0),
+        period_end_hour=_time_part(period_end, "hour", 0),
+        period_end_minute=_time_part(period_end, "minute", 0),
+    )
+
+    ok = coordinator._publish(raw)  # Integration-internal MQTT publish helper.
+    if not ok:
+        raise HomeAssistantError("MQTT publish failed while setting Auto Recharge")
+
+    # Optimistic update so the UI moves immediately; next robotConfig broadcast
+    # will confirm the real value.
+    if coordinator.data is not None:
+        coordinator.data["rrEnabled"] = enabled
+        coordinator.async_update_listeners()
+
+
+async def _auto_recharge_on(coordinator: LymowCoordinator) -> None:
+    await _set_auto_recharge(coordinator, True)
+
+
+async def _auto_recharge_off(coordinator: LymowCoordinator) -> None:
+    await _set_auto_recharge(coordinator, False)
+
+
+SWITCHES: tuple[LymowSwitchDesc, ...] = (
+    LymowSwitchDesc(
+        key="auto_recharge",
+        name="Auto Recharge",
+        icon="mdi:battery-sync",
+        value_fn=_rr_bool,
+        turn_on_fn=_auto_recharge_on,
+        turn_off_fn=_auto_recharge_off,
+        entity_registry_enabled_default=True,
+    ),
+)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities(
+        [LymowSwitch(coord, desc) for desc in SWITCHES],
+        update_before_add=False,
+    )
+
+
+class LymowSwitch(LymowEntity, SwitchEntity):
+    """Lymow switch entity."""
+
+    entity_description: LymowSwitchDesc
+
+    def __init__(self, coordinator: LymowCoordinator, desc: LymowSwitchDesc) -> None:
+        super().__init__(coordinator, desc.key)
+        self.entity_description = desc
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.entity_description.value_fn(self.coordinator.data or {}) is not None
+
+    @property
+    def is_on(self) -> bool | None:
+        return self.entity_description.value_fn(self.coordinator.data or {})
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self.entity_description.turn_on_fn(self.coordinator)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self.entity_description.turn_off_fn(self.coordinator)

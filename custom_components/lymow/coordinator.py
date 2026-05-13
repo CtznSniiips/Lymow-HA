@@ -52,13 +52,16 @@ from .protocol import (
     USER_CTRL_RESUME_DOCK,
     build_initial_query_packets,
     build_refresh_query_packets,
+    encode_query_map,
     encode_query_robot_config,
     decode_pboutput_envelope,
     decode_pbmap,
+    parse_zone_catalog,
     encode_start_zones,
     encode_userctrl,
+    encode_set_rr_config
 )
-from .state import derive_current_zone, robot_gps_from_state
+from .state import derive_current_zone, merge_pboutput, robot_gps_from_state
 from .state_matrix import lookup as lookup_state_row
 
 _LOGGER = logging.getLogger(__name__)
@@ -126,11 +129,6 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # REST metadata first: device_info gives IP/firmware/location fallback.
         await self._do_rest_poll()
 
-        # Load S3 backup map before MQTT. This gives the SVG camera a full
-        # zone catalog even if MQTT QUERY_MAP only returns a summary without
-        # polygon points.
-        await self._load_backup_map()
-
         await self._connect_mqtt()
 
         self._rest_poll_task = self.hass.async_create_background_task(
@@ -197,6 +195,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     
     async def _delayed_robot_config(self, delay: int) -> None:
         """Send robot config query with delay — mirrors app behavior (1s + 5s)."""
+        await asyncio.sleep(delay)
         self._publish(encode_query_robot_config())
 
     # ── Properties ──────────────────────────────────────────────
@@ -269,15 +268,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._state["currentZone"] = zone
 
         # Flatten runTimeConfig from btMap to top-level (blade height sensor)
-        btmap = self._state.get("btMap") or {}
-        import logging
-        _LOGGER.warning(
-            "DEBUG derive_state: cutHeight_top=%s btMap_cutHeight=%s btMap_keys=%s runTimeConfig=%s",
-            self._state.get("cutHeight"),
-            btmap.get("cutHeight"),
-            list(btmap.keys())[:10],
-            btmap.get("runTimeConfig"),
-        )
+        btmap = self._dict_or_empty(self._state.get("btMap"))
         for k in ("cutHeight", "cutSpeed", "moveSpeed"):
             if btmap.get(k) is not None and self._state.get(k) is None:
                 self._state[k] = btmap[k]
@@ -285,33 +276,90 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # ── Inbound MQTT handlers ────────────────────────────────────
 
+    def _dict_or_empty(self, value):
+        return value if isinstance(value, dict) else {}
+
     def _handle_pboutput(self, raw_envelope: bytes) -> None:
+        """Decode one MQTT /pboutput packet and merge it into coordinator state.
+
+        `protocol.decode_pboutput_envelope()` now returns a real protobuf
+        `PbOutput`. Normal fields are merged in `state.merge_pboutput()`;
+        the rich map/catalog branch inside `btMap.queryAck` is parsed
+        separately because that inner blob is not fully exposed by the pb2
+        schema.
+        """
         import time
         self._last_mqtt_ts = time.monotonic()
 
-        new_state = decode_pboutput_envelope(raw_envelope)
-        if not new_state:
+        try:
+            msg = decode_pboutput_envelope(raw_envelope)
+        except Exception:
+            _LOGGER.exception("Failed to decode PbOutput for %s", self.thing_name)
+            return
+
+        if msg is None:
             _LOGGER.debug("Empty pboutput decode for %s", self.thing_name)
             return
 
-        self._merge_state(new_state)
+        try:
+            merge_pboutput(self._state, msg)
+        except Exception:
+            _LOGGER.exception("Failed to merge PbOutput for %s", self.thing_name)
+            return
+
+        # QUERY_MAP rich response. PbOutput is decoded with protobuf, but the
+        # nested btMap.queryAck map payload still needs manual wire parsing.
+        try:
+            if msg.btMap.ByteSize() > 200:
+                catalog = parse_zone_catalog(msg.btMap)
+
+                # Sticky catalog: update only when the packet actually carries
+                # zones. QUERY_PATH / small btMap packets must not wipe a good
+                # catalog previously loaded from QUERY_MAP or S3.
+                if catalog.zones:
+                    self._state["zone_catalog"] = catalog
+                    self._state["btMap"] = catalog.to_btmap_dict()
+                    self._state["backupMapDownloadError"] = None
+
+                if catalog.enu_base_point:
+                    self._state["enu_base_point"] = catalog.enu_base_point
+
+                if catalog.charging_station_loc:
+                    self._state["chargingStationLoc"] = catalog.charging_station_loc
+
+                if catalog.runtime_config:
+                    self._state["runTimeConfig"] = catalog.runtime_config
+                    for key in ("cutHeight", "cutSpeed", "moveSpeed"):
+                        if key in catalog.runtime_config:
+                            self._state[key] = catalog.runtime_config[key]
+
+                _LOGGER.debug(
+                    "Parsed Lymow zone catalog for %s: zones=%s channels=%s ebp=%s runtime=%s",
+                    self.thing_name,
+                    len(catalog.zones),
+                    len(catalog.channels),
+                    bool(catalog.enu_base_point),
+                    bool(catalog.runtime_config),
+                )
+        except Exception:
+            _LOGGER.exception("Failed to parse btMap zone catalog for %s", self.thing_name)
+
         self._derive_state()
 
-        if (ws := new_state.get("workStatus")) is not None:
+        if (ws := self._state.get("workStatus")) is not None:
             self._prev_work_status = ws
 
         # ── Mow path tracking ──────────────────────────────────
-        ws = new_state.get("workStatus")
+        ws = self._state.get("workStatus")
         if ws is not None:
-            is_mowing = new_state.get("robotStatus") == 2  # CLEANING
+            is_mowing = self._state.get("robotStatus") == 2  # CLEANING
 
             if is_mowing:
                 self._mow_session_active = True
                 robot = (
-                    new_state.get("pose")
-                    or new_state.get("robotLoc")
-                    or self._state.get("pose")
+                    self._state.get("pose")
                     or self._state.get("robotLoc")
+                    or self._state.get("robotPosePib")
                 )
                 if isinstance(robot, dict):
                     x, y = robot.get("x"), robot.get("y")
@@ -320,19 +368,19 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         if not self._mow_path or self._mow_path[-1] != pt:
                             self._mow_path.append(pt)
 
-            # Reset SOLO quando è al dock (sessione terminata)
-            robot_status = new_state.get("robotStatus")
+            robot_status = self._state.get("robotStatus")
             if robot_status in (0, 5, 12):   # NONE, CHARGING, CHARGING_FULL
                 self._mow_path = []
                 self._mow_session_active = False
-            elif robot_status in (1, 3, 8, 4, 10):  # WAITING, PAUSE, RESUME, DOCKING, PAUSE_DOCKING
-                self._mow_session_active = False     # congela ma preserva path
+            elif robot_status in (1, 3, 8, 4, 10):
+                self._mow_session_active = False
 
         _LOGGER.debug(
-            "State update %s: workStatus=%s battery=%s",
+            "State update %s: workStatus=%s battery=%s catalog=%s",
             self.thing_name,
             self._state.get("workStatus"),
             self._state.get("battery"),
+            bool(self._state.get("zone_catalog")),
         )
         self._state_event.set()
         self.async_set_updated_data(self._state)
@@ -404,219 +452,6 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise
             except Exception:
                 _LOGGER.exception("REST poll failed for %s", self.thing_name)
-
-    def _backup_map_label(self, item: dict[str, Any]) -> str:
-        """Human-readable label for a backup map select option."""
-        name = (item.get("name") or "").strip()
-        map_file = item.get("map_file") or ""
-        filename = map_file.rsplit("/", 1)[-1] if map_file else "unknown"
-
-        # Keep labels unique/readable. Many backup names can be blank.
-        if name:
-            return f"{name} · {filename}"
-        return filename
-
-    def _backup_map_options(self) -> list[str]:
-        """Return labels for available backup maps."""
-        maps = self._state.get("backupMapList") or []
-        if not isinstance(maps, list):
-            return []
-        return [
-            self._backup_map_label(item)
-            for item in maps
-            if isinstance(item, dict) and isinstance(item.get("map_file"), str)
-        ]
-
-    def _backup_map_item_for_option(self, option: str) -> dict[str, Any] | None:
-        """Find backup map list item matching a select option label."""
-        maps = self._state.get("backupMapList") or []
-        if not isinstance(maps, list):
-            return None
-        for item in maps:
-            if isinstance(item, dict) and self._backup_map_label(item) == option:
-                return item
-        return None
-
-    @property
-    def backup_map_options(self) -> list[str]:
-        return self._backup_map_options()
-
-    @property
-    def current_backup_map_option(self) -> str | None:
-        loaded = self._state.get("loadedBackupMap")
-        if isinstance(loaded, dict):
-            return self._backup_map_label(loaded)
-        return None
-
-    async def async_select_backup_map(self, option: str) -> bool:
-        """Select and load a backup map from the HA select entity."""
-        item = self._backup_map_item_for_option(option)
-        if not item:
-            _LOGGER.warning("Unknown Lymow backup map option for %s: %s", self.thing_name, option)
-            return False
-        map_file = item.get("map_file")
-        if not isinstance(map_file, str):
-            return False
-        await self._load_backup_map(selected_map_file=map_file)
-        return self._state.get("backupMapDownloadError") is None
-
-    async def async_refresh_backup_maps(self) -> None:
-        """Refresh backup map list and keep current/default map loaded."""
-        await self._load_backup_map(selected_map_file=self._state.get("selectedBackupMapFile"))
-
-    async def _load_backup_map(self, selected_map_file: str | None = None) -> None:
-        """Load selected/default backup map from S3 and merge it into state.
-
-        get_backup_map returns S3 keys such as ``device_xxx/map/map.pb``.
-        The downloaded object is a standalone PbMap message, not a PbOutput and
-        not a PbBtMap wrapper.
-
-        If selected_map_file is None:
-          - keep previously selectedBackupMapFile if present;
-          - otherwise prefer current map.pb;
-          - otherwise first valid backup map.
-        """
-        try:
-            await self.auth.ensure_valid(self._email, self._password)
-            backup = await self.client.get_backup_map(self.thing_name)
-            map_list = (backup or {}).get("mapList") if isinstance(backup, dict) else None
-            if not isinstance(map_list, list) or not map_list:
-                self._merge_state({
-                    "backupMapList": [],
-                    "backupMapOptions": [],
-                    "backupMapDownloadError": "empty_map_list",
-                })
-                self.async_set_updated_data(self._state)
-                return
-
-            selected = None
-
-            desired_file = selected_map_file or self._state.get("selectedBackupMapFile")
-            if desired_file:
-                selected = next(
-                    (
-                        item for item in map_list
-                        if isinstance(item, dict) and item.get("map_file") == desired_file
-                    ),
-                    None,
-                )
-
-            # Prefer current map.pb by default.
-            if selected is None:
-                selected = next(
-                    (
-                        item for item in map_list
-                        if (
-                            isinstance(item, dict)
-                            and isinstance(item.get("map_file"), str)
-                            and item["map_file"].endswith("/map.pb")
-                        )
-                    ),
-                    None,
-                )
-
-            if selected is None:
-                selected = next(
-                    (
-                        item for item in map_list
-                        if isinstance(item, dict) and isinstance(item.get("map_file"), str)
-                    ),
-                    None,
-                )
-
-            options = [
-                self._backup_map_label(item)
-                for item in map_list
-                if isinstance(item, dict) and isinstance(item.get("map_file"), str)
-            ]
-
-            if not selected:
-                self._merge_state({
-                    "backupMapList": map_list,
-                    "backupMapOptions": options,
-                    "backupMapDownloadError": "no_valid_map_file",
-                })
-                self.async_set_updated_data(self._state)
-                return
-
-            map_file = selected["map_file"]
-            self._merge_state({
-                "backupMapList": map_list,
-                "backupMapOptions": options,
-                "selectedBackupMapFile": map_file,
-                "selectedBackupMapOption": self._backup_map_label(selected),
-                "backupMapDownloadError": None,
-            })
-            self.async_set_updated_data(self._state)
-
-            raw = await self.client.download_s3_object(map_file)
-            if not raw:
-                self._merge_state({
-                    "backupMapList": map_list,
-                    "backupMapOptions": options,
-                    "loadedBackupMap": selected,
-                    "backupMapDownloadError": "download_failed",
-                })
-                self.async_set_updated_data(self._state)
-                return
-
-            decoded = decode_pbmap(raw)
-            if not decoded:
-                self._merge_state({
-                    "backupMapList": map_list,
-                    "backupMapOptions": options,
-                    "loadedBackupMap": selected,
-                    "backupMapBytes": len(raw),
-                    "backupMapDownloadError": "decode_failed",
-                })
-                self.async_set_updated_data(self._state)
-                return
-            
-            _LOGGER.warning(
-                "DEBUG map decode: keys=%s cutHeight=%s runTimeConfig=%s",
-                list(decoded.keys()),
-                decoded.get("cutHeight"),
-                decoded.get("runTimeConfig"),
-            )
-
-            state_update: dict[str, Any] = {
-                "backupMapList": map_list,
-                "backupMapOptions": options,
-                "selectedBackupMapFile": map_file,
-                "selectedBackupMapOption": self._backup_map_label(selected),
-                "loadedBackupMap": selected,
-                "backupMapBytes": len(raw),
-                "backupMapDecodedZones": len(decoded.get("zones") or []),
-                "backupMapZonesWithPoints": sum(1 for z in (decoded.get("zones") or []) if z.get("points")),
-                "backupMapDownloadError": None,
-                "btMap": decoded,
-            }
-            if decoded.get("enuBasePoint"):
-                state_update["enu_base_point"] = decoded["enuBasePoint"]
-            if decoded.get("chargingStationLoc"):
-                state_update["chargingStationLoc"] = decoded["chargingStationLoc"]
-            # Flatten runTimeConfig values to state root for blade_height sensor
-            for k in ("cutHeight", "cutSpeed", "moveSpeed"):
-                if decoded.get(k) is not None:
-                    state_update[k] = decoded[k]
-
-            self._merge_state(state_update)
-            self._derive_state()
-
-            _LOGGER.info(
-                "Loaded Lymow backup map for %s: option=%s zones=%s bytes=%s key=%s",
-                self.thing_name,
-                self._backup_map_label(selected),
-                decoded.get("zone_count"),
-                len(raw),
-                map_file,
-            )
-            self.async_set_updated_data(self._state)
-
-        except Exception:
-            _LOGGER.debug("Backup map load failed for %s", self.thing_name, exc_info=True)
-            self._merge_state({"backupMapDownloadError": "exception"})
-            self.async_set_updated_data(self._state)
 
     async def _do_rest_poll(self) -> None:
         try:
@@ -705,6 +540,17 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except asyncio.TimeoutError:
             return False
 
+    async def _preflight_query_map(self, timeout: float = 3.0) -> None:
+        """Ask for a fresh map/state snapshot before user commands.
+
+        The mower often emits a useful state echo after QUERY_MAP. The command
+        methods do not fail if the preflight times out; they just proceed with
+        the best state currently available.
+        """
+        if self.mqtt and self.mqtt.is_connected:
+            self._publish(encode_query_map())
+            await self._wait_state_update(timeout=timeout)
+
     def _state_row(self):
         return lookup_state_row(
             work_status=self._state.get("workStatus"),
@@ -716,6 +562,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_start_mow(self, zone_ids: list[str] | None = None) -> bool:
         await self.auth.ensure_valid(self._email, self._password)
+        await self._preflight_query_map()
         if zone_ids:
             raw = encode_start_zones(zone_ids)
         else:
@@ -727,6 +574,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_pause(self) -> bool:
         await self.auth.ensure_valid(self._email, self._password)
+        await self._preflight_query_map()
         row = self._state_row()
         ctrl = row.pause or (USER_CTRL_PAUSE_DOCK if self.work_status in (WORK_STATUS_DOCKING, WORK_STATUS_PAUSE_DOCKING) else USER_CTRL_PAUSE)
         ok   = self._publish(encode_userctrl(ctrl))
@@ -735,6 +583,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_resume(self) -> bool:
         await self.auth.ensure_valid(self._email, self._password)
+        await self._preflight_query_map()
         ctrl = USER_CTRL_RESUME_DOCK if self.work_status == WORK_STATUS_PAUSE_DOCKING else USER_CTRL_RESUME
         ok   = self._publish(encode_userctrl(ctrl))
         await self._wait_state_update()
@@ -742,6 +591,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_dock(self) -> bool:
         await self.auth.ensure_valid(self._email, self._password)
+        await self._preflight_query_map()
         row = self._state_row()
         ok = self._publish(encode_userctrl(row.dock or USER_CTRL_RECHARGE_DOCK))
         await self._wait_state_update()
@@ -749,12 +599,14 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_dock_cancel_task(self) -> bool:
         await self.auth.ensure_valid(self._email, self._password)
+        await self._preflight_query_map()
         ok = self._publish(encode_userctrl(USER_CTRL_DOCK))
         await self._wait_state_update()
         return ok
 
     async def async_stop(self) -> bool:
         await self.auth.ensure_valid(self._email, self._password)
+        await self._preflight_query_map()
         ok = self._publish(encode_userctrl(USER_CTRL_FORCE_REINIT))
         await self._wait_state_update()
         return ok
@@ -774,20 +626,15 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_set_clean_mode(self, mode: str) -> bool:
         """Set global clean mode via PbInput.robotConfig (MQTT only).
 
-        PbInput.robotConfig = field 13, PbRobotConfig.cleanMode = field 7.
+        Per live wire captures, cleanMode sits at field 7 of PbRobotConfig
+        (PbInput field 13). See encode_set_clean_mode() for encoding details.
         """
-        from .protocol import _enc_i32, _enc_len, PB_VERSION_4_9
-        _CLEAN_MODE_INT = {
-            "ZIGZAG_MODE": 1, "CHESS_BOARD_MODE": 2,
-            "PERIMETER_LAPS_ONLY_MODE": 3, "ADAPTIVE_ZIGZAG_MODE": 4,
-        }
-        mode_int = _CLEAN_MODE_INT.get(mode)
+        from .protocol import encode_set_clean_mode, CLEAN_MODE_STR
+        mode_int = CLEAN_MODE_STR.get(mode)
         if mode_int is None:
             _LOGGER.warning("Unknown clean mode: %s", mode)
             return False
-        rc = _enc_i32(7, mode_int)          # PbRobotConfig.cleanMode
-        raw = _enc_i32(2, PB_VERSION_4_9) + _enc_len(13, rc)
-        self._publish(raw)
+        self._publish(encode_set_clean_mode(mode_int))
         if self.data:
             self.data["cleanMode"] = mode
             self.data["robotCleanMode"] = mode_int
@@ -797,6 +644,157 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_set_schedule(self, schedules: list[dict]) -> bool:
         _LOGGER.warning("set_schedule not implemented for MQTT path yet")
         return False
+    
+    async def _send_rr_update(
+        self,
+        *,
+        enable_rr: bool | None = None,
+        recharge_bat: int | None = None,
+        resume_bat: int | None = None,
+    ) -> bool:
+        """Update rrConfig while preserving existing values."""
+
+        await self.auth.ensure_valid(self._email, self._password)
+
+        d = self._state or {}
+
+        current_enable = d.get("rrEnabled")
+        current_recharge = d.get("rrRechargeBat")
+        current_resume = d.get("rrResumeBat")
+
+        # Default sicuri se il robotConfig non è ancora arrivato
+        if current_enable is None:
+            current_enable = True
+        if current_recharge is None:
+            current_recharge = 10
+        if current_resume is None:
+            current_resume = 98
+
+        # Orari RR già flattenati nello state.py, se presenti
+        rr_start = d.get("rrResumePeriodStart") or {}
+        rr_end = d.get("rrResumePeriodEnd") or {}
+
+        start_h = int(rr_start.get("hour", 0)) if isinstance(rr_start, dict) else 0
+        start_m = int(rr_start.get("minute", 0)) if isinstance(rr_start, dict) else 0
+        end_h = int(rr_end.get("hour", 0)) if isinstance(rr_end, dict) else 0
+        end_m = int(rr_end.get("minute", 0)) if isinstance(rr_end, dict) else 0
+
+        raw = encode_set_rr_config(
+            enable_rr=bool(current_enable if enable_rr is None else enable_rr),
+            recharge_bat=int(current_recharge if recharge_bat is None else recharge_bat),
+            resume_bat=int(current_resume if resume_bat is None else resume_bat),
+            period_start_hour=start_h,
+            period_start_minute=start_m,
+            period_end_hour=end_h,
+            period_end_minute=end_m,
+        )
+
+        ok = self._publish(raw)
+        await self._wait_state_update()
+        return ok
+
+
+    async def async_set_auto_recharge(self, enabled: bool) -> bool:
+        """Enable/disable auto recharge."""
+        return await self._send_rr_update(enable_rr=enabled)
+
+
+    async def cmd_set_auto_recharge(self, enabled: bool) -> bool:
+        """Alias used by switch entities."""
+        return await self.async_set_auto_recharge(enabled)
+
+
+    async def async_set_recharge_threshold(self, value: int) -> bool:
+        """Set battery percentage where mower should go recharge."""
+        value = max(1, min(100, int(value)))
+        return await self._send_rr_update(recharge_bat=value)
+
+
+    async def cmd_set_recharge_threshold(self, value: int) -> bool:
+        """Alias used by number entities."""
+        return await self.async_set_recharge_threshold(value)
+
+
+    async def async_set_resume_threshold(self, value: int) -> bool:
+        """Set battery percentage where mower should resume mowing."""
+        value = max(1, min(100, int(value)))
+        return await self._send_rr_update(resume_bat=value)
+
+
+    async def cmd_set_resume_threshold(self, value: int) -> bool:
+        """Alias used by number entities."""
+        return await self.async_set_resume_threshold(value)
+    
+    async def async_set_rr_start_time(self, hour: int, minute: int) -> bool:
+        """Set RR resume period start time."""
+        await self.auth.ensure_valid(self._email, self._password)
+
+        d = self._state or {}
+
+        current_enable = d.get("rrEnabled")
+        current_recharge = d.get("rrRechargeBat")
+        current_resume = d.get("rrResumeBat")
+
+        if current_enable is None:
+            current_enable = True
+        if current_recharge is None:
+            current_recharge = 10
+        if current_resume is None:
+            current_resume = 98
+
+        rr_end = d.get("rrResumePeriodEnd") or {}
+        end_h = int(rr_end.get("hour", 0)) if isinstance(rr_end, dict) else 0
+        end_m = int(rr_end.get("minute", 0)) if isinstance(rr_end, dict) else 0
+
+        raw = encode_set_rr_config(
+            enable_rr=bool(current_enable),
+            recharge_bat=int(current_recharge),
+            resume_bat=int(current_resume),
+            period_start_hour=max(0, min(23, int(hour))),
+            period_start_minute=max(0, min(59, int(minute))),
+            period_end_hour=end_h,
+            period_end_minute=end_m,
+        )
+
+        ok = self._publish(raw)
+        await self._wait_state_update()
+        return ok
+
+
+    async def async_set_rr_end_time(self, hour: int, minute: int) -> bool:
+        """Set RR resume period end time."""
+        await self.auth.ensure_valid(self._email, self._password)
+
+        d = self._state or {}
+
+        current_enable = d.get("rrEnabled")
+        current_recharge = d.get("rrRechargeBat")
+        current_resume = d.get("rrResumeBat")
+
+        if current_enable is None:
+            current_enable = True
+        if current_recharge is None:
+            current_recharge = 10
+        if current_resume is None:
+            current_resume = 98
+
+        rr_start = d.get("rrResumePeriodStart") or {}
+        start_h = int(rr_start.get("hour", 0)) if isinstance(rr_start, dict) else 0
+        start_m = int(rr_start.get("minute", 0)) if isinstance(rr_start, dict) else 0
+
+        raw = encode_set_rr_config(
+            enable_rr=bool(current_enable),
+            recharge_bat=int(current_recharge),
+            resume_bat=int(current_resume),
+            period_start_hour=start_h,
+            period_start_minute=start_m,
+            period_end_hour=max(0, min(23, int(hour))),
+            period_end_minute=max(0, min(59, int(minute))),
+        )
+
+        ok = self._publish(raw)
+        await self._wait_state_update()
+        return ok
 
     # ── One-time fetches ─────────────────────────────────────────
 
@@ -825,14 +823,6 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except LymowError as err:
             _LOGGER.warning("History fetch failed: %s", err)
             return []
-
-    async def async_refresh_map(self) -> dict | None:
-        try:
-            await self._load_backup_map()
-            return self._state.get("btMap")
-        except LymowError as err:
-            _LOGGER.warning("Map fetch failed: %s", err)
-            return None
 
     # ── DataUpdateCoordinator shim ───────────────────────────────
 

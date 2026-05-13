@@ -87,18 +87,59 @@ class LymowSensorDesc(SensorEntityDescription):
 
 # ── Helpers ───────────────────────────────────────────────────
 
+def _read(obj: Any, key: str, default: Any = None) -> Any:
+    """Read key from dict or protobuf/dataclass object."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 def _net(key: str) -> Callable[[dict], Any]:
-    return lambda d: (d.get(F_NET_DETAIL) or {}).get(key)
+    """Read network value from protobuf netDetailInfo, dict, or flat alias."""
+    return lambda d: _read(d.get(F_NET_DETAIL), key, d.get(key))
+
 
 def _rtk(key: str) -> Callable[[dict], Any]:
-    return lambda d: (d.get("rtkDiagnosticL1") or {}).get(key)
+    """Read RTK L1 value from protobuf object, dict, or flat alias."""
+    return lambda d: _read(d.get("rtkDiagnosticL1"), key, d.get(key))
+
 
 def _robot_ip(d: dict) -> str | None:
-    """Robot IP — top-level ipAddress, fallback netDetailInfo.wifiIp."""
-    return d.get(F_IP_ADDRESS) or (d.get(F_NET_DETAIL) or {}).get("wifiIp")
+    """Robot IP — top-level ipAddress, fallback netDetailInfo.wifiIp/rest IP."""
+    return d.get(F_IP_ADDRESS) or _read(d.get(F_NET_DETAIL), "wifiIp") or d.get("rest_ip_address")
+
 
 def _history_summary(key: str) -> Callable[[dict], Any]:
     return lambda d: (d.get("cleanHistorySummary") or {}).get(key)
+
+
+def _btmap(key: str) -> Callable[[dict], Any]:
+    return lambda d: (d.get("btMap") or {}).get(key)
+
+
+def _zone_catalog_value(key: str) -> Callable[[dict], Any]:
+    def _inner(d: dict) -> Any:
+        catalog = d.get("zone_catalog")
+        if catalog is not None:
+            if key == "zone_count":
+                return len(getattr(catalog, "zones", []) or [])
+            if key == "channel_count":
+                return len(getattr(catalog, "channels", []) or [])
+            if key == "zones_with_points":
+                return sum(1 for z in (getattr(catalog, "zones", []) or []) if getattr(z, "polygon_points", None))
+            if key == "has_enu_base_point":
+                return getattr(catalog, "enu_base_point", None) is not None
+        btmap = d.get("btMap") or {}
+        if key == "channel_count":
+            return len(btmap.get("channels") or [])
+        if key == "zones_with_points":
+            return sum(1 for z in (btmap.get("zones") or []) if z.get("points"))
+        if key == "has_enu_base_point":
+            return bool(btmap.get("enuBasePoint") or d.get("enu_base_point"))
+        return btmap.get(key)
+    return _inner
 
 
 # ── Sensor definitions ────────────────────────────────────────
@@ -112,6 +153,14 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         icon="mdi:robot-mower",
         value_source="workStatus",
         transform=lambda v: WORK_STATUS_LABELS.get(v, f"Unknown ({v})"),
+    ),
+    LymowSensorDesc(
+        key="robot_status",
+        name="Robot Status",
+        icon="mdi:robot-mower-outline",
+        value_source="robotStatus",
+        transform=lambda v: WORK_STATUS_LABELS.get(v, f"Unknown ({v})"),
+        entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
         key="error",
@@ -149,6 +198,23 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         icon="mdi:scissors-cutting",
         value_source=F_CUT_HEIGHT,
     ),
+    LymowSensorDesc(
+        key="move_speed",
+        name="Move Speed",
+        native_unit_of_measurement="m/s",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:speedometer",
+        value_source="moveSpeed",
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="cut_speed",
+        name="Blade Speed",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:fan",
+        value_source="cutSpeed",
+        entity_registry_enabled_default=False,
+    ),
 
     # ── Clean session ────────────────────────────────────────────────────
     LymowSensorDesc(
@@ -158,15 +224,17 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:map-check",
         value_source=F_CLEAN_AREA,
+        transform=lambda v: int(float(v)) if v is not None else None,
     ),
     LymowSensorDesc(
         key="session_time",
         name="Session Duration",
-        native_unit_of_measurement=UnitOfTime.SECONDS,
+        native_unit_of_measurement=UnitOfTime.MINUTES,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:timer-outline",
         value_source="cleanTime",
+        transform=lambda v: int(float(v)) if v is not None else None,
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
@@ -176,15 +244,17 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:progress-check",
         value_source="cleanPercent",
+        transform=lambda v: int(round(float(v) * 100)) if v is not None else None,
     ),
     LymowSensorDesc(
         key="session_remain",
         name="Session Remaining",
-        native_unit_of_measurement=UnitOfTime.SECONDS,
+        native_unit_of_measurement=UnitOfTime.MINUTES,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:timer-sand",
         value_source="remainCleanTime",
+        transform=lambda v: int(float(v)) if v is not None else None,
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
@@ -194,6 +264,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:map",
         value_source="mapArea",
+        transform=lambda v: int(float(v)) if v is not None else None,
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
@@ -201,7 +272,30 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         name="Zone Count",
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:map-marker-multiple",
-        value_source=lambda d: (d.get("btMap") or {}).get("zone_count"),
+        value_source=_zone_catalog_value("zone_count"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="zones_with_points",
+        name="Zones With Points",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:vector-polygon",
+        value_source=_zone_catalog_value("zones_with_points"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="channel_count",
+        name="Channel Count",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:map-marker-path",
+        value_source=_zone_catalog_value("channel_count"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="map_has_gps_origin",
+        name="Map Has GPS Origin",
+        icon="mdi:crosshairs-gps",
+        value_source=_zone_catalog_value("has_enu_base_point"),
         entity_registry_enabled_default=False,
     ),
 
@@ -228,6 +322,29 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:satellite-variant",
         value_source=_rtk("satelliteCount"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="rtk_l1_satellites",
+        name="RTK L1 Satellites",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:satellite-variant",
+        value_source=_rtk("l1SatelliteCount"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="rtk_l2_satellites",
+        name="RTK L2 Satellites",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:satellite-variant",
+        value_source=_rtk("l2SatelliteCount"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="rtk_base_status",
+        name="RTK Base Status",
+        icon="mdi:access-point",
+        value_source=_rtk("baseStationStatus"),
         entity_registry_enabled_default=False,
     ),
 
@@ -269,6 +386,20 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
+        key="sim_iccid",
+        name="SIM ICCID",
+        icon="mdi:sim",
+        value_source=_net("simIccid"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="sim_ip",
+        name="SIM IP",
+        icon="mdi:ip-network-outline",
+        value_source=_net("simIp"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
         key="fw_version",
         name="Firmware",
         icon="mdi:chip",
@@ -294,6 +425,30 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         name="Current Zone",
         icon="mdi:map-marker-radius",
         value_source="currentZone",
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="auto_recharge",
+        name="Auto Recharge",
+        icon="mdi:battery-sync",
+        value_source="rrEnabled",
+        transform=lambda v: "On" if v else "Off",
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="auto_recharge_battery",
+        name="Auto Recharge Battery",
+        native_unit_of_measurement=PERCENTAGE,
+        icon="mdi:battery-arrow-down",
+        value_source="rrRechargeBat",
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="auto_resume_battery",
+        name="Auto Resume Battery",
+        native_unit_of_measurement=PERCENTAGE,
+        icon="mdi:battery-arrow-up",
+        value_source="rrResumeBat",
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(

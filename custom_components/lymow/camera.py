@@ -135,9 +135,8 @@ class LymowMapCamera(LymowEntity, Camera):
                 1 for z in zones if z.get("points") and len(z.get("points") or []) >= 2
             ),
             "first_zone_points_count": len(zones[0].get("points") or []) if zones else 0,
-            "loadedBackupMap": d.get("loadedBackupMap"),
-            "backupMapBytes": d.get("backupMapBytes"),
-            "backupMapDownloadError": d.get("backupMapDownloadError"),
+            "channel_count": len((btmap.get("channels") or [])),
+            "has_enu_base_point": bool(btmap.get("enuBasePoint") or d.get("enu_base_point")),
         }
 
 
@@ -210,7 +209,7 @@ def build_map_png(data: dict) -> tuple:
         "zones":        len(zones),
         "drawable":     len(drawable),
         "first_points": len(zones[0].get("points") or []) if zones else 0,
-        "loaded":       data.get("loadedBackupMap"),
+        "channels":     len((btmap.get("channels") or [])),
     }
 
     draw_text(draw, "Lymow Map Diagnostic", 20, 16, 22, WHITE)
@@ -242,6 +241,20 @@ def build_map_png(data: dict) -> tuple:
 
     def sx(x: float) -> float: return (x - min_x) * scale + PAD
     def sy(y: float) -> float: return H - ((y - min_y) * scale + PAD)
+
+    # Channels / corridors — draw behind zone outlines.
+    for channel in (btmap.get("channels") or []):
+        pts = safe_points(channel.get("points") or [])
+        if len(pts) < 2:
+            continue
+        if len(pts) > 300:
+            step = max(1, math.ceil(len(pts) / 300))
+            pts = pts[::step]
+        xy = [(sx(x), sy(y)) for x, y in pts]
+        if len(xy) >= 3:
+            draw.line(xy + [xy[0]], fill=YELLOW, width=2)
+        elif len(xy) >= 2:
+            draw.line(xy, fill=YELLOW, width=2)
 
     for idx, zone in enumerate(drawable):
         pts = safe_points(zone.get("points") or [])

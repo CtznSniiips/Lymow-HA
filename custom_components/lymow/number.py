@@ -1,15 +1,9 @@
-"""Lymow number platform — Blade Height (read-only, derived from first zone config).
-
-cutHeight has no global firmware setting — each zone has its own value.
-This sensor shows the cutHeight of the first zone that has one configured,
-as a read-only indicator. Write support is not implemented because the
-firmware has no "set global blade height" command.
-"""
+"""Lymow number platform — Blade Height."""
 from __future__ import annotations
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory, UnitOfLength
+from homeassistant.const import PERCENTAGE, UnitOfLength
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -22,15 +16,21 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([LymowBladeHeight(coord)], update_before_add=False)
+    async_add_entities(
+        [
+            LymowBladeHeight(coord),
+            LymowRechargeThreshold(coord),
+            LymowResumeThreshold(coord),
+        ], 
+        update_before_add=False)
 
 
 class LymowBladeHeight(LymowEntity, NumberEntity):
-    """Blade height indicator (read-only, from first zone's zoneConfig).
+    """Blade height control (mm).
 
-    The Lymow firmware does not expose a global blade height command.
-    cutHeight is a per-zone setting; this entity shows the value from the
-    first zone that has one configured, updated whenever the map is loaded.
+    Reads from PbRunTimeConfig.cutHeight (QUERY_MAP response) or
+    PbBaseOutput.cutHeight (real-time broadcast) or PbRobotConfig.rcCutHeight.
+    Writes via PbInput.map.runTimeConfig.cutHeight (encode_set_cut_height).
     """
 
     _attr_name                       = "Blade Height"
@@ -40,7 +40,6 @@ class LymowBladeHeight(LymowEntity, NumberEntity):
     _attr_native_step                = 5
     _attr_native_unit_of_measurement = UnitOfLength.MILLIMETERS
     _attr_mode                       = NumberMode.BOX
-    _attr_entity_category            = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
         super().__init__(coordinator, "blade_height")
@@ -48,11 +47,11 @@ class LymowBladeHeight(LymowEntity, NumberEntity):
     @property
     def native_value(self) -> float | None:
         d = self.coordinator.data or {}
-        # _derive_state populates cutHeight from first zone's zoneConfig
+        # Prefer top-level cutHeight (flattened from runTimeConfig or baseOutput)
         val = d.get(F_CUT_HEIGHT)
         if val is not None:
             return float(val)
-        # Direct fallback: walk zones ourselves
+        # Fallback: walk zones for the first configured zoneConfig.cutHeight
         zones = (d.get("btMap") or {}).get("zones") or []
         for z in zones:
             ch = (z.get("zoneConfig") or {}).get("cutHeight")
@@ -61,6 +60,57 @@ class LymowBladeHeight(LymowEntity, NumberEntity):
         return None
 
     async def async_set_native_value(self, value: float) -> None:
-        # No global set command exists in firmware — this is a no-op.
-        # Implement per-zone writes when encode_set_zone_config is available.
-        pass
+        await self.coordinator.async_set_blade_height(int(value))
+
+class LymowRechargeThreshold(LymowEntity, NumberEntity):
+    """Battery percentage where mower should go recharge."""
+
+    _attr_name = "Auto Recharge Battery"
+    _attr_icon = "mdi:battery-arrow-down"
+    _attr_native_min_value = 1
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "auto_recharge_battery")
+
+    @property
+    def native_value(self) -> float | None:
+        val = (self.coordinator.data or {}).get("rrRechargeBat")
+        return float(val) if val is not None else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and (self.coordinator.data or {}).get("rrRechargeBat") is not None
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self.coordinator.async_set_recharge_threshold(int(value))
+
+
+class LymowResumeThreshold(LymowEntity, NumberEntity):
+    """Battery percentage where mower should resume mowing."""
+
+    _attr_name = "Auto Resume Battery"
+    _attr_icon = "mdi:battery-arrow-up"
+    _attr_native_min_value = 1
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "auto_resume_battery")
+
+    @property
+    def native_value(self) -> float | None:
+        val = (self.coordinator.data or {}).get("rrResumeBat")
+        return float(val) if val is not None else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and (self.coordinator.data or {}).get("rrResumeBat") is not None
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self.coordinator.async_set_resume_threshold(int(value))

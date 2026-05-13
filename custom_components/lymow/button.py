@@ -1,37 +1,21 @@
 """Lymow button platform.
 
-Exposes individual command buttons so they can be placed anywhere in
-Lovelace independently from the lawn_mower card.
-
-Buttons:
-  - Start Mowing    → state-matrix driven (CLEAN or RESUME)
-  - Pause           → state-matrix driven (PAUSE or PAUSE_DOCK)
-  - Dock            → RECHARGE_DOCK (keep task progress)
-  - Cancel Task     → FORCE_REINIT (stop in place, reset to waiting)
-  - Dock & Cancel   → DOCK (dock + abandon task)
+Command buttons call the coordinator methods instead of publishing protobuf
+payloads directly, so command preflight/watchdog logic stays in one place.
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Any
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from . import state_matrix
-from .const import (
-    DOMAIN,
-    USER_CTRL_DOCK,
-    USER_CTRL_FORCE_REINIT,
-    USER_CTRL_RECHARGE_DOCK,
-)
+from .const import DOMAIN
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
-from .protocol import encode_userctrl
+from .protocol import encode_query_map, encode_query_robot_config, encode_query_schedules
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,40 +26,35 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([
-        LymowStartButton(coord),
-        LymowPauseButton(coord),
-        LymowDockButton(coord),
-        LymowCancelTaskButton(coord),
-        LymowDockCancelButton(coord),
-    ])
+    async_add_entities(
+        [
+            LymowStartButton(coord),
+            LymowPauseButton(coord),
+            LymowResumeButton(coord),
+            LymowDockButton(coord),
+            LymowCancelTaskButton(coord),
+            LymowDockCancelButton(coord),
+            LymowRefreshMapButton(coord),
+            LymowRefreshRobotConfigButton(coord),
+            LymowRefreshSchedulesButton(coord),
+            LymowRefreshDeviceInfoButton(coord),
+            LymowRefreshHistoryButton(coord),
+        ],
+        update_before_add=False,
+    )
 
-
-# ── Shared base ───────────────────────────────────────────────────────────────
 
 class _LymowButton(LymowEntity, ButtonEntity):
     """Base for all Lymow command buttons."""
 
+    _attr_entity_registry_enabled_default = True
+
     def __init__(self, coordinator: LymowCoordinator, key: str) -> None:
         super().__init__(coordinator, key)
 
-    def _matrix_row(self) -> state_matrix.StateRow:
-        d   = self.coordinator.data or {}
-        ws  = d.get("workStatus",  0)
-        rs  = d.get("robotStatus", 0)
-        rch = bool(d.get("isRecharging", False))
-        return state_matrix.lookup(
-            work_status=ws, robot_status=rs, is_recharging=rch
-        )
-
-    def _publish(self, user_ctrl: int) -> None:
-        self.coordinator._publish(encode_userctrl(user_ctrl))
-
-
-# ── Start Mowing ──────────────────────────────────────────────────────────────
 
 class LymowStartButton(_LymowButton):
-    """Start or resume mowing — routes via state matrix."""
+    """Start or resume mowing using the coordinator state matrix."""
 
     _attr_name = "Start Mowing"
     _attr_icon = "mdi:play"
@@ -84,21 +63,12 @@ class LymowStartButton(_LymowButton):
         super().__init__(coordinator, "btn_start")
 
     async def async_press(self) -> None:
-        action = self._matrix_row().start_mowing
-        if action is None:
-            d = self.coordinator.data or {}
-            raise HomeAssistantError(
-                f"Cannot start mowing from current state "
-                f"(workStatus={d.get('workStatus')}, robotStatus={d.get('robotStatus')})"
-            )
-        _LOGGER.debug("Lymow Start → userCtrl=%s", action)
-        self._publish(action)
+        _LOGGER.debug("Lymow Start button pressed")
+        await self.coordinator.async_start_mow()
 
-
-# ── Pause ─────────────────────────────────────────────────────────────────────
 
 class LymowPauseButton(_LymowButton):
-    """Pause mowing or docking — routes via state matrix."""
+    """Pause mowing or docking."""
 
     _attr_name = "Pause"
     _attr_icon = "mdi:pause"
@@ -107,17 +77,26 @@ class LymowPauseButton(_LymowButton):
         super().__init__(coordinator, "btn_pause")
 
     async def async_press(self) -> None:
-        action = self._matrix_row().pause
-        if action is None:
-            raise HomeAssistantError("Cannot pause from current state")
-        _LOGGER.debug("Lymow Pause → userCtrl=%s", action)
-        self._publish(action)
+        _LOGGER.debug("Lymow Pause button pressed")
+        await self.coordinator.async_pause()
 
 
-# ── Dock (keep progress) ──────────────────────────────────────────────────────
+class LymowResumeButton(_LymowButton):
+    """Resume mowing or resume docking from pause."""
+
+    _attr_name = "Resume"
+    _attr_icon = "mdi:play-pause"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "btn_resume")
+
+    async def async_press(self) -> None:
+        _LOGGER.debug("Lymow Resume button pressed")
+        await self.coordinator.async_resume()
+
 
 class LymowDockButton(_LymowButton):
-    """Return to dock and KEEP task progress (recharge-resume)."""
+    """Return to dock and keep task progress when possible."""
 
     _attr_name = "Dock"
     _attr_icon = "mdi:home-import-outline"
@@ -126,14 +105,12 @@ class LymowDockButton(_LymowButton):
         super().__init__(coordinator, "btn_dock")
 
     async def async_press(self) -> None:
-        _LOGGER.debug("Lymow Dock (keep) → userCtrl=%s", USER_CTRL_RECHARGE_DOCK)
-        self._publish(USER_CTRL_RECHARGE_DOCK)
+        _LOGGER.debug("Lymow Dock button pressed")
+        await self.coordinator.async_dock()
 
-
-# ── Cancel Task ───────────────────────────────────────────────────────────────
 
 class LymowCancelTaskButton(_LymowButton):
-    """Stop in place and reset to waiting (= Cancel task in app)."""
+    """Stop in place and cancel/reset the current task."""
 
     _attr_name = "Cancel Task"
     _attr_icon = "mdi:cancel"
@@ -142,14 +119,12 @@ class LymowCancelTaskButton(_LymowButton):
         super().__init__(coordinator, "btn_cancel_task")
 
     async def async_press(self) -> None:
-        _LOGGER.debug("Lymow Cancel Task → userCtrl=%s", USER_CTRL_FORCE_REINIT)
-        self._publish(USER_CTRL_FORCE_REINIT)
+        _LOGGER.debug("Lymow Cancel Task button pressed")
+        await self.coordinator.async_stop()
 
-
-# ── Dock & Cancel ─────────────────────────────────────────────────────────────
 
 class LymowDockCancelButton(_LymowButton):
-    """Return to dock AND abandon the current task (no resume)."""
+    """Return to dock and abandon current task progress."""
 
     _attr_name = "Dock & Cancel"
     _attr_icon = "mdi:home-remove-outline"
@@ -158,5 +133,86 @@ class LymowDockCancelButton(_LymowButton):
         super().__init__(coordinator, "btn_dock_cancel")
 
     async def async_press(self) -> None:
-        _LOGGER.debug("Lymow Dock+Cancel → userCtrl=%s", USER_CTRL_DOCK)
-        self._publish(USER_CTRL_DOCK)
+        _LOGGER.debug("Lymow Dock & Cancel button pressed")
+        await self.coordinator.async_dock_cancel_task()
+
+
+class _LymowRawQueryButton(_LymowButton):
+    """Diagnostic button that publishes a single query packet."""
+
+    _attr_entity_registry_enabled_default = False
+    _packet_name: str = ""
+
+    def _publish_packet(self, raw: bytes) -> None:
+        if not self.coordinator._publish(raw):
+            _LOGGER.warning("Failed to publish %s query", self._packet_name)
+
+
+class LymowRefreshMapButton(_LymowRawQueryButton):
+    """Ask the robot for a fresh live QUERY_MAP response."""
+
+    _attr_name = "Refresh Map"
+    _attr_icon = "mdi:map-sync"
+    _packet_name = "QUERY_MAP"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "btn_refresh_map")
+
+    async def async_press(self) -> None:
+        self._publish_packet(encode_query_map())
+
+
+class LymowRefreshRobotConfigButton(_LymowRawQueryButton):
+    """Ask the robot for its robotConfig/rrConfig state."""
+
+    _attr_name = "Refresh Robot Config"
+    _attr_icon = "mdi:cog-refresh"
+    _packet_name = "QUERY_ROBOT_CONFIG"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "btn_refresh_robot_config")
+
+    async def async_press(self) -> None:
+        self._publish_packet(encode_query_robot_config())
+
+
+class LymowRefreshSchedulesButton(_LymowRawQueryButton):
+    """Ask the robot for its schedule list."""
+
+    _attr_name = "Refresh Schedules"
+    _attr_icon = "mdi:calendar-sync"
+    _packet_name = "QUERY_SCHEDULES"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "btn_refresh_schedules")
+
+    async def async_press(self) -> None:
+        self._publish_packet(encode_query_schedules())
+
+
+class LymowRefreshDeviceInfoButton(_LymowButton):
+    """Refresh REST device metadata."""
+
+    _attr_name = "Refresh Device Info"
+    _attr_icon = "mdi:information-outline"
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "btn_refresh_device_info")
+
+    async def async_press(self) -> None:
+        await self.coordinator.async_refresh_device_info()
+
+
+class LymowRefreshHistoryButton(_LymowButton):
+    """Refresh REST mowing history summary."""
+
+    _attr_name = "Refresh History"
+    _attr_icon = "mdi:history"
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "btn_refresh_history")
+
+    async def async_press(self) -> None:
+        await self.coordinator.async_refresh_history()
