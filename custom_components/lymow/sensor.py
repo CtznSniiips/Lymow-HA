@@ -276,6 +276,35 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
+        key="nogo_zone_count",
+        name="No-Go Zone Count",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:map-marker-off",
+        value_source=lambda d: (d.get("btMap") or {}).get("nogo_zone_count"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="nogo_zones_with_points",
+        name="No-Go Zones With Points",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:vector-polygon",
+        value_source=lambda d: (d.get("btMap") or {}).get("nogo_zones_with_points"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="nogo_area_total",
+        name="No-Go Area Total",
+        native_unit_of_measurement=UnitOfArea.SQUARE_METERS,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:map-marker-off",
+        value_source=lambda d: int(round(sum(
+            float(z.get("area") or 0)
+            for z in ((d.get("btMap") or {}).get("nogoZones") or [])
+            if isinstance(z, dict)
+        ))),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
         key="zones_with_points",
         name="Zones With Points",
         state_class=SensorStateClass.MEASUREMENT,
@@ -493,6 +522,32 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         ),
         entity_registry_enabled_default=False,
     ),
+
+    LymowSensorDesc(
+        key="path_points",
+        name="Path Points",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:vector-polyline",
+        value_source=lambda d: (d.get("path_data") or {}).get("points_count"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="path_segments",
+        name="Path Segments",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:vector-line",
+        value_source=lambda d: (d.get("path_data") or {}).get("segment_count"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="path_length",
+        name="Path Length",
+        native_unit_of_measurement=UnitOfLength.METERS,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:map-marker-distance",
+        value_source=lambda d: (d.get("path_data") or {}).get("path_length_m"),
+        entity_registry_enabled_default=False,
+    ),
 )
 
 
@@ -621,19 +676,46 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
         btmap = data.get("btMap") or {}
         zones = btmap.get("zones") or []
 
+        nogo_zones = btmap.get("nogoZones") or []
+
         ebp  = btmap.get("enuBasePoint") or data.get("enu_base_point") or {}
         lat0 = _sf(ebp.get("latitude"))
         lon0 = _sf(ebp.get("longitude"))
         has_origin = lat0 is not None and lon0 is not None
 
-        mow_path = getattr(self.coordinator, "mow_path", [])
-
         # Only rebuild when something meaningful actually changed.
-        cache_key = (len(zones), len(mow_path), has_origin)
+        mowed_polygons = data.get("mowed_area_polygons") or []
+
+        mowed_area_points_count = sum(
+            len(poly)
+            for poly in mowed_polygons
+            if isinstance(poly, list)
+        )
+
+        nogo_points_count = sum(
+            len(z.get("points") or [])
+            for z in nogo_zones
+            if isinstance(z, dict)
+        )
+
+        cache_key = (
+            len(zones),
+            len(nogo_zones),
+            nogo_points_count,
+            len(mowed_polygons),
+            mowed_area_points_count,
+            has_origin,
+        )
         if cache_key == self._cache_key and self._geojson_cache is not None:
             return self._geojson_cache
 
         features: list[dict[str, Any]] = []
+
+        zone_features: list[dict[str, Any]] = []
+        nogo_features: list[dict[str, Any]] = []
+        mowed_area_features: list[dict[str, Any]] = []
+        dock_features: list[dict[str, Any]] = []
+        robot_features: list[dict[str, Any]] = []
 
         # Zone polygons — decimated to max 150 pts each
         for idx, zone in enumerate(zones):
@@ -662,7 +744,50 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
                     "coordinates": [[[p[0], p[1]] for p in pts] + [list(pts[0])]],
                     "_crs":        "ENU_metres",
                 }
-            features.append({"type": "Feature", "properties": props, "geometry": geometry})
+            feature = {"type": "Feature", "properties": props, "geometry": geometry}
+            features.append(feature)
+            zone_features.append(feature)
+        
+        # No-go zone polygons — orange/excluded areas
+        for idx, zone in enumerate(nogo_zones):
+            pts = _safe_pts(zone.get("points") or [])
+            if len(pts) < 3:
+                continue
+
+            if len(pts) > 300:
+                step = max(1, len(pts) // 300)
+                pts = pts[::step]
+
+            props: dict[str, Any] = {
+                "type": "nogo_zone",
+                "name": zone.get("name") or zone.get("hashId") or f"No-Go {idx + 1}",
+                "hashId": zone.get("hashId"),
+                "zoneType": zone.get("zoneType"),
+                "linkedZoneHashIds": zone.get("linkedZoneHashIds") or [],
+            }
+
+            if has_origin:
+                geometry: dict[str, Any] = {
+                    "type": "Polygon",
+                    "coordinates": [_pts_to_ring(pts, lat0, lon0)],
+                }
+            else:
+                ring = [[p[0], p[1]] for p in pts]
+                if ring and ring[0] != ring[-1]:
+                    ring.append(ring[0])
+                geometry = {
+                    "type": "Polygon",
+                    "coordinates": [ring],
+                    "_crs": "ENU_metres",
+                }
+
+            feature = {
+                "type": "Feature",
+                "properties": props,
+                "geometry": geometry,
+            }
+            features.append(feature)
+            nogo_features.append(feature)
 
         # Dock
         dock = data.get("chargingStationLoc")
@@ -674,11 +799,13 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
                     coords: list[float] = [round(lon, 8), round(lat, 8)]
                 else:
                     coords = [x, y]
-                features.append({
+                feature = {
                     "type": "Feature",
                     "properties": {"type": "dock", "name": "Dock", "heading": _sf(dock.get("heading"))},
                     "geometry": {"type": "Point", "coordinates": coords},
-                })
+                }
+                features.append(feature)
+                dock_features.append(feature)
 
         # Robot position
         robot = data.get("robotLoc") or data.get("pose") or data.get("robotPosePib")
@@ -690,45 +817,79 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
                     coords = [round(lon, 8), round(lat, 8)]
                 else:
                     coords = [x, y]
-                features.append({
+                feature = {
                     "type": "Feature",
                     "properties": {
-                        "type":    "robot",
-                        "name":    "Robot",
+                        "type": "robot",
+                        "name": "Robot",
                         "heading": _sf(robot.get("heading") or robot.get("theta")),
                     },
                     "geometry": {"type": "Point", "coordinates": coords},
-                })
+                }
+                features.append(feature)
+                robot_features.append(feature)
 
-        # Mow path — decimated to max 500 pts
-        if len(mow_path) >= 2:
-            path_pts = mow_path
-            if len(path_pts) > 500:
-                step     = max(1, len(path_pts) // 500)
-                path_pts = path_pts[::step]
+        # Mowed area polygons from QUERY_PATH
+        for idx, poly in enumerate(mowed_polygons):
+            pts = _safe_pts(poly)
+            if len(pts) < 3:
+                continue
+
+            if len(pts) > 800:
+                step = max(1, len(pts) // 800)
+                pts = pts[::step]
+
             if has_origin:
-                line_coords = []
-                for x, y in path_pts:
-                    lat, lon = _enu_to_latlon(x, y, lat0, lon0)
-                    line_coords.append([round(lon, 8), round(lat, 8)])
+                ring = _pts_to_ring(pts, lat0, lon0)
             else:
-                line_coords = [[p[0], p[1]] for p in path_pts]
-            features.append({
+                ring = [[p[0], p[1]] for p in pts]
+                if ring and ring[0] != ring[-1]:
+                    ring.append(ring[0])
+
+            feature = {
                 "type": "Feature",
                 "properties": {
-                    "type":        "mow_path",
-                    "name":        "Mow Path",
-                    "point_count": len(mow_path),
+                    "type": "mowed_area",
+                    "name": f"Mowed Area {idx + 1}",
+                    "point_count": len(poly),
                 },
                 "geometry": {
-                    "type":        "LineString",
-                    "coordinates": line_coords,
+                    "type": "Polygon",
+                    "coordinates": [ring],
                 },
-            })
+            }
+            features.append(feature)
+            mowed_area_features.append(feature)
 
         result = {
-            "geojson":        {"type": "FeatureCollection", "features": features},
-            "zone_count":     len(features),
+            "geojson": {"type": "FeatureCollection", "features": features},
+
+            "geojson_zones": {
+                "type": "FeatureCollection",
+                "features": zone_features,
+            },
+            "geojson_nogo_zones": {
+                "type": "FeatureCollection",
+                "features": nogo_features,
+            },
+            "geojson_mowed_area": {
+                "type": "FeatureCollection",
+                "features": mowed_area_features,
+            },
+            "geojson_dock": {
+                "type": "FeatureCollection",
+                "features": dock_features,
+            },
+            "geojson_robot": {
+                "type": "FeatureCollection",
+                "features": robot_features,
+            },
+
+            "zone_count": len(zones),
+            "nogo_zone_count": len(nogo_zones),
+            "mowed_area_polygon_count": len(mowed_polygons),
+            "mowed_area_points_count": mowed_area_points_count,
+            "feature_count": len(features),
             "has_gps_origin": has_origin,
             "enu_base_point": ebp or None,
         }

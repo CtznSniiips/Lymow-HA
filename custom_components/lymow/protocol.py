@@ -111,11 +111,58 @@ class ChannelInfo:
             out["isValid"] = self.is_valid
         return out
 
+@dataclass(slots=True)
+class NoGoZoneInfo:
+    """One no-go zone / excluded area from QUERY_MAP."""
+
+    hash_id: str
+    name: str
+    is_enabled: bool
+    polygon_points: list[tuple[float, float]]
+    linked_zone_hash_ids: list[str] = field(default_factory=list)
+    zone_type: int | None = None
+    area: float | None = None
+    points_source: str | None = None
+    bound_00: tuple[float, float] | None = None
+    bound_11: tuple[float, float] | None = None
+    inner_point: tuple[float, float] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "hashId": self.hash_id,
+            "name": self.name,
+            "isEnabled": self.is_enabled,
+            "points": self.polygon_points,
+            "points_count": len(self.polygon_points),
+            "linkedZoneHashIds": self.linked_zone_hash_ids,
+        }
+
+        if self.zone_type is not None:
+            out["zoneType"] = self.zone_type
+
+        if self.area is not None:
+            out["area"] = self.area
+
+        if self.points_source:
+            out["points_source"] = self.points_source
+
+        if self.bound_00 is not None:
+            out["bound_00"] = self.bound_00
+
+        if self.bound_11 is not None:
+            out["bound_11"] = self.bound_11
+
+        if self.inner_point is not None:
+            out["innerPoint"] = self.inner_point
+
+        return out
+
 
 @dataclass(slots=True)
 class ZoneCatalog:
     zones: list[ZoneInfo] = field(default_factory=list)
     channels: list[ChannelInfo] = field(default_factory=list)
+    nogo_zones: list[NoGoZoneInfo] = field(default_factory=list)
     zones_by_hashid: dict[str, ZoneInfo] = field(default_factory=dict)
     runtime_config: dict[str, Any] | None = None
     enu_base_point: dict[str, Any] | None = None
@@ -126,6 +173,13 @@ class ZoneCatalog:
             "zones": [z.to_dict() for z in self.zones],
             "zone_count": len(self.zones),
             "zones_with_points": sum(1 for z in self.zones if z.polygon_points),
+
+            "nogoZones": [z.to_dict() for z in self.nogo_zones],
+            "nogo_zone_count": len(self.nogo_zones),
+            "nogo_zones_with_points": sum(
+                1 for z in self.nogo_zones if z.polygon_points
+            ),
+
             "channels": [c.to_dict() for c in self.channels],
             "channels_with_points": sum(1 for c in self.channels if c.polygon_points),
         }
@@ -474,6 +528,138 @@ def _wire_parse(buf: bytes) -> dict[int, list[tuple[str, Any]]]:
             break
     return out
 
+def _is_path_marker(pt: tuple[float, float]) -> bool:
+    x, y = pt
+    return (
+        (abs(x - 333.0) < 0.001 and abs(y - 333.0) < 0.001)
+        or (abs(x - 444.0) < 0.001 and abs(y - 444.0) < 0.001)
+    )
+
+
+def _split_path_segments(points: list[tuple[float, float]]) -> list[list[tuple[float, float]]]:
+    segments: list[list[tuple[float, float]]] = []
+    current: list[tuple[float, float]] = []
+
+    for pt in points:
+        if _is_path_marker(pt):
+            if len(current) >= 2:
+                segments.append(current)
+            current = []
+            continue
+
+        current.append(pt)
+
+    if len(current) >= 2:
+        segments.append(current)
+
+    return segments
+
+
+def _path_length(points: list[tuple[float, float]]) -> float:
+    total = 0.0
+    for i in range(1, len(points)):
+        x1, y1 = points[i - 1]
+        x2, y2 = points[i]
+        total += ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+    return round(total, 2)
+
+
+def _bounds(points: list[tuple[float, float]]) -> dict[str, float] | None:
+    if not points:
+        return None
+    return {
+        "min_x": round(min(x for x, y in points), 4),
+        "max_x": round(max(x for x, y in points), 4),
+        "min_y": round(min(y for x, y in points), 4),
+        "max_y": round(max(y for x, y in points), 4),
+    }
+
+
+def parse_query_path(bt_map_msg) -> dict:
+    """Parse QUERY_PATH response from PbOutput.btMap.
+
+    Returns planned/cut path points as ENU metres.
+    Marker points (333,333) and (444,444) are treated as segment separators.
+    """
+    raw = bt_map_msg.SerializeToString()
+    root = _wire_parse(raw)
+
+    result: dict[str, Any] = {
+        "btMap_bytes": len(raw),
+        "queryAck_found": False,
+        "inner_found": False,
+        "inner_bytes": 0,
+        "inner_field_numbers": [],
+        "raw_points_count": 0,
+        "marker_count": 0,
+        "points_count": 0,
+        "segment_count": 0,
+        "path_length_m": 0,
+        "bounds": None,
+        "points": [],
+        "segments": [],
+    }
+
+    try:
+        if 2 not in root or not root[2] or root[2][0][0] != "L":
+            return result
+
+        qa = _wire_parse(root[2][0][1])
+        result["queryAck_found"] = True
+
+        inner_raw = None
+
+        if 3 in qa and qa[3] and qa[3][0][0] == "L":
+            inner_raw = qa[3][0][1]
+        else:
+            for _fno, entries in qa.items():
+                for kind, val in entries:
+                    if kind == "L" and isinstance(val, (bytes, bytearray)) and len(val) > 20:
+                        inner_raw = val
+                        break
+                if inner_raw is not None:
+                    break
+
+        if not inner_raw:
+            return result
+
+        inner = _wire_parse(inner_raw)
+        result["inner_found"] = True
+        result["inner_bytes"] = len(inner_raw)
+        result["inner_field_numbers"] = sorted(inner.keys())
+
+        raw_points: list[tuple[float, float]] = []
+
+        # Nel tuo debug: inner_field_numbers = [1], quindi field 1 = repeated PbPoint
+        for kind, val in inner.get(1, []):
+            if kind != "L":
+                continue
+
+            pf = _wire_parse(val)
+            x = _gf(pf, 1)
+            y = _gf(pf, 2)
+
+            if x is not None and y is not None:
+                raw_points.append((round(float(x), 4), round(float(y), 4)))
+
+        segments = _split_path_segments(raw_points)
+        clean_points = [pt for seg in segments for pt in seg]
+
+        result["raw_points_count"] = len(raw_points)
+        result["marker_count"] = sum(1 for pt in raw_points if _is_path_marker(pt))
+        result["points_count"] = len(clean_points)
+        result["segment_count"] = len(segments)
+        result["points"] = clean_points
+        result["segments"] = segments
+        result["bounds"] = _bounds(clean_points)
+        result["path_length_m"] = round(sum(_path_length(seg) for seg in segments), 2)
+
+        return result
+
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
 
 def _gv(f: dict, n: int) -> int | None:
     e = f.get(n)
@@ -740,6 +926,18 @@ def parse_map_fields(map_data: dict[int, list[tuple[str, Any]]]) -> ZoneCatalog:
         )
         catalog.zones.append(zi)
         catalog.zones_by_hashid[zi.hash_id] = zi
+    
+    # PbMap.nogozone (field 2)
+    for kind, raw_nogo in map_data.get(2, []):
+        if kind != "L":
+            continue
+
+        try:
+            nogo = _parse_nogo_zone(raw_nogo)
+            if nogo is not None:
+                catalog.nogo_zones.append(nogo)
+        except Exception:
+            _LOGGER.debug("Failed to parse no-go zone", exc_info=True)
 
     # PbMap.channels (field 3)
     for kind, cval in map_data.get(3, []):
@@ -787,6 +985,94 @@ def parse_zone_catalog(bt_map: pb.PbBtMap) -> ZoneCatalog:
 
     # Fallback: sometimes the bytes may already look like PbMap-ish fields.
     return parse_map_fields(root)
+
+def _parse_nogo_zone(raw: bytes) -> NoGoZoneInfo | None:
+    """Parse one no-go zone / excluded area from QUERY_MAP inner.field_2."""
+    msg = _wire_parse(raw)
+
+    hash_id = ""
+    name = ""
+    is_enabled = True
+    zone_type: int | None = None
+    points: list[tuple[float, float]] = []
+    points_source: str | None = None
+    area: float | None = None
+    bound_00: tuple[float, float] | None = None
+    bound_11: tuple[float, float] | None = None
+    inner_point: tuple[float, float] | None = None
+
+    # field 1 = basicInfo-like
+    basic = _sub(msg, 1)
+    if basic:
+        if (v := _gv(basic, 1)) is not None:
+            zone_type = int(v)
+
+        if (hid := _gs(basic, 3)):
+            hash_id = hid
+
+        if (v := _gv(basic, 4)) is not None:
+            is_enabled = bool(v)
+
+        poly = _sub(basic, 5)
+        if poly:
+            pts = _decode_polygon_points(poly)
+            if pts:
+                points = pts
+                points_source = "basicInfo.polygon"
+                area = round(_polygon_area(pts), 3)
+
+    # field 3 = ppBasicInfo-like, fallback bounds/inner point
+    pp = _sub(msg, 3)
+    if pp:
+        pp_info = _decode_pp_basic_info(pp)
+
+        if isinstance(pp_info.get("bound_00"), tuple):
+            bound_00 = pp_info["bound_00"]
+
+        if isinstance(pp_info.get("bound_11"), tuple):
+            bound_11 = pp_info["bound_11"]
+
+        if isinstance(pp_info.get("innerPoint"), tuple):
+            inner_point = pp_info["innerPoint"]
+
+        if not points and bound_00 and bound_11:
+            rect = _rectangle_from_bounds(bound_00, bound_11)
+            if rect:
+                points = rect
+                points_source = "ppBasicInfo.bounds_fallback"
+                area = round(_polygon_area(rect), 3)
+
+    # field 4 = linked go-zone hash ids
+    linked_zone_hash_ids: list[str] = []
+    for kind, value in msg.get(4, []):
+        if kind != "L":
+            continue
+        try:
+            linked_zone_hash_ids.append(value.decode("utf-8"))
+        except Exception:
+            pass
+
+    if not hash_id and not points:
+        return None
+
+    if not hash_id:
+        hash_id = f"nogo_{abs(hash(tuple(points))) % 1000000}"
+
+    name = hash_id
+
+    return NoGoZoneInfo(
+        hash_id=hash_id,
+        name=name,
+        is_enabled=is_enabled,
+        polygon_points=points,
+        linked_zone_hash_ids=linked_zone_hash_ids,
+        zone_type=zone_type,
+        area=area,
+        points_source=points_source,
+        bound_00=bound_00,
+        bound_11=bound_11,
+        inner_point=inner_point,
+    )
 
 
 def decode_btmap(raw: bytes) -> dict[str, Any]:

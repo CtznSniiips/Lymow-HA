@@ -121,7 +121,13 @@ class LymowMapCamera(LymowEntity, Camera):
     def extra_state_attributes(self) -> dict:
         d = self.coordinator.data or {}
         btmap = d.get("btMap") or {}
+        if not isinstance(btmap, dict):
+            btmap = {}
+
         zones = btmap.get("zones") or []
+        nogo_zones = btmap.get("nogoZones") or []
+        channels = btmap.get("channels") or []
+
         return {
             "render_mode": "diagnostic_png",
             "pil_available": Image is not None,
@@ -135,7 +141,12 @@ class LymowMapCamera(LymowEntity, Camera):
                 1 for z in zones if z.get("points") and len(z.get("points") or []) >= 2
             ),
             "first_zone_points_count": len(zones[0].get("points") or []) if zones else 0,
-            "channel_count": len((btmap.get("channels") or [])),
+            "channel_count": len(channels),
+            "nogo_zone_count": len(nogo_zones),
+            "nogo_zones_with_points": sum(
+                1 for z in nogo_zones
+                if isinstance(z, dict) and z.get("points")
+            ),
             "has_enu_base_point": bool(btmap.get("enuBasePoint") or d.get("enu_base_point")),
         }
 
@@ -205,11 +216,19 @@ def build_map_png(data: dict) -> tuple:
         if z.get("points") and len(z.get("points") or []) >= 2
     ]
 
+    nogo_zones = btmap.get("nogoZones") or []
+    drawable_nogo = [
+        z for z in nogo_zones
+        if z.get("points") and len(z.get("points") or []) >= 3
+    ]
+
     dbg = {
         "zones":        len(zones),
         "drawable":     len(drawable),
         "first_points": len(zones[0].get("points") or []) if zones else 0,
         "channels":     len((btmap.get("channels") or [])),
+        "nogo_zones":   len(nogo_zones),
+        "drawable_nogo": len(drawable_nogo),
     }
 
     draw_text(draw, "Lymow Map Diagnostic", 20, 16, 22, WHITE)
@@ -268,6 +287,62 @@ def build_map_png(data: dict) -> tuple:
             cy = sum(p[1] for p in xy) / len(xy)
             label = str(zone.get("name") or zone.get("hashId") or idx)[:16]
             draw_center(draw, label, cx, cy, 10, WHITE)
+    
+    # No-go zones / excluded areas — orange overlay
+    for idx, zone in enumerate(drawable_nogo):
+        pts = safe_points(zone.get("points") or [])
+        if len(pts) < 3:
+            continue
+
+        if len(pts) > 300:
+            step = max(1, math.ceil(len(pts) / 300))
+            pts = pts[::step]
+
+        xy = [(sx(x), sy(y)) for x, y in pts]
+
+        if xy and xy[0] != xy[-1]:
+            xy.append(xy[0])
+
+        try:
+            draw.polygon(
+                xy,
+                fill=(249, 115, 22, 130),      # orange transparent
+                outline=(251, 146, 60, 240),   # orange border
+            )
+
+            cx = sum(p[0] for p in xy) / len(xy)
+            cy = sum(p[1] for p in xy) / len(xy)
+            label = str(zone.get("name") or zone.get("hashId") or f"No-Go {idx + 1}")[:14]
+            draw_center(draw, label, cx, cy, 9, WHITE)
+
+        except Exception:
+            pass
+
+    # Mowed Poligons QUERY_PATH
+    mowed_polygons = data.get("mowed_area_polygons") or []
+    for poly in mowed_polygons:
+        pts = safe_points(poly)
+        if len(pts) < 3:
+            continue
+
+        if len(pts) > 800:
+            step = max(1, math.ceil(len(pts) / 800))
+            pts = pts[::step]
+
+        xy = [(sx(x), sy(y)) for x, y in pts]
+
+        if xy and xy[0] != xy[-1]:
+            xy.append(xy[0])
+
+        draw.polygon(
+            xy,
+            fill=(59, 130, 246, 90),
+            outline=(37, 99, 235, 220),
+        )
+    dbg.update({
+        "mowed_area_polygons": len(mowed_polygons),
+        "mowed_area_points": sum(len(safe_points(poly)) for poly in mowed_polygons),
+    })     
 
     dock = data.get("chargingStationLoc")
     if isinstance(dock, dict):

@@ -53,9 +53,11 @@ from .protocol import (
     build_initial_query_packets,
     build_refresh_query_packets,
     encode_query_map,
+    encode_query_path,
     encode_query_robot_config,
     decode_pboutput_envelope,
     decode_pbmap,
+    parse_query_path,
     parse_zone_catalog,
     encode_start_zones,
     encode_userctrl,
@@ -70,6 +72,8 @@ _REST_POLL_INTERVAL = timedelta(minutes=15)
 _REFRESH_INTERVAL   = 90          # seconds — periodic config/net/RTK refresh
 _RECONNECT_DELAY    = 5           # seconds — wait before reconnect attempt
 _WATCHDOG_TIMEOUT   = 5.0
+
+_PATH_REFRESH_INTERVAL = 45
 
 
 class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -102,9 +106,6 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._state: dict[str, Any] = {}
         self.device_info_data: dict = {}
         self.history: list[dict]    = []
-
-        self._mow_path: list[tuple[float, float]] = []
-        self._mow_session_active: bool = False
 
         self._rest_online: bool    = False
         self._last_mqtt_ts: float  = 0.0
@@ -217,7 +218,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @property
     def mow_path(self) -> list[tuple[float, float]]:
         """ENU points accumulated during the current/last mowing session."""
-        return self._mow_path
+        return []
 
     @property
     def state_dict(self) -> dict[str, Any]:
@@ -311,69 +312,81 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # nested btMap.queryAck map payload still needs manual wire parsing.
         try:
             if msg.btMap.ByteSize() > 200:
-                catalog = parse_zone_catalog(msg.btMap)
+                if getattr(msg.btMap, "queryMap", False):
+                    catalog = parse_zone_catalog(msg.btMap)
 
-                # Sticky catalog: update only when the packet actually carries
-                # zones. QUERY_PATH / small btMap packets must not wipe a good
-                # catalog previously loaded from QUERY_MAP or S3.
-                if catalog.zones:
-                    self._state["zone_catalog"] = catalog
-                    self._state["btMap"] = catalog.to_btmap_dict()
-                    self._state["backupMapDownloadError"] = None
+                    # Sticky catalog: update only when the packet actually carries
+                    # zones. QUERY_PATH / small btMap packets must not wipe a good
+                    # catalog previously loaded from QUERY_MAP or S3.
+                    if catalog.zones:
+                        self._state["zone_catalog"] = catalog
+                        self._state["btMap"] = catalog.to_btmap_dict()
+                        self._state["backupMapDownloadError"] = None
 
-                if catalog.enu_base_point:
-                    self._state["enu_base_point"] = catalog.enu_base_point
+                    if catalog.enu_base_point:
+                        self._state["enu_base_point"] = catalog.enu_base_point
 
-                if catalog.charging_station_loc:
-                    self._state["chargingStationLoc"] = catalog.charging_station_loc
+                    if catalog.charging_station_loc:
+                        self._state["chargingStationLoc"] = catalog.charging_station_loc
 
-                if catalog.runtime_config:
-                    self._state["runTimeConfig"] = catalog.runtime_config
-                    for key in ("cutHeight", "cutSpeed", "moveSpeed"):
-                        if key in catalog.runtime_config:
-                            self._state[key] = catalog.runtime_config[key]
+                    if catalog.runtime_config:
+                        self._state["runTimeConfig"] = catalog.runtime_config
+                        for key in ("cutHeight", "cutSpeed", "moveSpeed"):
+                            if key in catalog.runtime_config:
+                                self._state[key] = catalog.runtime_config[key]
 
-                _LOGGER.debug(
-                    "Parsed Lymow zone catalog for %s: zones=%s channels=%s ebp=%s runtime=%s",
-                    self.thing_name,
-                    len(catalog.zones),
-                    len(catalog.channels),
-                    bool(catalog.enu_base_point),
-                    bool(catalog.runtime_config),
-                )
+                    _LOGGER.debug(
+                        "Parsed Lymow zone catalog for %s: zones=%s channels=%s noGO=%s ebp=%s runtime=%s",
+                        self.thing_name,
+                        len(catalog.zones),
+                        len(catalog.channels),
+                        len(catalog.nogo_zones),
+                        bool(catalog.enu_base_point),
+                        bool(catalog.runtime_config),
+                    )
+                # QUERY_PATH: traiettoria / coverage / path
+                elif getattr(msg.btMap, "queryPath", False):
+                    path = parse_query_path(msg.btMap)
+
+                    if path.get("points_count", 0) > 0:
+                        segments = path.get("segments") or []
+
+                        # I marker 333/444 vengono già rimossi da parse_query_path().
+                        # Ogni segmento valido con almeno 3 punti può essere disegnato come poligono.
+                        mowed_polygons = [
+                            seg for seg in segments
+                            if isinstance(seg, list) and len(seg) >= 3
+                        ]
+
+                        self._state["mowed_area_data"] = {
+                            "btMap_bytes": path.get("btMap_bytes"),
+                            "points_count": path.get("points_count"),
+                            "raw_points_count": path.get("raw_points_count"),
+                            "marker_count": path.get("marker_count"),
+                            "polygon_count": len(mowed_polygons),
+                            "segment_count": path.get("segment_count"),
+                            "path_length_m": path.get("path_length_m"),
+                            "bounds": path.get("bounds"),
+                        }
+
+                        self._state["mowed_area_polygons"] = mowed_polygons
+
+                        # Delete old path
+                        self._state.pop("planned_path", None)
+                        self._state.pop("planned_path_segments", None)
+                        self._state.pop("path_data", None)
+
+                        _LOGGER.debug(
+                            "Parsed Lymow QUERY_PATH as mowed area for %s: polygons=%s points=%s markers=%s",
+                            self.thing_name,
+                            len(mowed_polygons),
+                            path.get("points_count"),
+                            path.get("marker_count"),
+                        )
         except Exception:
             _LOGGER.exception("Failed to parse btMap zone catalog for %s", self.thing_name)
 
         self._derive_state()
-
-        if (ws := self._state.get("workStatus")) is not None:
-            self._prev_work_status = ws
-
-        # ── Mow path tracking ──────────────────────────────────
-        ws = self._state.get("workStatus")
-        if ws is not None:
-            is_mowing = self._state.get("robotStatus") == 2  # CLEANING
-
-            if is_mowing:
-                self._mow_session_active = True
-                robot = (
-                    self._state.get("pose")
-                    or self._state.get("robotLoc")
-                    or self._state.get("robotPosePib")
-                )
-                if isinstance(robot, dict):
-                    x, y = robot.get("x"), robot.get("y")
-                    if x is not None and y is not None:
-                        pt = (round(float(x), 3), round(float(y), 3))
-                        if not self._mow_path or self._mow_path[-1] != pt:
-                            self._mow_path.append(pt)
-
-            robot_status = self._state.get("robotStatus")
-            if robot_status in (0, 5, 12):   # NONE, CHARGING, CHARGING_FULL
-                self._mow_path = []
-                self._mow_session_active = False
-            elif robot_status in (1, 3, 8, 4, 10):
-                self._mow_session_active = False
 
         _LOGGER.debug(
             "State update %s: workStatus=%s battery=%s catalog=%s",
@@ -438,6 +451,8 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if self.mqtt and self.mqtt.is_connected:
                     _LOGGER.debug("Periodic refresh queries for %s", self.thing_name)
                     self._fire_refresh_queries()
+                    if self.work_status in (2, 8, 9):  # mowing, resume, zone partition
+                        self._publish(encode_query_path())
             except asyncio.CancelledError:
                 raise
             except Exception:
