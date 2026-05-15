@@ -64,7 +64,8 @@ from .protocol import (
     encode_start_zones,
     encode_start_schedule_task_full,
     encode_userctrl,
-    encode_set_rr_config
+    encode_set_rr_config,
+    encode_set_headlights
 )
 from .state import derive_current_zone, merge_pboutput, robot_gps_from_state
 from .state_matrix import lookup as lookup_state_row
@@ -711,6 +712,21 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         ok = self._publish(raw)
         await self._wait_state_update()
+        return ok
+    
+    async def async_set_headlights(self, enabled: bool) -> bool:
+        """Turn headlights on or off."""
+        await self.auth.ensure_valid(self._email, self._password)
+
+        raw = encode_set_headlights(enabled)
+
+        ok = self._publish(raw)
+        await self._wait_state_update()
+
+        # Ask for robot config again, so camLedStatus updates quickly.
+        self._publish(encode_query_robot_config())
+        await self._wait_state_update(timeout=3.0)
+
         return ok
     
     async def _send_rr_update(

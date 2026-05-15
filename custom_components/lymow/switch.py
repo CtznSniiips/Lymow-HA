@@ -175,10 +175,9 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowSwitch(coord, desc) for desc in SWITCHES],
+        [LymowSwitch(coord, desc) for desc in SWITCHES] + [LymowHeadlightsSwitch(coord)],
         update_before_add=False,
     )
-
 
 class LymowSwitch(LymowEntity, SwitchEntity):
     """Lymow switch entity."""
@@ -202,3 +201,61 @@ class LymowSwitch(LymowEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self.entity_description.turn_off_fn(self.coordinator)
+
+class LymowHeadlightsSwitch(LymowEntity, SwitchEntity):
+    """Headlights / camera LED switch."""
+
+    _attr_name = "Headlights"
+    _attr_icon = "mdi:car-light-high"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "headlights")
+
+    @property
+    def is_on(self) -> bool | None:
+        d = self.coordinator.data or {}
+
+        cam = d.get("camLedStatus")
+
+        if cam is None:
+            rc = d.get("robotConfig")
+            if isinstance(rc, dict):
+                cam = rc.get("camLedStatus")
+            elif rc is not None:
+                cam = getattr(rc, "camLedStatus", None)
+
+        if cam is None:
+            return None
+
+        # Verified:
+        # camLedStatus = 3 -> ON
+        # camLedStatus = 4 -> OFF
+        return int(cam) == 3
+
+    @property
+    def available(self) -> bool:
+        d = self.coordinator.data or {}
+        return super().available and (
+            d.get("camLedStatus") is not None
+            or d.get("robotConfig") is not None
+        )
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self.coordinator.async_set_headlights(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self.coordinator.async_set_headlights(False)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        d = self.coordinator.data or {}
+        return {
+            "cam_led_status": d.get("camLedStatus"),
+            "veh_led_status": d.get("vehLedStatus"),
+            "open_led_time": d.get("openLedTime"),
+            "close_led_time": d.get("closeLedTime"),
+            "state_mapping": {
+                "3": "on",
+                "4": "off",
+            },
+        }

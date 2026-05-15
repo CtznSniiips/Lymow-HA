@@ -510,6 +510,27 @@ def encode_set_rr_config(
     msg.debugSetting.uploadRobotConfig = True
     return msg.SerializeToString()
 
+def encode_set_headlights(enabled: bool) -> bytes:
+    """Turn mower headlights / camera LED on or off.
+
+    Command field:
+      PbInput.robotConfig.isOpenLed = true/false
+
+    The robot does not return isOpenLed as state. The real state is read from
+    PbRobotConfig.camLedStatus:
+      3 = on
+      4 = off
+    """
+    msg = pb.PbInput()
+    msg.version = PB_VERSION_4_9
+
+    msg.robotConfig.isOpenLed = bool(enabled)
+
+    # Ask the robot to send back updated robotConfig
+    msg.debugSetting.uploadRobotConfig = True
+
+    return msg.SerializeToString()
+
 
 def build_initial_query_packets(
     query_index: int = 0,
