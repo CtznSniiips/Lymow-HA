@@ -19,6 +19,8 @@ from typing import Any
 
 from .proto import lymow_pb2 as pb
 
+_DAYS_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
 _LOGGER = logging.getLogger(__name__)
 
 PB_VERSION_4_9 = 40
@@ -194,7 +196,89 @@ class ZoneCatalog:
             out["chargingStationLoc"] = self.charging_station_loc
         return out
 
+@dataclass(slots=True)
+class ScheduleConfigInfo:
+    hash_id: str
+    cut_height: int | None = None
+    move_speed: float | None = None
+    clean_dir: int | None = None
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "hashId": self.hash_id,
+            "cutHeight": self.cut_height,
+            "moveSpeed": self.move_speed,
+            "cleanDir": self.clean_dir,
+        }
+
+
+@dataclass(slots=True)
+class ScheduleZoneInfo:
+    hash_id: str
+    name: str | None = None
+    mow_order: int = 0
+    text_pos: dict[str, float] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "hashId": self.hash_id,
+            "mowOrder": self.mow_order,
+        }
+
+        if self.name:
+            out["name"] = self.name
+
+        if self.text_pos:
+            out["textPos"] = self.text_pos
+
+        return out
+
+
+@dataclass(slots=True)
+class ScheduleInfo:
+    id: int
+    hour: int
+    minute: int
+    days_of_week: list[int]
+    day_names: list[str]
+    timezone: int
+    is_repeated: bool
+    is_disabled: bool
+    is_angle_offset: bool
+    mow_angle: int
+    zones: list[ScheduleZoneInfo] = field(default_factory=list)
+    config: list[ScheduleConfigInfo] = field(default_factory=list)
+
+    @property
+    def enabled(self) -> bool:
+        return not self.is_disabled
+
+    @property
+    def time(self) -> str:
+        return f"{self.hour:02d}:{self.minute:02d}"
+
+    @property
+    def zone_hash_ids(self) -> list[str]:
+        return [z.hash_id for z in sorted(self.zones, key=lambda z: z.mow_order or 999)]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "enabled": self.enabled,
+            "time": self.time,
+            "hour": self.hour,
+            "minute": self.minute,
+            "daysOfWeek": self.days_of_week,
+            "dayNames": self.day_names,
+            "timezone": self.timezone,
+            "isRepeated": self.is_repeated,
+            "isDisabled": self.is_disabled,
+            "isAngleOffset": self.is_angle_offset,
+            "mowAngle": self.mow_angle,
+            "zoneHashIds": self.zone_hash_ids,
+            "zones": [z.to_dict() for z in self.zones],
+            "config": [c.to_dict() for c in self.config],
+        }
 # ---------------------------------------------------------------------------
 # Envelope helpers
 # ---------------------------------------------------------------------------
@@ -660,6 +744,184 @@ def parse_query_path(bt_map_msg) -> dict:
         result["error"] = f"{type(exc).__name__}: {exc}"
         return result
 
+def parse_schedules(schedule_msg: Any) -> list[ScheduleInfo]:
+    """Decode PbSchedules into ScheduleInfo list.
+
+    Works even if generated PbSchedule is incomplete/empty by walking raw wire format.
+    """
+    raw = schedule_msg.SerializeToString()
+    root = _wire_parse(raw)
+
+    schedules: list[ScheduleInfo] = []
+
+    # PbSchedules.tasks = field 1 repeated PbSchedule
+    for kind, task_raw in root.get(1, []):
+        if kind != "L":
+            continue
+
+        try:
+            f = _wire_parse(task_raw)
+
+            days_of_week: list[int] = []
+
+            # field 1 dayOfWeek packed repeated enum
+            for day_kind, day_val in f.get(1, []):
+                if day_kind == "L":
+                    days_of_week.extend(_decode_packed_varints(day_val))
+                elif day_kind == "v":
+                    days_of_week.append(int(day_val))
+
+            day_names = [
+                _DAYS_NAMES[d]
+                for d in days_of_week
+                if 0 <= d < len(_DAYS_NAMES)
+            ]
+
+            hour = int(f[2][0][1]) if 2 in f and f[2][0][0] == "v" else 0
+            minute = int(f[3][0][1]) if 3 in f and f[3][0][0] == "v" else 0
+
+            is_repeated = bool(f[4][0][1]) if 4 in f and f[4][0][0] == "v" else False
+            schedule_id = int(f[6][0][1]) if 6 in f and f[6][0][0] == "v" else 0
+
+            timezone = 0
+            if 7 in f and f[7][0][0] == "v":
+                timezone = _as_signed_64(int(f[7][0][1]))
+
+            is_disabled = bool(f[8][0][1]) if 8 in f and f[8][0][0] == "v" else False
+            is_angle_offset = bool(f[9][0][1]) if 9 in f and f[9][0][0] == "v" else False
+            mow_angle = int(f[10][0][1]) if 10 in f and f[10][0][0] == "v" else 0
+
+            zones: list[ScheduleZoneInfo] = []
+            for zone_kind, zone_raw in f.get(5, []):
+                if zone_kind != "L":
+                    continue
+                zone = _decode_schedule_zone_basicinfo(zone_raw)
+                if zone is not None:
+                    zones.append(zone)
+
+            # Keep zone order stable
+            zones.sort(key=lambda z: z.mow_order or 999)
+
+            config: list[ScheduleConfigInfo] = []
+            for cfg_kind, cfg_raw in f.get(11, []):
+                if cfg_kind != "L":
+                    continue
+                cfg = _decode_schedule_config(cfg_raw)
+                if cfg is not None:
+                    config.append(cfg)
+
+            schedules.append(
+                ScheduleInfo(
+                    id=schedule_id,
+                    hour=hour,
+                    minute=minute,
+                    days_of_week=days_of_week,
+                    day_names=day_names,
+                    timezone=timezone,
+                    is_repeated=is_repeated,
+                    is_disabled=is_disabled,
+                    is_angle_offset=is_angle_offset,
+                    mow_angle=mow_angle,
+                    zones=zones,
+                    config=config,
+                )
+            )
+
+        except Exception:
+            _LOGGER.debug("Failed to decode Lymow schedule task", exc_info=True)
+
+    return schedules
+
+def _decode_packed_varints(buf: bytes) -> list[int]:
+    out: list[int] = []
+    pos = 0
+
+    while pos < len(buf):
+        try:
+            value, pos = _wire_varint(buf, pos)
+            out.append(value)
+        except Exception:
+            break
+
+    return out
+
+def _decode_schedule_zone_basicinfo(buf: bytes) -> ScheduleZoneInfo | None:
+    """Decode PbZoneBasicInfo-like item inside PbSchedule field 5."""
+    f = _wire_parse(buf)
+
+    hash_id = ""
+    name: str | None = None
+    mow_order = 0
+    text_pos: dict[str, float] | None = None
+
+    if 2 in f and f[2][0][0] == "L":
+        name = _wire_str(f[2][0][1]) or None
+
+    if 3 in f and f[3][0][0] == "L":
+        hash_id = _wire_str(f[3][0][1]) or ""
+
+    if 6 in f and f[6][0][0] == "L":
+        # zoneRename fallback
+        rename = _wire_str(f[6][0][1])
+        if rename:
+            name = rename
+
+    if 8 in f and f[8][0][0] == "v":
+        mow_order = int(f[8][0][1])
+
+    if 9 in f and f[9][0][0] == "L":
+        pt = _parse_point(f[9][0][1])
+        if pt is not None:
+            text_pos = {"x": pt[0], "y": pt[1]}
+
+    if not hash_id:
+        return None
+
+    return ScheduleZoneInfo(
+        hash_id=hash_id,
+        name=name,
+        mow_order=mow_order,
+        text_pos=text_pos,
+    )
+
+
+def _decode_schedule_config(buf: bytes) -> ScheduleConfigInfo | None:
+    """Decode PbScheduleConfig.
+
+    Schema:
+      1 hashId
+      2 cutHeight
+      3 moveSpeed
+      4 cleanDir
+    """
+    f = _wire_parse(buf)
+
+    hash_id = ""
+    cut_height: int | None = None
+    move_speed: float | None = None
+    clean_dir: int | None = None
+
+    if 1 in f and f[1][0][0] == "L":
+        hash_id = _wire_str(f[1][0][1]) or ""
+
+    if 2 in f and f[2][0][0] == "v":
+        cut_height = int(f[2][0][1])
+
+    if 3 in f and f[3][0][0] == "f32":
+        move_speed = _wire_f32(f[3][0][1])
+
+    if 4 in f and f[4][0][0] == "v":
+        clean_dir = _as_signed_64(int(f[4][0][1]))
+
+    if not hash_id:
+        return None
+
+    return ScheduleConfigInfo(
+        hash_id=hash_id,
+        cut_height=cut_height,
+        move_speed=move_speed,
+        clean_dir=clean_dir,
+    )
 
 def _gv(f: dict, n: int) -> int | None:
     e = f.get(n)
@@ -700,6 +962,70 @@ def _wire_str(blob: bytes) -> str | None:
     except Exception:
         pass
     return None
+
+def _wire_f32(blob: Any) -> float | None:
+    """Decode protobuf fixed32/float little-endian."""
+    if not isinstance(blob, (bytes, bytearray)) or len(blob) != 4:
+        return None
+
+    try:
+        return float(struct.unpack("<f", bytes(blob))[0])
+    except Exception:
+        return None
+    
+def _wire_varint(buf: bytes, pos: int) -> tuple[int, int]:
+    """Decode a protobuf varint from buf starting at pos.
+
+    Returns:
+        (value, new_pos)
+    """
+    result = 0
+    shift = 0
+
+    for _ in range(10):  # protobuf varint max 10 bytes for 64-bit
+        if pos >= len(buf):
+            raise ValueError("truncated varint")
+
+        b = buf[pos]
+        pos += 1
+
+        result |= (b & 0x7F) << shift
+
+        if not (b & 0x80):
+            return result, pos
+
+        shift += 7
+
+    raise ValueError("varint overflow")
+
+
+def _as_signed_64(value: int) -> int:
+    """Convert unsigned varint value to signed int64 when needed."""
+    if value > 0x7FFFFFFFFFFFFFFF:
+        value -= 1 << 64
+    return value
+
+
+def _parse_point(buf: bytes) -> tuple[float, float] | None:
+    """Decode PbPoint { x = field 1 float, y = field 2 float }."""
+    fields = _wire_parse(buf)
+
+    if 1 not in fields or 2 not in fields:
+        return None
+
+    x_kind, x_raw = fields[1][0]
+    y_kind, y_raw = fields[2][0]
+
+    if x_kind != "f32" or y_kind != "f32":
+        return None
+
+    x = _wire_f32(x_raw)
+    y = _wire_f32(y_raw)
+
+    if x is None or y is None:
+        return None
+
+    return (round(x, 4), round(y, 4))
 
 
 def _decode_point_dict(fields: dict) -> dict[str, Any]:
@@ -1096,16 +1422,51 @@ def decode_pbmap(raw: bytes) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Schedule decoder placeholder-compatible functions
+# Start schedule encoder
 # ---------------------------------------------------------------------------
 
-def decode_schedules(schedule_msg: Any) -> list[dict[str, Any]]:
-    """Best-effort schedule decoder placeholder.
+def encode_start_schedule_task_full(task: ScheduleInfo | dict[str, Any]) -> bytes:
+    """Start a schedule manually with zone order and per-zone config."""
+    pb_in = pb.PbInput()
+    pb_in.version = PB_VERSION_4_9
+    pb_in.userCtrl = USER_CTRL_CLEAN
 
-    PbSchedule appears as an empty placeholder in the recovered schema, so this
-    keeps a safe return type for entities. We can expand this once schedules are
-    needed with full wire parsing.
-    """
-    if schedule_msg is None or getattr(schedule_msg, "ByteSize", lambda: 0)() == 0:
-        return []
-    return [{"rawByteSize": schedule_msg.ByteSize()}]
+    if isinstance(task, dict):
+        zones = task.get("zones") or []
+        configs = task.get("config") or []
+    else:
+        zones = [z.to_dict() for z in task.zones]
+        configs = [c.to_dict() for c in task.config]
+
+    config_by_hash = {
+        c.get("hashId"): c
+        for c in configs
+        if c.get("hashId")
+    }
+
+    # fallback se non ci sono zones dettagliate
+    if not zones and isinstance(task, dict):
+        zones = [
+            {"hashId": hid, "mowOrder": i}
+            for i, hid in enumerate(task.get("zoneHashIds") or [], start=1)
+        ]
+
+    for i, zone_data in enumerate(zones, start=1):
+        hash_id = zone_data.get("hashId")
+        if not hash_id:
+            continue
+
+        z = pb_in.map.goZones.add()
+        z.basicInfo.hashId = hash_id
+        z.basicInfo.mowOrder = int(zone_data.get("mowOrder") or i)
+
+        cfg = config_by_hash.get(hash_id)
+        if cfg:
+            if cfg.get("cutHeight") is not None:
+                z.zoneConfig.cutHeight = int(cfg["cutHeight"])
+            if cfg.get("moveSpeed") is not None:
+                z.zoneConfig.moveSpeed = float(cfg["moveSpeed"])
+            if cfg.get("cleanDir") is not None:
+                z.zoneConfig.cleanDir = int(cfg["cleanDir"])
+
+    return pb_in.SerializeToString()

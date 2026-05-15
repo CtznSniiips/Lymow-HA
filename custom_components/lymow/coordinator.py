@@ -54,12 +54,15 @@ from .protocol import (
     build_refresh_query_packets,
     encode_query_map,
     encode_query_path,
+    encode_query_schedules,
     encode_query_robot_config,
     decode_pboutput_envelope,
     decode_pbmap,
     parse_query_path,
     parse_zone_catalog,
+    parse_schedules,
     encode_start_zones,
+    encode_start_schedule_task_full,
     encode_userctrl,
     encode_set_rr_config
 )
@@ -185,9 +188,10 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Publish all startup queries. Also called after reconnect."""
         for raw in build_initial_query_packets(client_uuid=self._client_uuid):
             self._publish(raw)
+        
+        self.hass.async_create_task(self._delayed_query_schedules(3))
         # Robot only responds to robotConfig query after being online for a few seconds
-        self.hass.async_create_task(self._delayed_robot_config(1))
-        self.hass.async_create_task(self._delayed_robot_config(5))
+        self.hass.async_create_task(self._delayed_robot_config(4))
 
     def _fire_refresh_queries(self) -> None:
         """Periodic refresh — keeps IP, signal, RTK and config up to date."""
@@ -198,7 +202,11 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Send robot config query with delay — mirrors app behavior (1s + 5s)."""
         await asyncio.sleep(delay)
         self._publish(encode_query_robot_config())
-
+    
+    async def _delayed_query_schedules(self, delay: int) -> None:
+        """Send robot schedules query with delay — mirrors app behavior (1s + 5s)."""
+        await asyncio.sleep(delay)
+        self._publish(encode_query_schedules())
     # ── Properties ──────────────────────────────────────────────
 
     @property
@@ -385,6 +393,21 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
         except Exception:
             _LOGGER.exception("Failed to parse btMap zone catalog for %s", self.thing_name)
+
+        #Parse Schedule
+        try:
+            if msg.schedule.ByteSize() > 0:
+                schedules = parse_schedules(msg.schedule)
+
+                self._state["schedules"] = schedules
+                self._state["schedules_data"] = {
+                    "task_count": len(schedules),
+                    "enabled_count": sum(1 for s in schedules if s.enabled),
+                    "disabled_count": sum(1 for s in schedules if not s.enabled),
+                    "tasks": [s.to_dict() for s in schedules],
+                }
+        except Exception:
+            _LOGGER.exception("Failed to parse bpSchedule for %s", self.thing_name)
 
         self._derive_state()
 
@@ -660,6 +683,36 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.warning("set_schedule not implemented for MQTT path yet")
         return False
     
+    async def async_start_schedule_task(self, schedule_id: int) -> bool:
+        """Start one decoded schedule manually."""
+        await self.auth.ensure_valid(self._email, self._password)
+
+        tasks = ((self._state.get("schedules_data") or {}).get("tasks") or [])
+        task = next((t for t in tasks if int(t.get("id", -1)) == int(schedule_id)), None)
+
+        if not task:
+            _LOGGER.warning("Schedule task %s not found for %s", schedule_id, self.thing_name)
+            return False
+
+        zone_hash_ids = task.get("zoneHashIds") or []
+        if not zone_hash_ids:
+            _LOGGER.warning("Schedule task %s has no zones", schedule_id)
+            return False
+
+        # Stato fresco prima del comando
+        self._publish(encode_query_map())
+        await self._wait_state_update(timeout=3.0)
+
+        raw = encode_start_schedule_task_full(task)
+
+        # opzionale: pulisci vecchia area tagliata
+        self._state.pop("mowed_area_polygons", None)
+        self._state.pop("mowed_area_data", None)
+
+        ok = self._publish(raw)
+        await self._wait_state_update()
+        return ok
+    
     async def _send_rr_update(
         self,
         *,
@@ -819,6 +872,12 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.device_info_data = await self.client.get_device_info(self.thing_name)
         except LymowError as err:
             _LOGGER.warning("Cannot fetch device info for %s: %s", self.thing_name, err)
+    
+    async def async_refresh_schedules(self) -> bool:
+        await self.auth.ensure_valid(self._email, self._password)
+        ok = self._publish(encode_query_schedules())
+        await self._wait_state_update()
+        return ok
 
     async def async_refresh_history(self, count: int = 10) -> list[dict]:
         try:

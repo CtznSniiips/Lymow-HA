@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import date, datetime, time, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from homeassistant.components.time import TimeEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .coordinator import LymowCoordinator
@@ -31,6 +33,7 @@ async def async_setup_entry(
 
 
 def _read_time(data: dict[str, Any], key: str) -> time | None:
+    """Read a raw UTC time dict from coordinator data."""
     value = data.get(key)
     if not isinstance(value, dict):
         return None
@@ -47,6 +50,20 @@ def _read_time(data: dict[str, Any], key: str) -> time | None:
     return time(hour=hour, minute=minute)
 
 
+def _utc_time_to_local(utc_t: time, ha_tz: ZoneInfo) -> time:
+    """Convert a naive UTC time-of-day to the HA local timezone."""
+    today_utc = datetime.now(timezone.utc).date()
+    utc_dt = datetime.combine(today_utc, utc_t, tzinfo=timezone.utc)
+    return utc_dt.astimezone(ha_tz).time().replace(tzinfo=None)
+
+
+def _local_time_to_utc(local_t: time, ha_tz: ZoneInfo) -> time:
+    """Convert a naive local time-of-day (HA timezone) to UTC."""
+    today_local = datetime.now(ha_tz).date()
+    local_dt = datetime.combine(today_local, local_t, tzinfo=ha_tz)
+    return local_dt.astimezone(timezone.utc).time().replace(tzinfo=None)
+
+
 class LymowRrStartTime(LymowEntity, TimeEntity):
     """Auto recharge resume period start time."""
 
@@ -57,15 +74,23 @@ class LymowRrStartTime(LymowEntity, TimeEntity):
         super().__init__(coordinator, "auto_recharge_start_time")
 
     @property
+    def _ha_tz(self) -> ZoneInfo:
+        return dt_util.get_time_zone(self.coordinator.hass.config.time_zone)
+
+    @property
     def native_value(self) -> time | None:
-        return _read_time(self.coordinator.data or {}, "rrResumePeriodStart")
+        utc_t = _read_time(self.coordinator.data or {}, "rrResumePeriodStart")
+        if utc_t is None:
+            return None
+        return _utc_time_to_local(utc_t, self._ha_tz)
 
     @property
     def available(self) -> bool:
         return super().available and self.native_value is not None
 
     async def async_set_value(self, value: time) -> None:
-        await self.coordinator.async_set_rr_start_time(value.hour, value.minute)
+        utc_t = _local_time_to_utc(value, self._ha_tz)
+        await self.coordinator.async_set_rr_start_time(utc_t.hour, utc_t.minute)
 
 
 class LymowRrEndTime(LymowEntity, TimeEntity):
@@ -78,12 +103,20 @@ class LymowRrEndTime(LymowEntity, TimeEntity):
         super().__init__(coordinator, "auto_recharge_end_time")
 
     @property
+    def _ha_tz(self) -> ZoneInfo:
+        return dt_util.get_time_zone(self.coordinator.hass.config.time_zone)
+
+    @property
     def native_value(self) -> time | None:
-        return _read_time(self.coordinator.data or {}, "rrResumePeriodEnd")
+        utc_t = _read_time(self.coordinator.data or {}, "rrResumePeriodEnd")
+        if utc_t is None:
+            return None
+        return _utc_time_to_local(utc_t, self._ha_tz)
 
     @property
     def available(self) -> bool:
         return super().available and self.native_value is not None
 
     async def async_set_value(self, value: time) -> None:
-        await self.coordinator.async_set_rr_end_time(value.hour, value.minute)
+        utc_t = _local_time_to_utc(value, self._ha_tz)
+        await self.coordinator.async_set_rr_end_time(utc_t.hour, utc_t.minute)

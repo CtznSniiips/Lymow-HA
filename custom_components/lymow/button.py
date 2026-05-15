@@ -6,12 +6,14 @@ payloads directly, so command preflight/watchdog logic stays in one place.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
@@ -39,9 +41,43 @@ async def async_setup_entry(
             LymowRefreshSchedulesButton(coord),
             LymowRefreshDeviceInfoButton(coord),
             LymowRefreshHistoryButton(coord),
+            LymowRefreshRobotSchedulesButton(coord),
         ],
         update_before_add=False,
     )
+
+    added_schedule_ids: set[int] = set()
+
+    def _schedule_tasks() -> list[dict[str, Any]]:
+        data = coord.data or {}
+        schedules_data = data.get("schedules_data") or {}
+        tasks = schedules_data.get("tasks") or []
+        return [t for t in tasks if isinstance(t, dict) and t.get("id") is not None]
+
+    @callback
+    def _maybe_add_schedule_buttons() -> None:
+        new_entities: list[ButtonEntity] = []
+
+        for task in _schedule_tasks():
+            try:
+                schedule_id = int(task["id"])
+            except (TypeError, ValueError):
+                continue
+
+            if schedule_id in added_schedule_ids:
+                continue
+
+            added_schedule_ids.add(schedule_id)
+            new_entities.append(LymowScheduleStartButton(coord, schedule_id))
+
+        if new_entities:
+            async_add_entities(new_entities)
+
+    # Prova subito, se le schedule sono già presenti
+    _maybe_add_schedule_buttons()
+
+    # Poi crea i bottoni quando arrivano via MQTT
+    entry.async_on_unload(coord.async_add_listener(_maybe_add_schedule_buttons))
 
 
 class _LymowButton(LymowEntity, ButtonEntity):
@@ -161,6 +197,19 @@ class LymowRefreshMapButton(_LymowRawQueryButton):
     async def async_press(self) -> None:
         self._publish_packet(encode_query_map())
 
+class LymowRefreshRobotSchedulesButton(_LymowRawQueryButton):
+    """Ask the robot for its schedules."""
+
+    _attr_name = "Refresh Schedules"
+    _attr_icon = "mdi:calendar-refresh"
+    _packet_name = "QUERY_ROBOT_CONFIG"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "btn_refresh_schedules")
+
+    async def async_press(self) -> None:
+        self._publish_packet(encode_query_schedules())
+
 
 class LymowRefreshRobotConfigButton(_LymowRawQueryButton):
     """Ask the robot for its robotConfig/rrConfig state."""
@@ -216,3 +265,86 @@ class LymowRefreshHistoryButton(_LymowButton):
 
     async def async_press(self) -> None:
         await self.coordinator.async_refresh_history()
+
+class LymowScheduleStartButton(_LymowButton):
+    """Start a decoded schedule manually."""
+
+    _attr_icon = "mdi:calendar-play"
+
+    def __init__(self, coordinator: LymowCoordinator, schedule_id: int) -> None:
+        self._schedule_id = int(schedule_id)
+        super().__init__(coordinator, f"schedule_{self._schedule_id}_start")
+
+    def _schedule(self) -> dict[str, Any] | None:
+        data = self.coordinator.data or {}
+        schedules_data = data.get("schedules_data") or {}
+        tasks = schedules_data.get("tasks") or []
+
+        for task in tasks:
+            try:
+                if int(task.get("id", -1)) == self._schedule_id:
+                    return task
+            except (TypeError, ValueError):
+                continue
+
+        return None
+
+    @property
+    def name(self) -> str:
+        task = self._schedule()
+        if not task:
+            return f"Start Schedule {self._schedule_id}"
+
+        days = ", ".join(task.get("dayNames") or [])
+        time = task.get("time") or f"{task.get('hour', 0):02d}:{task.get('minute', 0):02d}"
+        zones = task.get("zoneHashIds") or []
+
+        if days:
+            return f"Start Schedule {days} {time} ({len(zones)} zones)"
+
+        return f"Start Schedule {time} ({len(zones)} zones)"
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._schedule() is not None
+
+    async def async_press(self) -> None:
+        task = self._schedule()
+        if not task:
+            raise HomeAssistantError(f"Schedule {self._schedule_id} not found")
+
+        zone_hash_ids = task.get("zoneHashIds") or []
+        if not zone_hash_ids:
+            raise HomeAssistantError(f"Schedule {self._schedule_id} has no zones")
+
+        ok = await self.coordinator.async_start_schedule_task(self._schedule_id)
+        if not ok:
+            raise HomeAssistantError(f"Failed to start schedule {self._schedule_id}")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        task = self._schedule()
+        if not task:
+            return {
+                "schedule_id": self._schedule_id,
+                "available": False,
+            }
+
+        return {
+            "schedule_id": self._schedule_id,
+            "enabled": task.get("enabled"),
+            "time": task.get("time"),
+            "hour": task.get("hour"),
+            "minute": task.get("minute"),
+            "days_of_week": task.get("daysOfWeek") or [],
+            "day_names": task.get("dayNames") or [],
+            "timezone": task.get("timezone"),
+            "is_repeated": task.get("isRepeated"),
+            "is_disabled": task.get("isDisabled"),
+            "is_angle_offset": task.get("isAngleOffset"),
+            "mow_angle": task.get("mowAngle"),
+            "zone_hash_ids": task.get("zoneHashIds") or [],
+            "zones": task.get("zones") or [],
+            "config": task.get("config") or [],
+            "config_count": task.get("config_count"),
+        }
