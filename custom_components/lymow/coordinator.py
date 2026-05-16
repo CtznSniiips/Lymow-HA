@@ -27,6 +27,7 @@ import logging
 import uuid
 from datetime import timedelta
 from typing import Any
+import re
 
 from homeassistant.core import HomeAssistant
 from homeassistant.core import callback
@@ -233,6 +234,18 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def state_dict(self) -> dict[str, Any]:
         """Compatibility alias used by helper entities."""
         return self._state
+    
+    def _normalize_fw_version(self, version: str | None) -> str | None:
+        """Remove Lymow date suffix from firmware version.
+
+        Examples:
+        v2.1.48_beta_20260512 -> v2.1.48_beta
+        v2.1.46_20260510      -> v2.1.46
+        """
+        if not version:
+            return None
+
+        return re.sub(r"_\d{8}$", "", str(version).strip())
 
     def _merge_state(self, new_state: dict[str, Any]) -> None:
         """Merge MQTT/REST state without losing sticky subfields.
@@ -552,7 +565,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_info = await self.client.check_update(self.thing_name)
             if isinstance(update_info, dict):
                 latest = (
-                    update_info.get("latestVersion")
+                    self._normalize_fw_version(update_info.get("latestVersion"))
                 )
                 note = (
                     update_info.get("releaseNote")
