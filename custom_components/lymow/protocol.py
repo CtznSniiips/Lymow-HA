@@ -560,6 +560,7 @@ def build_refresh_query_packets(client_uuid: str | None = None) -> list[bytes]:
         encode_query_wifi_4g(),
         encode_query_rtk_l1(),
         encode_query_rtk_l2(),
+        encode_query_cleaning_summary(),
     ])
     return packets
 

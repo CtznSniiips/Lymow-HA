@@ -28,6 +28,7 @@ import uuid
 from datetime import timedelta
 from typing import Any
 import re
+from datetime import UTC, datetime, timedelta
 
 from homeassistant.core import HomeAssistant
 from homeassistant.core import callback
@@ -410,18 +411,52 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         #Parse Schedule
         try:
-            if msg.schedule.ByteSize() > 0:
-                schedules = parse_schedules(msg.schedule)
+            if msg.cleanReport.ByteSize() > 0:
+                report = msg.cleanReport
+                report_ts = int(report.cleanStartTime or 0)
 
-                self._state["schedules"] = schedules
-                self._state["schedules_data"] = {
-                    "task_count": len(schedules),
-                    "enabled_count": sum(1 for s in schedules if s.enabled),
-                    "disabled_count": sum(1 for s in schedules if not s.enabled),
-                    "tasks": [s.to_dict() for s in schedules],
-                }
+                if report_ts and self._state.get("lastCleanReportTs") != report_ts:
+                    end_labels = {
+                        0: "unknown",
+                        1: "completed",
+                        2: "cancelled",
+                    }
+
+                    event_data = {
+                        "thing_name": self.thing_name,
+                        "clean_start_time": report.cleanStartTime,
+                        "start_time": (
+                            datetime.fromtimestamp(report.cleanStartTime, UTC).isoformat()
+                            if report.cleanStartTime
+                            else None
+                        ),
+                        "clean_time": report.cleanInfo.cleanTime,
+                        "duration_s": report.cleanInfo.cleanTime,
+                        "clean_area": report.cleanInfo.cleanArea,
+                        "area_m2": round(float(report.cleanInfo.cleanArea), 1)
+                        if report.cleanInfo.cleanArea is not None
+                        else None,
+                        "clean_percent": report.cleanInfo.cleanPercent,
+                        "mow_end_type": report.mowEndType,
+                        "end_type": end_labels.get(report.mowEndType, "unknown"),
+                        "used_battery": report.usedBattery,
+                        "zones": list(report.cleanInfo.areaInfo.cleanZoneIds),
+                    }
+
+                    self._state["lastCleanReport"] = report
+                    self._state["lastCleanReportTs"] = report_ts
+                    self._state["lastSessionEvent"] = event_data
+                    self._state["lastSessionEventId"] = report_ts
+
+                    _LOGGER.info(
+                        "Lymow session completed for %s: area=%s time=%s end_type=%s",
+                        self.thing_name,
+                        event_data["area_m2"],
+                        event_data["duration_s"],
+                        event_data["end_type"],
+                    )
         except Exception:
-            _LOGGER.exception("Failed to parse bpSchedule for %s", self.thing_name)
+            _LOGGER.exception("Failed to parse cleanReport for %s", self.thing_name)
 
         self._derive_state()
 
@@ -432,6 +467,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._state.get("battery"),
             bool(self._state.get("zone_catalog")),
         )
+
         self._state_event.set()
         self.async_set_updated_data(self._state)
 
