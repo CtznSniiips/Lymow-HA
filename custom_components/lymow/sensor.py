@@ -160,7 +160,6 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         icon="mdi:robot-mower-outline",
         value_source="robotStatus",
         transform=lambda v: WORK_STATUS_LABELS.get(v, f"Unknown ({v})"),
-        entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
         key="error",

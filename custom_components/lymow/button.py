@@ -41,7 +41,6 @@ async def async_setup_entry(
             LymowRefreshSchedulesButton(coord),
             LymowRefreshDeviceInfoButton(coord),
             LymowRefreshHistoryButton(coord),
-            LymowRefreshRobotSchedulesButton(coord),
         ],
         update_before_add=False,
     )
@@ -196,19 +195,6 @@ class LymowRefreshMapButton(_LymowRawQueryButton):
 
     async def async_press(self) -> None:
         self._publish_packet(encode_query_map())
-
-class LymowRefreshRobotSchedulesButton(_LymowRawQueryButton):
-    """Ask the robot for its schedules."""
-
-    _attr_name = "Refresh Schedules"
-    _attr_icon = "mdi:calendar-refresh"
-    _packet_name = "QUERY_ROBOT_CONFIG"
-
-    def __init__(self, coordinator: LymowCoordinator) -> None:
-        super().__init__(coordinator, "btn_refresh_schedules")
-
-    async def async_press(self) -> None:
-        self._publish_packet(encode_query_schedules())
 
 
 class LymowRefreshRobotConfigButton(_LymowRawQueryButton):

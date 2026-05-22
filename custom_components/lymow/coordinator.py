@@ -79,7 +79,7 @@ _REFRESH_INTERVAL   = 90          # seconds — periodic config/net/RTK refresh
 _RECONNECT_DELAY    = 5           # seconds — wait before reconnect attempt
 _WATCHDOG_TIMEOUT   = 5.0
 
-_PATH_REFRESH_INTERVAL = 45
+_PATH_REFRESH_INTERVAL = 15
 
 
 class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -123,6 +123,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._rest_poll_task:    asyncio.Task | None = None
         self._refresh_task:      asyncio.Task | None = None
         self._reconnect_task:    asyncio.Task | None = None
+        self._path_refresh_task: asyncio.Task | None = None
 
         self._state_event = asyncio.Event()
 
@@ -144,11 +145,15 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._refresh_task = self.hass.async_create_background_task(
             self._refresh_loop(), name=f"lymow_refresh_{self.thing_name}"
         )
+        self._path_refresh_task = self.hass.async_create_background_task(
+            self._path_refresh_loop(),
+            name=f"lymow_path_refresh_{self.thing_name}",
+        )
 
     async def async_shutdown(self) -> None:
         """Disconnect MQTT and cancel all background tasks."""
         self._shutting_down = True
-        for task_attr in ("_rest_poll_task", "_refresh_task", "_reconnect_task"):
+        for task_attr in ("_rest_poll_task", "_refresh_task",  "_path_refresh_task", "_reconnect_task"):
             task = getattr(self, task_attr)
             if task:
                 task.cancel()
@@ -187,6 +192,25 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.debug("MQTT connected for %s — firing startup queries", self.thing_name)
         self._fire_startup_queries()
 
+    async def _path_refresh_loop(self) -> None:
+        """Frequently query path while the mower is actively working."""
+        while True:
+            try:
+                await asyncio.sleep(_PATH_REFRESH_INTERVAL)
+
+                if not self.mqtt or not self.mqtt.is_connected:
+                    continue
+
+                # mowing, resume, zone partition
+                if self.robot_status in (2, 8, 9):
+                    _LOGGER.debug("Path refresh query for %s", self.thing_name)
+                    self._publish(encode_query_path())
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception("Path refresh loop error for %s", self.thing_name)
+
     def _fire_startup_queries(self) -> None:
         """Publish all startup queries. Also called after reconnect."""
         for raw in build_initial_query_packets(client_uuid=self._client_uuid):
@@ -215,6 +239,10 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @property
     def work_status(self) -> int:
         return self._state.get("workStatus", WORK_STATUS_OFFLINE)
+    
+    @property
+    def robot_status(self) -> int:
+        return self._state.get("robotStatus", WORK_STATUS_OFFLINE)
 
     @property
     def is_online(self) -> bool:
@@ -367,7 +395,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         bool(catalog.enu_base_point),
                         bool(catalog.runtime_config),
                     )
-                # QUERY_PATH: traiettoria / coverage / path
+               # QUERY_PATH: traiettoria / coverage / path
                 elif getattr(msg.btMap, "queryPath", False):
                     path = parse_query_path(msg.btMap)
 
