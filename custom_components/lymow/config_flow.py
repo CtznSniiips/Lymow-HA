@@ -1,21 +1,36 @@
-"""Config flow for Lymow."""
+"""Config flow for Lymow — supports email/password AND Google OAuth."""
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
+import secrets
 from typing import Any
 
 import aiohttp
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.components.http import HomeAssistantView
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import CognitoAuth, LymowAuthError, LymowClient
-from .const import CONF_EMAIL, CONF_PASSWORD, CONF_REGION, DOMAIN, REGIONS
+from .const import (
+    AUTH_METHOD_GOOGLE,
+    AUTH_METHOD_PASSWORD,
+    CONF_AUTH_METHOD,
+    CONF_EMAIL,
+    CONF_PASSWORD,
+    CONF_REGION,
+    DOMAIN,
+    REGIONS,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+OAUTH_CALLBACK_PATH = "/api/lymow/oauth/callback"
 
 
 class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -29,29 +44,52 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._email     = ""
         self._password  = ""
         self._region    = "eu-west-1"
+        self._oauth_state    = ""
+        self._pkce_verifier  = ""
+
+    # ── Step 1: Choose auth method ──────────────────────────────
 
     async def async_step_user(self, user_input: dict | None = None) -> FlowResult:
+        if user_input:
+            method = user_input.get(CONF_AUTH_METHOD, AUTH_METHOD_PASSWORD)
+            self._region = user_input[CONF_REGION]
+            if method == AUTH_METHOD_GOOGLE:
+                return await self.async_step_google()
+            return await self.async_step_password()
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema({
+                vol.Required(CONF_REGION, default="us-east-2"): vol.In(REGIONS),
+                vol.Required(CONF_AUTH_METHOD, default=AUTH_METHOD_PASSWORD): vol.In({
+                    AUTH_METHOD_PASSWORD: "Email & Password",
+                    AUTH_METHOD_GOOGLE:   "Google Account (OAuth)",
+                }),
+            }),
+        )
+
+    # ── Step 2a: Email/password login (original flow) ───────────
+
+    async def async_step_password(self, user_input: dict | None = None) -> FlowResult:
         errors: dict[str, str] = {}
 
         if user_input:
             email    = user_input[CONF_EMAIL]
             password = user_input[CONF_PASSWORD]
-            region   = user_input[CONF_REGION]
 
             try:
                 session = async_get_clientsession(self.hass)
-                auth    = CognitoAuth(region, session)
+                auth    = CognitoAuth(self._region, session)
                 await auth.login(email, password)
                 await auth.get_aws_credentials()
 
-                client  = LymowClient(region, auth, session)
+                client  = LymowClient(self._region, auth, session)
                 devices = await client.get_device_list()
 
                 self._auth     = auth
                 self._devices  = devices
                 self._email    = email
                 self._password = password
-                self._region   = region
 
             except LymowAuthError:
                 errors["base"] = "invalid_auth"
@@ -68,14 +106,112 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return await self.async_step_select_device()
 
         return self.async_show_form(
-            step_id="user",
+            step_id="password",
             data_schema=vol.Schema({
                 vol.Required(CONF_EMAIL):    str,
                 vol.Required(CONF_PASSWORD): str,
-                vol.Required(CONF_REGION, default="eu-west-1"): vol.In(REGIONS),
             }),
             errors=errors,
         )
+
+    # ── Step 2b: Google OAuth flow ──────────────────────────────
+
+    async def async_step_google(self, user_input: dict | None = None) -> FlowResult:
+        """Show the user a link to Google OAuth login."""
+        if user_input is not None:
+            code = user_input.get("code", "").strip()
+            import re
+            # Auto-extract code and state from pasted callback URLs
+            m = re.search(r'[?&]code=([a-f0-9-]+)', code, re.I)
+            if m:
+                code = m.group(1)
+            if not code:
+                return self.async_show_form(
+                    step_id="google",
+                    data_schema=vol.Schema({vol.Required("code"): str}),
+                    errors={"base": "invalid_auth"},
+                    description_placeholders={"auth_url": self._oauth_url()},
+                )
+
+            # Validate state from pasted URL if present
+            raw = user_input.get("code", "")
+            state_match = re.search(r'[?&]state=([A-Za-z0-9_-]+)', raw)
+            if state_match and self._oauth_state:
+                if state_match.group(1) != self._oauth_state:
+                    _LOGGER.warning("OAuth state mismatch — possible CSRF")
+                    return self.async_show_form(
+                        step_id="google",
+                        data_schema=vol.Schema({vol.Required("code"): str}),
+                        errors={"base": "invalid_auth"},
+                        description_placeholders={"auth_url": self._oauth_url()},
+                    )
+
+            try:
+                session = async_get_clientsession(self.hass)
+                auth = CognitoAuth(self._region, session)
+                redirect_uri = self._oauth_redirect_uri()
+                await auth.exchange_oauth_code(
+                    code, redirect_uri, code_verifier=self._pkce_verifier or None,
+                )
+                await auth.get_aws_credentials()
+
+                client = LymowClient(self._region, auth, session)
+                devices = await client.get_device_list()
+
+                self._auth    = auth
+                self._devices = devices
+                self._email   = ""
+                self._password = ""
+
+            except LymowAuthError as e:
+                _LOGGER.error("Google OAuth failed: %s", e)
+                return self.async_show_form(
+                    step_id="google",
+                    data_schema=vol.Schema({vol.Required("code"): str}),
+                    errors={"base": "invalid_auth"},
+                    description_placeholders={"auth_url": self._oauth_url()},
+                )
+            except Exception:
+                _LOGGER.exception("Unexpected error during Google OAuth")
+                return self.async_show_form(
+                    step_id="google",
+                    data_schema=vol.Schema({vol.Required("code"): str}),
+                    errors={"base": "unknown"},
+                    description_placeholders={"auth_url": self._oauth_url()},
+                )
+            else:
+                if not self._devices:
+                    return self.async_abort(reason="no_devices")
+                if len(self._devices) == 1:
+                    return await self._create_entry(self._devices[0])
+                return await self.async_step_select_device()
+
+        return self.async_show_form(
+            step_id="google",
+            data_schema=vol.Schema({vol.Required("code"): str}),
+            description_placeholders={"auth_url": self._oauth_url()},
+        )
+
+    def _oauth_url(self) -> str:
+        self._oauth_state = secrets.token_urlsafe(32)
+        self._pkce_verifier = secrets.token_urlsafe(64)
+        code_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(self._pkce_verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        base = self.hass.config.internal_url or "http://homeassistant.local:8123"
+        import urllib.parse
+        qs = urllib.parse.urlencode({
+            "region": self._region,
+            "state": self._oauth_state,
+            "cc": code_challenge,
+        })
+        return f"{base}/api/lymow/oauth/start?{qs}"
+
+    def _oauth_redirect_uri(self) -> str:
+        # Must use the app's registered redirect URI with trailing slash
+        return "myapp://callback/"
+
+    # ── Step 3: Select device ───────────────────────────────────
 
     async def async_step_select_device(self, user_input: dict | None = None) -> FlowResult:
         if user_input:
@@ -100,6 +236,7 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_EMAIL:      self._email,
                 CONF_PASSWORD:   self._password,
                 CONF_REGION:     self._region,
+                CONF_AUTH_METHOD: AUTH_METHOD_GOOGLE if not self._password else AUTH_METHOD_PASSWORD,
                 "thing_name":    thing,
                 "device_name":   _label(device),
                 "refresh_token": self._auth.refresh_token,
@@ -129,6 +266,104 @@ class LymowOptionsFlow(config_entries.OptionsFlow):
                 ): vol.All(int, vol.Range(min=10, max=300)),
             }),
         )
+
+
+class LymowOAuthStartView(HomeAssistantView):
+    """Intercept the myapp:// redirect and display the code."""
+
+    url = "/api/lymow/oauth/start"
+    name = "api:lymow:oauth:start"
+    requires_auth = False
+
+    async def get(self, request):
+        from aiohttp import web
+        import html as html_mod
+        region = request.query.get("region", "us-east-2")
+        if region not in REGIONS:
+            return web.Response(text="Invalid region", status=400)
+        state = request.query.get("state", "")
+        code_challenge = request.query.get("cc", "")
+        hass = request.app["hass"]
+        session = async_get_clientsession(hass)
+        auth = CognitoAuth(region, session)
+        auth_url = auth.get_oauth_authorize_url(
+            redirect_uri="myapp://callback/",
+            provider="Google",
+            state=state or None,
+            code_challenge=code_challenge or None,
+        )
+        safe_url = html_mod.escape(auth_url)
+        page = f"""<!DOCTYPE html><html><head><title>Lymow - Sign in with Google</title>
+<style>
+body{{font-family:-apple-system,sans-serif;display:flex;justify-content:center;
+     align-items:center;min-height:100vh;margin:0;background:#f0f2f5}}
+.card{{background:#fff;border-radius:16px;padding:40px;max-width:580px;width:90%;
+      box-shadow:0 4px 24px rgba(0,0,0,.12);text-align:center}}
+h2{{color:#1a73e8;margin-bottom:8px}}
+.sub{{color:#666;margin-bottom:24px}}
+.btn{{background:#1a73e8;color:#fff;border:none;padding:14px 28px;border-radius:8px;
+     font-size:16px;cursor:pointer;display:inline-block}}
+.btn:hover{{background:#1557b0}}
+.btn2{{background:#fff;color:#1a73e8;border:2px solid #1a73e8;padding:12px 24px;border-radius:8px;
+      font-size:15px;cursor:pointer;display:inline-block}}
+.btn2:hover{{background:#e8f0fe}}
+.code-box{{font-size:15px;padding:14px;width:100%;border:2px solid #1a73e8;border-radius:8px;
+          margin:12px 0;font-family:monospace;text-align:center;box-sizing:border-box}}
+.ok{{color:#0d652d;background:#e6f4ea;padding:16px;border-radius:8px;margin-top:16px}}
+.step{{background:#f8f9fa;border-radius:8px;padding:16px;margin:12px 0;text-align:left;line-height:2}}
+.step b{{color:#1a73e8}}
+kbd{{background:#e8e8e8;border:1px solid #b4b4b4;border-radius:3px;padding:2px 6px;font-size:13px}}
+</style></head>
+<body><div class="card">
+<h2>Lymow + Google</h2>
+<p class="sub">Connect your Lymow account via Google sign-in</p>
+<input type="hidden" id="au" value="{safe_url}">
+
+<div class="step">
+  <b>1.</b> If not signed into Google yet, click <b>Sign in</b> first (opens new tab).<br>
+  &nbsp;&nbsp;&nbsp;&nbsp;The tab may keep loading after sign-in &mdash; that is normal. Just close it.<br>
+  <b>2.</b> Press <kbd>F12</kbd> &rarr; <b>Network</b> tab &rarr; check <b>Preserve log</b><br>
+  <b>3.</b> Click <b>Get Code</b> (navigates this tab &mdash; keep DevTools open!)<br>
+  <b>4.</b> Find <code>callback</code> in Network tab &rarr; right-click &rarr; <b>Copy URL</b><br>
+  <b>5.</b> Go back to <b>Home Assistant</b> and paste it in the code field
+</div>
+<div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin:16px 0">
+  <button class="btn2" onclick="signIn()">Sign in with Google &nearr;</button>
+  <button class="btn" onclick="getCode()">Get Code</button>
+</div>
+<p style="font-size:13px;color:#888">
+  Already signed in? Skip straight to <b>Get Code</b>.
+</p>
+
+<hr style="margin:24px 0;border:none;border-top:1px solid #e0e0e0">
+<p style="color:#666;font-size:14px"><b>Already have the code?</b> Paste below to extract &amp; copy:</p>
+<input type="text" id="code" class="code-box"
+       placeholder="Paste code or myapp://callback URL..." oninput="extractCode(this)">
+<button class="btn" onclick="copyCode()">Copy Code</button>
+<div id="ok" class="ok" style="display:none">
+  Copied! Paste in <b>Home Assistant</b> and submit quickly &mdash; expires in ~60s.
+</div>
+</div>
+<script>
+var AU=document.getElementById("au").value;
+function $(id){{return document.getElementById(id)}}
+function signIn(){{window.open(AU,"_blank")}}
+function getCode(){{window.location.href=AU}}
+function extractCode(el){{
+  var v=el.value.trim(),m=v.match(/[?&]code=([a-f0-9-]+)/i);
+  if(m) el.value=m[1]
+}}
+function copyCode(){{
+  var el=$("code"),c=el.value.trim();if(!c) return;
+  var m=c.match(/[?&]code=([a-f0-9-]+)/i);
+  if(m){{c=m[1];el.value=c}}
+  try{{navigator.clipboard.writeText(c)}}catch(e){{}}
+  el.select();try{{document.execCommand("copy")}}catch(e){{}}
+  $("ok").style.display="block"
+}}
+</script>
+</body></html>"""
+        return web.Response(text=page, content_type="text/html")
 
 
 def _thing_name(d: dict) -> str:

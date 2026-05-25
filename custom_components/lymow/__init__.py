@@ -13,6 +13,8 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import CognitoAuth, LymowClient
 from .const import (
+    AUTH_METHOD_GOOGLE,
+    CONF_AUTH_METHOD,
     CONF_EMAIL,
     CONF_PASSWORD,
     CONF_REGION,
@@ -21,6 +23,7 @@ from .const import (
     SERVICE_SET_SCHEDULE,
     SERVICE_START_ZONE,
 )
+from .config_flow import LymowOAuthStartView
 from .coordinator import LymowCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,12 +44,22 @@ PLATFORMS = [
 ]
 
 
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register OAuth view early so it's available during config flow."""
+    hass.http.register_view(LymowOAuthStartView)
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Lymow from a config entry."""
-    email      = entry.data[CONF_EMAIL]
-    password   = entry.data[CONF_PASSWORD]
+    email      = entry.data.get(CONF_EMAIL, "")
+    password   = entry.data.get(CONF_PASSWORD, "")
     region     = entry.data[CONF_REGION]
     thing_name = entry.data["thing_name"]
+    auth_method = entry.data.get(CONF_AUTH_METHOD, "password")
+
+    # Register OAuth helper view (idempotent)
+    hass.http.register_view(LymowOAuthStartView)
 
     session = async_get_clientsession(hass)
     auth    = CognitoAuth(region, session)
@@ -55,14 +68,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if entry.data.get("refresh_token"):
         auth.from_dict(entry.data)
         try:
-            await auth.ensure_valid(email, password)
+            await auth.ensure_valid(email or None, password or None)
         except Exception:
+            if auth_method == AUTH_METHOD_GOOGLE:
+                _LOGGER.error("Google OAuth tokens expired for %s — reconfigure the integration", thing_name)
+                raise
             _LOGGER.warning("Stored tokens invalid for %s — re-logging in", thing_name)
             await auth.login(email, password)
             await auth.get_aws_credentials()
-    else:
+    elif email and password:
         await auth.login(email, password)
         await auth.get_aws_credentials()
+    else:
+        raise Exception("No credentials available — reconfigure the integration")
 
     client = LymowClient(region, auth, session)
 
