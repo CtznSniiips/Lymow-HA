@@ -439,6 +439,21 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         #Parse Schedule
         try:
+            if msg.schedule.ByteSize() > 0:
+                schedules = parse_schedules(msg.schedule)
+
+                self._state["schedules"] = schedules
+                self._state["schedules_data"] = {
+                    "task_count": len(schedules),
+                    "enabled_count": sum(1 for s in schedules if s.enabled),
+                    "disabled_count": sum(1 for s in schedules if not s.enabled),
+                    "tasks": [s.to_dict() for s in schedules],
+                }
+        except Exception:
+            _LOGGER.exception("Failed to parse bpSchedule for %s", self.thing_name)
+            
+        #Parse Clean Report
+        try:
             if msg.cleanReport.ByteSize() > 0:
                 report = msg.cleanReport
                 report_ts = int(report.cleanStartTime or 0)
