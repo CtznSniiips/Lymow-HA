@@ -3,11 +3,25 @@
     "step": {
       "user": {
         "title": "Lymow Robot Mower",
+        "description": "Choose your login method and region",
+        "data": {
+          "region": "Region",
+          "auth_method": "Login Method"
+        }
+      },
+      "password": {
+        "title": "Lymow Login",
         "description": "Enter your Lymow app credentials",
         "data": {
           "email": "Email",
-          "password": "Password",
-          "region": "AWS Region (choose the one closest to you)"
+          "password": "Password"
+        }
+      },
+      "google": {
+        "title": "Google Login",
+        "description": "Copy this URL and open it in a **new browser tab**:\n\n`{auth_url}`\n\nFollow the steps on that page to sign in and get the code, then paste it below.",
+        "data": {
+          "code": "Authorization Code"
         }
       },
       "select_device": {
@@ -19,7 +33,7 @@
       }
     },
     "error": {
-      "invalid_auth": "Invalid email or password",
+      "invalid_auth": "Authentication failed — check your credentials or try again",
       "cannot_connect": "Cannot connect to Lymow servers",
       "unknown": "Unexpected error — check the HA logs"
     },

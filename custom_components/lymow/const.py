@@ -6,6 +6,18 @@ MANUFACTURER = "Lymow"
 CONF_EMAIL    = "email"
 CONF_PASSWORD = "password"
 CONF_REGION   = "region"
+CONF_AUTH_METHOD = "auth_method"
+
+AUTH_METHOD_PASSWORD = "password"
+AUTH_METHOD_GOOGLE   = "google"
+
+# Cognito Hosted UI domains (discovered via OpenID configuration endpoint)
+COGNITO_DOMAINS: dict[str, str] = {
+    "eu-west-1":      "eu-auth.lymow.com",
+    "ap-southeast-2": "ap-auth.lymow.com",
+    "us-east-2":      "us-auth.lymow.com",
+    "ap-east-1":      "lymow.auth.ap-east-1.amazoncognito.com",
+}
 
 DEFAULT_SCAN_INTERVAL = 30  # seconds
 
