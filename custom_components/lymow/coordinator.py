@@ -69,7 +69,7 @@ from .protocol import (
     encode_set_rr_config,
     encode_set_headlights
 )
-from .state import derive_current_zone, merge_pboutput, robot_gps_from_state
+from .state import _ACTIVE_TASK_WORK_STATUSES, derive_current_zone, merge_pboutput, robot_gps_from_state
 from .state_matrix import lookup as lookup_state_row
 
 _LOGGER = logging.getLogger(__name__)
@@ -318,6 +318,9 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         zone = derive_current_zone(self._state)
         if zone:
             self._state["currentZone"] = zone
+        elif "currentZone" in self._state and self._state["workStatus"]  not in _ACTIVE_TASK_WORK_STATUSES:
+            self._state["currentZone"] = None
+
 
         # Flatten runTimeConfig from btMap to top-level (blade height sensor)
         btmap = self._dict_or_empty(self._state.get("btMap"))
@@ -451,7 +454,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 }
         except Exception:
             _LOGGER.exception("Failed to parse bpSchedule for %s", self.thing_name)
-            
+
         #Parse Clean Report
         try:
             if msg.cleanReport.ByteSize() > 0:
@@ -498,6 +501,11 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         event_data["duration_s"],
                         event_data["end_type"],
                     )
+
+                    #Reset Current zone on Clean report, if not in active task status
+                    if "currentZone" in self._state and self._state["workStatus"] not in _ACTIVE_TASK_WORK_STATUSES:
+                        self._state["currentZone"] = None
+
         except Exception:
             _LOGGER.exception("Failed to parse cleanReport for %s", self.thing_name)
 
