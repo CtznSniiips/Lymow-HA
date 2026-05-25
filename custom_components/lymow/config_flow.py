@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
+import secrets
 from typing import Any
 
 import aiohttp
@@ -41,6 +44,8 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._email     = ""
         self._password  = ""
         self._region    = "eu-west-1"
+        self._oauth_state    = ""
+        self._pkce_verifier  = ""
 
     # ── Step 1: Choose auth method ──────────────────────────────
 
@@ -114,10 +119,9 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_google(self, user_input: dict | None = None) -> FlowResult:
         """Show the user a link to Google OAuth login."""
         if user_input is not None:
-            # User submitted the OAuth code from the callback
             code = user_input.get("code", "").strip()
-            # Auto-extract code from pasted URLs like myapp://callback/?code=UUID
             import re
+            # Auto-extract code and state from pasted callback URLs
             m = re.search(r'[?&]code=([a-f0-9-]+)', code, re.I)
             if m:
                 code = m.group(1)
@@ -129,11 +133,26 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     description_placeholders={"auth_url": self._oauth_url()},
                 )
 
+            # Validate state from pasted URL if present
+            raw = user_input.get("code", "")
+            state_match = re.search(r'[?&]state=([A-Za-z0-9_-]+)', raw)
+            if state_match and self._oauth_state:
+                if state_match.group(1) != self._oauth_state:
+                    _LOGGER.warning("OAuth state mismatch — possible CSRF")
+                    return self.async_show_form(
+                        step_id="google",
+                        data_schema=vol.Schema({vol.Required("code"): str}),
+                        errors={"base": "invalid_auth"},
+                        description_placeholders={"auth_url": self._oauth_url()},
+                    )
+
             try:
                 session = async_get_clientsession(self.hass)
                 auth = CognitoAuth(self._region, session)
                 redirect_uri = self._oauth_redirect_uri()
-                await auth.exchange_oauth_code(code, redirect_uri)
+                await auth.exchange_oauth_code(
+                    code, redirect_uri, code_verifier=self._pkce_verifier or None,
+                )
                 await auth.get_aws_credentials()
 
                 client = LymowClient(self._region, auth, session)
@@ -174,8 +193,19 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     def _oauth_url(self) -> str:
+        self._oauth_state = secrets.token_urlsafe(32)
+        self._pkce_verifier = secrets.token_urlsafe(64)
+        code_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(self._pkce_verifier.encode()).digest()
+        ).rstrip(b"=").decode()
         base = self.hass.config.internal_url or "http://homeassistant.local:8123"
-        return f"{base}/api/lymow/oauth/start?region={self._region}"
+        import urllib.parse
+        qs = urllib.parse.urlencode({
+            "region": self._region,
+            "state": self._oauth_state,
+            "cc": code_challenge,
+        })
+        return f"{base}/api/lymow/oauth/start?{qs}"
 
     def _oauth_redirect_uri(self) -> str:
         # Must use the app's registered redirect URI with trailing slash
@@ -248,16 +278,20 @@ class LymowOAuthStartView(HomeAssistantView):
     async def get(self, request):
         from aiohttp import web
         import html as html_mod
-        auth_url = request.query.get("auth_url", "")
-        if not auth_url:
-            region = request.query.get("region", "us-east-2")
-            hass = request.app["hass"]
-            session = async_get_clientsession(hass)
-            auth = CognitoAuth(region, session)
-            auth_url = auth.get_oauth_authorize_url(
-                redirect_uri="myapp://callback/",
-                provider="Google",
-            )
+        region = request.query.get("region", "us-east-2")
+        if region not in REGIONS:
+            return web.Response(text="Invalid region", status=400)
+        state = request.query.get("state", "")
+        code_challenge = request.query.get("cc", "")
+        hass = request.app["hass"]
+        session = async_get_clientsession(hass)
+        auth = CognitoAuth(region, session)
+        auth_url = auth.get_oauth_authorize_url(
+            redirect_uri="myapp://callback/",
+            provider="Google",
+            state=state or None,
+            code_challenge=code_challenge or None,
+        )
         safe_url = html_mod.escape(auth_url)
         page = f"""<!DOCTYPE html><html><head><title>Lymow - Sign in with Google</title>
 <style>

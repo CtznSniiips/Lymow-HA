@@ -147,33 +147,48 @@ class CognitoAuth:
 
     # ── OAuth (Google / hosted UI) ─────────────────────────────
 
-    def get_oauth_authorize_url(self, redirect_uri: str, provider: str = "Google") -> str:
+    def get_oauth_authorize_url(
+        self,
+        redirect_uri: str,
+        provider: str = "Google",
+        state: str | None = None,
+        code_challenge: str | None = None,
+    ) -> str:
         """Build the Cognito Hosted UI authorize URL for federated login."""
         domain = COGNITO_DOMAINS.get(self._region)
         if not domain:
             raise LymowAuthError(f"No Cognito domain for region {self._region}")
-        params = urllib.parse.urlencode({
+        params: dict[str, str] = {
             "client_id": self._cfg["client_id"],
             "response_type": "code",
             "scope": "openid aws.cognito.signin.user.admin",
             "redirect_uri": redirect_uri,
             "identity_provider": provider,
-        })
-        return f"https://{domain}/oauth2/authorize?{params}"
+        }
+        if state:
+            params["state"] = state
+        if code_challenge:
+            params["code_challenge"] = code_challenge
+            params["code_challenge_method"] = "S256"
+        return f"https://{domain}/oauth2/authorize?{urllib.parse.urlencode(params)}"
 
-    async def exchange_oauth_code(self, code: str, redirect_uri: str) -> None:
+    async def exchange_oauth_code(
+        self, code: str, redirect_uri: str, code_verifier: str | None = None,
+    ) -> None:
         """Exchange an OAuth authorization code for Cognito tokens."""
         domain = COGNITO_DOMAINS.get(self._region)
         if not domain:
             raise LymowAuthError(f"No Cognito domain for region {self._region}")
 
         token_url = f"https://{domain}/oauth2/token"
-        payload = {
+        payload: dict[str, str] = {
             "grant_type": "authorization_code",
             "client_id": self._cfg["client_id"],
             "code": code,
             "redirect_uri": redirect_uri,
         }
+        if code_verifier:
+            payload["code_verifier"] = code_verifier
 
         async with self._session.post(
             token_url,
