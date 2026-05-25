@@ -29,7 +29,7 @@ try:
 except ImportError:
     _HAS_PYCOGNITO = False
 
-from .const import API_ENDPOINTS, COGNITO_CONFIG
+from .const import API_ENDPOINTS, COGNITO_CONFIG, COGNITO_DOMAINS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -144,6 +144,86 @@ class CognitoAuth:
 
         self._email:    str | None = None
         self._password: str | None = None
+
+    # ── OAuth (Google / hosted UI) ─────────────────────────────
+
+    def get_oauth_authorize_url(self, redirect_uri: str, provider: str = "Google") -> str:
+        """Build the Cognito Hosted UI authorize URL for federated login."""
+        domain = COGNITO_DOMAINS.get(self._region)
+        if not domain:
+            raise LymowAuthError(f"No Cognito domain for region {self._region}")
+        params = urllib.parse.urlencode({
+            "client_id": self._cfg["client_id"],
+            "response_type": "code",
+            "scope": "openid aws.cognito.signin.user.admin",
+            "redirect_uri": redirect_uri,
+            "identity_provider": provider,
+        })
+        return f"https://{domain}/oauth2/authorize?{params}"
+
+    async def exchange_oauth_code(self, code: str, redirect_uri: str) -> None:
+        """Exchange an OAuth authorization code for Cognito tokens."""
+        domain = COGNITO_DOMAINS.get(self._region)
+        if not domain:
+            raise LymowAuthError(f"No Cognito domain for region {self._region}")
+
+        token_url = f"https://{domain}/oauth2/token"
+        payload = {
+            "grant_type": "authorization_code",
+            "client_id": self._cfg["client_id"],
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }
+
+        async with self._session.post(
+            token_url,
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        ) as r:
+            data = await r.json(content_type=None)
+            if r.status != 200:
+                raise LymowAuthError(f"OAuth token exchange failed ({r.status}): {data}")
+
+        self.id_token      = data["id_token"]
+        self.access_token  = data["access_token"]
+        self.refresh_token = data.get("refresh_token")
+        self._token_expiry = datetime.now(UTC) + timedelta(
+            seconds=data.get("expires_in", 3600)
+        )
+        self._email = None
+        self._password = None
+        _LOGGER.debug("OAuth token exchange OK, expires in %ss", data.get("expires_in"))
+
+    async def refresh_oauth(self) -> None:
+        """Refresh tokens using the OAuth refresh_token grant."""
+        if not self.refresh_token:
+            raise LymowAuthError("No refresh token — re-login required")
+
+        domain = COGNITO_DOMAINS.get(self._region)
+        if not domain:
+            raise LymowAuthError(f"No Cognito domain for region {self._region}")
+
+        token_url = f"https://{domain}/oauth2/token"
+        payload = {
+            "grant_type": "refresh_token",
+            "client_id": self._cfg["client_id"],
+            "refresh_token": self.refresh_token,
+        }
+
+        async with self._session.post(
+            token_url,
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        ) as r:
+            data = await r.json(content_type=None)
+            if r.status != 200:
+                raise LymowAuthError(f"OAuth refresh failed ({r.status}): {data}")
+
+        self.id_token     = data["id_token"]
+        self.access_token = data["access_token"]
+        self._token_expiry = datetime.now(UTC) + timedelta(
+            seconds=data.get("expires_in", 3600)
+        )
 
     # ── SRP login ──────────────────────────────────────────────
 
@@ -260,7 +340,10 @@ class CognitoAuth:
         if self._tokens_expiring():
             if self.refresh_token:
                 try:
-                    await self.refresh()
+                    if _email and _password:
+                        await self.refresh()
+                    else:
+                        await self.refresh_oauth()
                 except LymowAuthError:
                     if _email and _password:
                         await self.login(_email, _password)
