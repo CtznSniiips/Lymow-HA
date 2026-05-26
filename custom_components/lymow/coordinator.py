@@ -67,7 +67,10 @@ from .protocol import (
     encode_start_schedule_task_full,
     encode_userctrl,
     encode_set_rr_config,
-    encode_set_headlights
+    encode_set_headlights,
+
+    encode_remote_control,
+    encode_remote_stop,
 )
 from .state import _ACTIVE_TASK_WORK_STATUSES, derive_current_zone, merge_pboutput, robot_gps_from_state
 from .state_matrix import lookup as lookup_state_row
@@ -75,11 +78,18 @@ from .state_matrix import lookup as lookup_state_row
 _LOGGER = logging.getLogger(__name__)
 
 _REST_POLL_INTERVAL = timedelta(minutes=15)
-_REFRESH_INTERVAL   = 90          # seconds — periodic config/net/RTK refresh
+_REFRESH_INTERVAL   = 30          # seconds — periodic config/net/RTK refresh
 _RECONNECT_DELAY    = 5           # seconds — wait before reconnect attempt
 _WATCHDOG_TIMEOUT   = 5.0
 
 _PATH_REFRESH_INTERVAL = 15
+
+
+
+_REMOTE_LINEAR_SPEED = 0.25
+_REMOTE_ANGULAR_SPEED = 0.35
+_REMOTE_PULSE_SECONDS = 0.35
+
 
 
 class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -201,8 +211,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if not self.mqtt or not self.mqtt.is_connected:
                     continue
 
-                # mowing, resume, zone partition
-                if self.robot_status in (2, 8, 9):
+                if self.work_status in _ACTIVE_TASK_WORK_STATUSES:
                     _LOGGER.debug("Path refresh query for %s", self.thing_name)
                     self._publish(encode_query_path())
 
@@ -275,6 +284,24 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
 
         return re.sub(r"_\d{8}$", "", str(version).strip())
+    
+    def _zone_name_by_id(self, zone_id: str) -> str | None:
+        catalog = self._state.get("zone_catalog")
+        zones = getattr(catalog, "zones", None)
+
+        if isinstance(zones, list):
+            for z in zones:
+                if str(getattr(z, "hash_id", "")) == str(zone_id):
+                    return getattr(z, "name", None)
+
+        btmap = self._state.get("btMap") or {}
+        zones = btmap.get("zones") if isinstance(btmap, dict) else []
+
+        for z in zones or []:
+            if str(z.get("hashId")) == str(zone_id):
+                return z.get("name")
+
+        return None
 
     def _merge_state(self, new_state: dict[str, Any]) -> None:
         """Merge MQTT/REST state without losing sticky subfields.
@@ -315,10 +342,13 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._state.setdefault("latitude", gps[0])
             self._state.setdefault("longitude", gps[1])
 
+        work_status = self._state.get("workStatus")
         zone = derive_current_zone(self._state)
-        if zone:
-            self._state["currentZone"] = zone
-        elif "currentZone" in self._state and self._state["workStatus"]  not in _ACTIVE_TASK_WORK_STATUSES:
+
+        if work_status in _ACTIVE_TASK_WORK_STATUSES:
+            if zone:
+                self._state["currentZone"] = zone
+        else:
             self._state["currentZone"] = None
 
 
@@ -462,6 +492,8 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 report_ts = int(report.cleanStartTime or 0)
 
                 if report_ts and self._state.get("lastCleanReportTs") != report_ts:
+                    # Reset stale current zone after job completion
+                    self._state["currentZone"] = None
                     end_labels = {
                         0: "unknown",
                         1: "completed",
@@ -489,6 +521,23 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "zones": list(report.cleanInfo.areaInfo.cleanZoneIds),
                     }
 
+                    zone_history = self._state.setdefault("zone_history", {})
+
+                    for zone_id in event_data["zones"]:
+                        zone_name = self._zone_name_by_id(str(zone_id))
+
+                        zone_history[str(zone_id)] = {
+                            "zone_id": str(zone_id),
+                            "zone_name": zone_name or str(zone_id),
+                            "last_mowed_at": event_data["start_time"],
+                            "last_clean_start_time": report.cleanStartTime,
+                            "last_duration_s": event_data["duration_s"],
+                            "last_area_m2": event_data["area_m2"],
+                            "last_clean_percent": event_data["clean_percent"],
+                            "last_end_type": event_data["end_type"],
+                            "last_session_event_id": report_ts,
+                        }
+
                     self._state["lastCleanReport"] = report
                     self._state["lastCleanReportTs"] = report_ts
                     self._state["lastSessionEvent"] = event_data
@@ -501,10 +550,6 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         event_data["duration_s"],
                         event_data["end_type"],
                     )
-
-                    #Reset Current zone on Clean report, if not in active task status
-                    if "currentZone" in self._state and self._state["workStatus"] not in _ACTIVE_TASK_WORK_STATUSES:
-                        self._state["currentZone"] = None
 
         except Exception:
             _LOGGER.exception("Failed to parse cleanReport for %s", self.thing_name)
@@ -979,6 +1024,82 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ok = self._publish(raw)
         await self._wait_state_update()
         return ok
+
+    async def async_remote_control(
+        self,
+        *,
+        linear_speed: float = 0.0,
+        angular_speed: float = 0.0,
+    ) -> bool:
+        """Send a raw remote-control movement command."""
+        await self.auth.ensure_valid(self._email, self._password)
+
+        linear_speed = max(-1.0, min(1.0, float(linear_speed)))
+        angular_speed = max(-1.0, min(1.0, float(angular_speed)))
+
+        return self._publish(
+            encode_remote_control(
+                linear_speed=linear_speed,
+                angular_speed=angular_speed,
+            )
+        )
+
+
+    async def async_remote_stop(self) -> bool:
+        """Stop remote/manual movement."""
+        await self.auth.ensure_valid(self._email, self._password)
+        return self._publish(encode_remote_stop())
+
+
+    async def async_remote_pulse(
+        self,
+        *,
+        linear_speed: float = 0.0,
+        angular_speed: float = 0.0,
+        duration: float = _REMOTE_PULSE_SECONDS,
+    ) -> bool:
+        """Move briefly, then stop automatically.
+
+        Useful for Home Assistant ButtonEntity because buttons do not expose
+        press/release events.
+        """
+        ok = await self.async_remote_control(
+            linear_speed=linear_speed,
+            angular_speed=angular_speed,
+        )
+
+        await asyncio.sleep(max(0.05, min(2.0, float(duration))))
+
+        await self.async_remote_stop()
+        return ok
+
+
+    async def async_remote_forward(self) -> bool:
+        return await self.async_remote_pulse(
+            linear_speed=_REMOTE_LINEAR_SPEED,
+            angular_speed=0.0,
+        )
+
+
+    async def async_remote_backward(self) -> bool:
+        return await self.async_remote_pulse(
+            linear_speed=-_REMOTE_LINEAR_SPEED,
+            angular_speed=0.0,
+        )
+
+
+    async def async_remote_left(self) -> bool:
+        return await self.async_remote_pulse(
+            linear_speed=0.0,
+            angular_speed=_REMOTE_ANGULAR_SPEED,
+        )
+
+
+    async def async_remote_right(self) -> bool:
+        return await self.async_remote_pulse(
+            linear_speed=0.0,
+            angular_speed=-_REMOTE_ANGULAR_SPEED,
+        )
 
     # ── One-time fetches ─────────────────────────────────────────
 

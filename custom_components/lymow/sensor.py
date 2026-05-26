@@ -608,9 +608,35 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowSensor(coord, desc) for desc in SENSORS] + [LymowMapGeoJsonSensor(coord)],
+        [LymowSensor(coord, desc) for desc in SENSORS] + [LymowMapGeoJsonSensor(coord)] + [LymowZoneHistorySensor(coord)],
         update_before_add=False,
     )
+
+class LymowZoneHistorySensor(LymowEntity, SensorEntity):
+    _attr_icon = "mdi:map-clock"
+
+    @property
+    def name(self) -> str:
+        return f"{self.coordinator.thing_name} Zone history"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self.coordinator.thing_name}_zone_history"
+
+    @property
+    def native_value(self):
+        history = (self.coordinator.data or {}).get("zone_history") or {}
+        return len(history)
+
+    @property
+    def extra_state_attributes(self):
+        data = self.coordinator.data or {}
+        history = data.get("zone_history") or {}
+
+        return {
+            "zones": history,
+            "zone_count": len(history),
+        }
 
 
 class LymowSensor(LymowEntity, SensorEntity):

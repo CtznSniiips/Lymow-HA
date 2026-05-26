@@ -6,7 +6,7 @@ payloads directly, so command preflight/watchdog logic stays in one place.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
@@ -36,6 +36,44 @@ async def async_setup_entry(
             LymowDockButton(coord),
             LymowCancelTaskButton(coord),
             LymowDockCancelButton(coord),
+
+            # Remote control buttons
+            LymowRemoteButton(
+                coord,
+                key="remote_forward",
+                name="Remote forward",
+                icon="mdi:arrow-up-bold",
+                action="async_remote_forward",
+            ),
+            LymowRemoteButton(
+                coord,
+                key="remote_backward",
+                name="Remote backward",
+                icon="mdi:arrow-down-bold",
+                action="async_remote_backward",
+            ),
+            LymowRemoteButton(
+                coord,
+                key="remote_left",
+                name="Remote left",
+                icon="mdi:arrow-left-bold",
+                action="async_remote_left",
+            ),
+            LymowRemoteButton(
+                coord,
+                key="remote_right",
+                name="Remote right",
+                icon="mdi:arrow-right-bold",
+                action="async_remote_right",
+            ),
+            LymowRemoteButton(
+                coord,
+                key="remote_stop",
+                name="Remote stop",
+                icon="mdi:stop-circle",
+                action="async_remote_stop",
+            ),
+
             LymowRefreshMapButton(coord),
             LymowRefreshRobotConfigButton(coord),
             LymowRefreshSchedulesButton(coord),
@@ -78,6 +116,25 @@ async def async_setup_entry(
     # Poi crea i bottoni quando arrivano via MQTT
     entry.async_on_unload(coord.async_add_listener(_maybe_add_schedule_buttons))
 
+class LymowRemoteButton(LymowEntity, ButtonEntity):
+    def __init__(
+        self,
+        coordinator: LymowCoordinator,
+        *,
+        key: str,
+        name: str,
+        icon: str,
+        action: Callable[[LymowCoordinator], Awaitable[bool]],
+    ) -> None:
+        super().__init__(coordinator)
+        self._key = key
+        self._attr_name = f"{coordinator.thing_name} {name}"
+        self._attr_unique_id = f"{coordinator.thing_name}_{key}"
+        self._attr_icon = icon
+        self._action = action
+
+    async def async_press(self) -> None:
+        await self._action(self.coordinator)
 
 class _LymowButton(LymowEntity, ButtonEntity):
     """Base for all Lymow command buttons."""

@@ -444,7 +444,7 @@ def encode_upload_robot_config() -> bytes:
 
 def encode_app_connect(client_uuid: str) -> bytes:
     msg = _new_input()
-    msg.appConnect = 1
+    msg.appConnect = 2
     msg.uuid = client_uuid
     return msg.SerializeToString()
 
@@ -480,6 +480,32 @@ def encode_set_clean_mode(mode_int: int) -> bytes:
     """
     robot_config = _raw_enc_i32(7, int(mode_int))
     return _raw_enc_i32(2, PB_VERSION_4_9) + _raw_enc_len(13, robot_config)
+
+def encode_remote_control(
+    linear_speed: float = 0.0,
+    angular_speed: float = 0.0,
+) -> bytes:
+    """Encode remote/manual movement command.
+
+    linear_speed:
+      > 0 forward
+      < 0 backward
+
+    angular_speed:
+      > 0 rotate one direction
+      < 0 rotate the opposite direction
+
+    The sign for left/right may need to be swapped after testing.
+    """
+    msg = _new_input()
+    msg.remoteControl.linearSpeed = float(linear_speed)
+    msg.remoteControl.angularSpeed = float(angular_speed)
+    return msg.SerializeToString()
+
+
+def encode_remote_stop() -> bytes:
+    """Stop remote/manual movement."""
+    return encode_remote_control(0.0, 0.0)
 
 
 def encode_set_rr_config(
@@ -545,6 +571,12 @@ def build_initial_query_packets(
         encode_query_map(query_index),
         encode_query_schedules(),
         encode_upload_robot_config(),
+        # Ask for live/status data immediately, not only after 90s
+        encode_query_cleaning_info(),
+        encode_query_net_detail(),
+        encode_query_robot_config(),
+        encode_query_wifi_4g(),
+        encode_query_cleaning_summary(),
     ])
     return packets
 
