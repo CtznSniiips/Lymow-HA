@@ -34,12 +34,11 @@ Control your robot, monitor its status, view zones and map — all from Home Ass
 ## Requirements
 
 - Home Assistant **2024.1** or newer
-- A Lymow account created with **email and password**
+- A Lymow account created with **email and password** or Google login
 - Your robot must be paired to that account via the official Lymow app
 
-> ⚠️ **Google and Apple login are not supported.**  
+> ⚠️ **Apple login is not supported.**  
 > Those accounts use OAuth2 with a mobile deep link (`myapp://callback`) that cannot be replicated in a headless environment.  
-> Please create a dedicated Lymow account with email and password and pair your robot to it.
 
 ---
 
@@ -71,14 +70,19 @@ Or manually:
 
 1. Go to **Settings → Devices & Services → Add Integration**
 2. Search for **Lymow**
-3. Enter your email, password and select the AWS region closest to you:
+3. Choose your login method and region:
 
 | Region | Use if you are in |
-|--------|------------------|
+|--------|-------------------|
 | Europe (Ireland) | Europe |
 | Asia Pacific (Sydney) | Australia, Oceania |
 | Asia Pacific (Hong Kong) | Asia |
 | US East (Ohio) | Americas |
+
+| Login method | Used for | Steps |
+|--------------|--------| ----- |
+| Email & Password | Lymow account used to log into official Lymow app | <ol><li>Enter email address and password used to login to the Lymow app</li></ol> |
+| Google Account (OAuth) | Google login used in official Lymow app | <ol><li>Copy the provided URL and open it in a new browser tab</li> <li>Follow the steps on that page to sign in and get the authorization code, then paste it in the box</li></ol> |
 
 4. If multiple robots are found, select which one to add.
 5. Done — entities will appear under the Lymow device.
