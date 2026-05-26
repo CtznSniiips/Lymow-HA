@@ -118,6 +118,9 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_google(self, user_input: dict | None = None) -> FlowResult:
         """Show the user a link to Google OAuth login."""
+        from homeassistant.components.http import HomeAssistantView
+        self.hass.http.register_view(LymowOAuthStartView)
+        
         if user_input is not None:
             code = user_input.get("code", "").strip()
             import re
