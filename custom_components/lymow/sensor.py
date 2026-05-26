@@ -615,13 +615,9 @@ async def async_setup_entry(
 class LymowZoneHistorySensor(LymowEntity, SensorEntity):
     _attr_icon = "mdi:map-clock"
 
-    @property
-    def name(self) -> str:
-        return f"{self.coordinator.thing_name} Zone history"
-
-    @property
-    def unique_id(self) -> str:
-        return f"{self.coordinator.thing_name}_zone_history"
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "zone_history")
+        self._attr_name = "Zone History"
 
     @property
     def native_value(self):

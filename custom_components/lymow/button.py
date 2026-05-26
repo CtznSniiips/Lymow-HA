@@ -12,6 +12,7 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.exceptions import HomeAssistantError
 
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
@@ -124,17 +125,25 @@ class LymowRemoteButton(LymowEntity, ButtonEntity):
         key: str,
         name: str,
         icon: str,
-        action: Callable[[LymowCoordinator], Awaitable[bool]],
+        action: str,
     ) -> None:
-        super().__init__(coordinator)
+        super().__init__(coordinator, key)
+
         self._key = key
-        self._attr_name = f"{coordinator.thing_name} {name}"
-        self._attr_unique_id = f"{coordinator.thing_name}_{key}"
+        self._attr_name = name
         self._attr_icon = icon
         self._action = action
 
     async def async_press(self) -> None:
-        await self._action(self.coordinator)
+        method = getattr(self.coordinator, self._action, None)
+
+        if method is None:
+            raise HomeAssistantError(f"Remote action not found: {self._action}")
+
+        ok = await method()
+
+        if ok is False:
+            raise HomeAssistantError(f"Remote action failed: {self._action}")
 
 class _LymowButton(LymowEntity, ButtonEntity):
     """Base for all Lymow command buttons."""
