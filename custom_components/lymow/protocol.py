@@ -396,11 +396,19 @@ def encode_query_net_detail() -> bytes:
 
 
 def encode_query_rtk_l1() -> bytes:
-    return encode_userctrl(USER_CTRL_QUERY_RTK_L1)
+    """RTK L1 query — uses version=49 (app 3.0.6) instead of global PB_VERSION."""
+    msg = pb.PbInput()
+    msg.version = 49
+    msg.userCtrl = USER_CTRL_QUERY_RTK_L1
+    return msg.SerializeToString()
 
 
 def encode_query_rtk_l2() -> bytes:
-    return encode_userctrl(USER_CTRL_QUERY_RTK_L2)
+    """RTK L2 query — uses version=49 (app 3.0.6) instead of global PB_VERSION."""
+    msg = pb.PbInput()
+    msg.version = 49
+    msg.userCtrl = USER_CTRL_QUERY_RTK_L2
+    return msg.SerializeToString()
 
 
 def encode_debug_setting(
