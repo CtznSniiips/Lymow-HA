@@ -8,6 +8,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable
 
+from datetime import datetime, timezone
+import re
+
+from homeassistant.util import dt as dt_util
+
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -348,13 +353,26 @@ class LymowScheduleStartButton(_LymowButton):
             return f"Start Schedule {self._schedule_id}"
 
         days = ", ".join(task.get("dayNames") or [])
-        time = task.get("time") or f"{task.get('hour', 0):02d}:{task.get('minute', 0):02d}"
-        zones = task.get("zoneHashIds") or []
+        time = self._local_time_from_task(task)
+
+        zone_names = self._zone_display_names(task)
+        readable_zone_names = [
+            z for z in zone_names
+            if z and not self._is_hash_like(z)
+        ]
+
+        if readable_zone_names:
+            zones_label = ", ".join(readable_zone_names[:3])
+            if len(readable_zone_names) > 3:
+                zones_label += f" +{len(readable_zone_names) - 3}"
+        else:
+            zones = task.get("zoneHashIds") or []
+            zones_label = f"{len(zones)} zones"
 
         if days:
-            return f"Start Schedule {days} {time} ({len(zones)} zones)"
+            return f"Start Schedule {days} {time} ({zones_label})"
 
-        return f"Start Schedule {time} ({len(zones)} zones)"
+        return f"Start Schedule {time} ({zones_label})"
 
     @property
     def available(self) -> bool:
@@ -382,21 +400,156 @@ class LymowScheduleStartButton(_LymowButton):
                 "available": False,
             }
 
+        zone_hash_ids = task.get("zoneHashIds") or []
+        zone_display_names = self._zone_display_names(task)
+
         return {
             "schedule_id": self._schedule_id,
             "enabled": task.get("enabled"),
-            "time": task.get("time"),
-            "hour": task.get("hour"),
-            "minute": task.get("minute"),
+
+            # Original robot schedule time.
+            "time_utc": task.get("time"),
+            "hour_utc": task.get("hour"),
+            "minute_utc": task.get("minute"),
+
+            # Schedule time converted to the Home Assistant timezone.
+            "time_local": self._local_time_from_task(task),
+            "timezone": self.coordinator.hass.config.time_zone,
+
             "days_of_week": task.get("daysOfWeek") or [],
             "day_names": task.get("dayNames") or [],
-            "timezone": task.get("timezone"),
             "is_repeated": task.get("isRepeated"),
             "is_disabled": task.get("isDisabled"),
             "is_angle_offset": task.get("isAngleOffset"),
             "mow_angle": task.get("mowAngle"),
-            "zone_hash_ids": task.get("zoneHashIds") or [],
+
+            "zone_hash_ids": zone_hash_ids,
+            "zone_names": zone_display_names,
             "zones": task.get("zones") or [],
+
             "config": task.get("config") or [],
             "config_count": task.get("config_count"),
         }
+    
+    def _local_time_from_task(self, task: dict[str, Any]) -> str:
+        """Return the schedule time converted from UTC to the Home Assistant timezone."""
+
+        try:
+            hour = int(task.get("hour", 0))
+            minute = int(task.get("minute", 0))
+        except (TypeError, ValueError):
+            return task.get("time") or "00:00"
+
+        # The task only contains hour/minute, not a full date.
+        # Use today's UTC date so Home Assistant can apply the configured
+        # timezone correctly, including the current DST offset.
+        now_utc = dt_util.utcnow()
+        utc_dt = datetime(
+            now_utc.year,
+            now_utc.month,
+            now_utc.day,
+            hour,
+            minute,
+            tzinfo=timezone.utc,
+        )
+
+        local_dt = dt_util.as_local(utc_dt)
+        return local_dt.strftime("%H:%M")
+
+
+    def _is_hash_like(self, value: Any) -> bool:
+        """Return True if the value looks like an internal zone hash id."""
+
+        if not isinstance(value, str):
+            return False
+
+        value = value.strip()
+        if not value:
+            return False
+
+        # Typical zone hashes look like jNHSquRg, Ywl0HqOo, etc.
+        return bool(re.fullmatch(r"[A-Za-z0-9_-]{6,}", value))
+
+
+    def _zone_name_map(self) -> dict[str, str]:
+        """Build a hash_id -> readable zone name map from coordinator data."""
+
+        data = self.coordinator.data or {}
+
+        # Try multiple possible locations because the zone catalog may be stored
+        # in different coordinator keys depending on the integration version.
+        candidates = []
+
+        for key in (
+            "zone_catalog",
+            "zones",
+            "map_zones",
+        ):
+            value = data.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+
+        map_data = data.get("map_data") or {}
+        if isinstance(map_data, dict):
+            for key in (
+                "zone_catalog",
+                "zones",
+                "map_zones",
+            ):
+                value = map_data.get(key)
+                if isinstance(value, list):
+                    candidates.extend(value)
+
+        result: dict[str, str] = {}
+
+        for zone in candidates:
+            if not isinstance(zone, dict):
+                continue
+
+            hash_id = (
+                zone.get("hashId")
+                or zone.get("hash_id")
+                or zone.get("id")
+                or zone.get("zoneHashId")
+            )
+
+            name = (
+                zone.get("name")
+                or zone.get("zoneName")
+                or zone.get("label")
+            )
+
+            if not hash_id or not name:
+                continue
+
+            hash_id = str(hash_id).strip()
+            name = str(name).strip()
+
+            # Only expose the name if it is actually user-friendly.
+            # Ignore names that are empty, equal to the hash id, or look like hashes.
+            if not name or name == hash_id or self._is_hash_like(name):
+                continue
+
+            result[hash_id] = name
+
+        return result
+
+
+    def _zone_display_names(self, task: dict[str, Any]) -> list[str]:
+        """Return readable zone names for a schedule, falling back to hash ids."""
+
+        zone_hash_ids = task.get("zoneHashIds") or []
+        name_map = self._zone_name_map()
+
+        names: list[str] = []
+
+        for zone_hash_id in zone_hash_ids:
+            zone_hash_id = str(zone_hash_id)
+            readable_name = name_map.get(zone_hash_id)
+
+            if readable_name:
+                names.append(readable_name)
+            else:
+                names.append(zone_hash_id)
+
+        return names
