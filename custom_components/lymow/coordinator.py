@@ -47,6 +47,8 @@ from .protocol import (
     USER_CTRL_CLEAN,
     USER_CTRL_DOCK,
     USER_CTRL_FORCE_REINIT,
+    USER_CTRL_OTA,
+    USER_CTRL_ABORT_OTA,
     USER_CTRL_PAUSE,
     USER_CTRL_PAUSE_DOCK,
     USER_CTRL_RECHARGE_DOCK,
@@ -792,6 +794,31 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.auth.ensure_valid(self._email, self._password)
         await self._preflight_query_map()
         ok = self._publish(encode_userctrl(USER_CTRL_FORCE_REINIT))
+        await self._wait_state_update()
+        return ok
+
+    async def async_clear_error(self) -> bool:
+        """Clear/acknowledge a mower error so a task can resume. The Lymow app
+        implements its contextual 'Clear Error' button as a plain Pause
+        (userCtrl=3) — there is no dedicated clear-error opcode (confirmed via
+        app bytecode disassembly)."""
+        await self.auth.ensure_valid(self._email, self._password)
+        ok = self._publish(encode_userctrl(USER_CTRL_PAUSE))
+        await self._wait_state_update()
+        return ok
+
+    async def async_ota_update(self) -> bool:
+        """Trigger a firmware OTA (userCtrl=26). No-op unless the mower has an
+        update available. Mower enters workStatus=11 (Updating) while it runs."""
+        await self.auth.ensure_valid(self._email, self._password)
+        ok = self._publish(encode_userctrl(USER_CTRL_OTA))
+        await self._wait_state_update()
+        return ok
+
+    async def async_abort_ota(self) -> bool:
+        """Abort an in-progress firmware OTA (userCtrl=27)."""
+        await self.auth.ensure_valid(self._email, self._password)
+        ok = self._publish(encode_userctrl(USER_CTRL_ABORT_OTA))
         await self._wait_state_update()
         return ok
 

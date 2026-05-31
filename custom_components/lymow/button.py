@@ -18,14 +18,26 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.const import EntityCategory
 
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    MOWING_STATUSES,
+    WORK_STATUS_EMERGENCY_STOP,
+    WORK_STATUS_ERROR,
+    WORK_STATUS_ESCAPING,
+    WORK_STATUS_PAUSE,
+    WORK_STATUS_UPDATING,
+)
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
 from .protocol import encode_query_map, encode_query_robot_config, encode_query_schedules
 
 _LOGGER = logging.getLogger(__name__)
+
+# Dock (RECHARGE_DOCK) only acts with a live, resumable task to come home to.
+DOCKABLE_STATUSES = MOWING_STATUSES | {WORK_STATUS_PAUSE, WORK_STATUS_ESCAPING}
 
 
 async def async_setup_entry(
@@ -42,6 +54,9 @@ async def async_setup_entry(
             LymowDockButton(coord),
             LymowCancelTaskButton(coord),
             LymowDockCancelButton(coord),
+            LymowClearErrorButton(coord),
+            LymowOtaUpdateButton(coord),
+            LymowAbortOtaButton(coord),
 
             # Remote control buttons
             LymowRemoteButton(
@@ -202,13 +217,26 @@ class LymowResumeButton(_LymowButton):
 
 
 class LymowDockButton(_LymowButton):
-    """Return to dock and keep task progress when possible."""
+    """Return to dock and keep task progress so the mow can resume (RECHARGE_DOCK).
+
+    Only available while there's a live, resumable task — an active mow or a
+    pause mid-mow. From idle the firmware has nothing to resume and ignores the
+    command, so the button is gray then; use "Dock & Cancel" to send it home
+    from any other state."""
 
     _attr_name = "Dock"
     _attr_icon = "mdi:home-import-outline"
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
         super().__init__(coordinator, "btn_dock")
+
+    @property
+    def available(self) -> bool:
+        d = self.coordinator.data or {}
+        return super().available and (
+            d.get("workStatus") in DOCKABLE_STATUSES
+            or d.get("robotStatus") in DOCKABLE_STATUSES
+        )
 
     async def async_press(self) -> None:
         _LOGGER.debug("Lymow Dock button pressed")
@@ -553,3 +581,75 @@ class LymowScheduleStartButton(_LymowButton):
                 names.append(zone_hash_id)
 
         return names
+
+
+class LymowClearErrorButton(_LymowButton):
+    """Clear/acknowledge a mower error so a task can resume. Sends a Pause
+    (userCtrl=3) — exactly what the app's contextual 'Clear Error' button does.
+    Available whenever there's an active error: obstacle errors (E74) set
+    robotStatus=Error + errorCode but leave workStatus unset, so we check all
+    three (the old workStatus-only gate kept the button grayed out during a
+    real error)."""
+
+    _attr_name = "Clear Error"
+    _attr_icon = "mdi:alert-circle-check-outline"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "btn_clear_error")
+
+    @property
+    def available(self) -> bool:
+        d = self.coordinator.data or {}
+        return super().available and (
+            d.get("workStatus") in (WORK_STATUS_ERROR, WORK_STATUS_EMERGENCY_STOP)
+            or d.get("robotStatus") in (WORK_STATUS_ERROR, WORK_STATUS_EMERGENCY_STOP)
+            or bool(d.get("errorCode"))
+        )
+
+    async def async_press(self) -> None:
+        _LOGGER.debug("Lymow Clear Error button pressed")
+        await self.coordinator.async_clear_error()
+
+
+class LymowOtaUpdateButton(_LymowButton):
+    """Trigger a firmware OTA (userCtrl=26). Grayed out unless the mower has an
+    update pending. (The Firmware entity's Install button does the same, but HA
+    only surfaces it when latest > installed.)"""
+
+    _attr_name = "Update Firmware"
+    _attr_icon = "mdi:cellphone-arrow-down"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "btn_ota_update")
+
+    @property
+    def available(self) -> bool:
+        d = self.coordinator.data or {}
+        latest = d.get("latestFw")
+        installed = d.get("softwareVersion")
+        return super().available and bool(latest) and latest != installed
+
+    async def async_press(self) -> None:
+        _LOGGER.debug("Lymow Update Firmware button pressed")
+        await self.coordinator.async_ota_update()
+
+
+class LymowAbortOtaButton(_LymowButton):
+    """Abort an in-progress firmware OTA (userCtrl=27). Available only while the
+    mower is updating (workStatus=11)."""
+
+    _attr_name = "Abort Firmware Update"
+    _attr_icon = "mdi:cancel"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "btn_abort_ota")
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.work_status == WORK_STATUS_UPDATING
+
+    async def async_press(self) -> None:
+        _LOGGER.debug("Lymow Abort Firmware Update button pressed")
+        await self.coordinator.async_abort_ota()
