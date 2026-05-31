@@ -3,11 +3,11 @@ from __future__ import annotations
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfLength
+from homeassistant.const import EntityCategory, PERCENTAGE, UnitOfLength
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, F_CUT_HEIGHT
+from .const import DEFAULT_CHANNEL_BUFFER_M, DOMAIN, F_CUT_HEIGHT
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
 
@@ -21,8 +21,37 @@ async def async_setup_entry(
             LymowBladeHeight(coord),
             LymowRechargeThreshold(coord),
             LymowResumeThreshold(coord),
-        ], 
+            LymowChannelBuffer(coord),
+        ],
         update_before_add=False)
+
+
+class LymowChannelBuffer(LymowEntity, NumberEntity):
+    """How far (metres) outside a channel polygon the mower still counts as being
+    'in' the channel. Lymow's channel polygons are coarse/thin, so a strict
+    inside test misses fast passes; this buffer makes thin corridors reliable
+    triggers for transit automations (gates/doors). Local setting — not sent to
+    the mower. 0 = strict inside only."""
+
+    _attr_name = "Channel Detection Buffer"
+    _attr_icon = "mdi:vector-polyline-plus"
+    _attr_native_min_value = 0.0
+    _attr_native_max_value = 5.0
+    _attr_native_step = 0.25
+    _attr_native_unit_of_measurement = UnitOfLength.METERS
+    _attr_mode = NumberMode.BOX
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "channel_buffer_m")
+
+    @property
+    def native_value(self) -> float | None:
+        val = (self.coordinator.data or {}).get("channel_buffer_m")
+        return float(val) if val is not None else DEFAULT_CHANNEL_BUFFER_M
+
+    async def async_set_native_value(self, value: float) -> None:
+        self.coordinator.set_channel_buffer_m(value)
 
 
 class LymowBladeHeight(LymowEntity, NumberEntity):

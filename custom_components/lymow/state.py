@@ -9,8 +9,10 @@ The coordinator owns the dict. These helpers only mutate/derive it.
 """
 from __future__ import annotations
 
-from math import cos, radians
+from math import cos, hypot, radians
 from typing import Any
+
+from .const import DEFAULT_CHANNEL_BUFFER_M
 
 try:
     from .proto import lymow_pb2 as pb
@@ -19,6 +21,10 @@ except Exception:  # pragma: no cover - allows standalone linting
 
 
 _ACTIVE_TASK_WORK_STATUSES = {2, 8, 9, 14}  # mowing, resume, zone partition, escaping
+# Statuses where the mower is out navigating and we should resolve zone/channel.
+# Adds Docking (4) so it tracks on the way HOME too — it crosses the same
+# corridors returning, which matters for transit automations (e.g. a gate).
+_LOCALIZE_STATUSES = _ACTIVE_TASK_WORK_STATUSES | {4}
 
 
 def _has_msg(msg: Any) -> bool:
@@ -122,12 +128,27 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
     li = getattr(msg, "localizationInfo", None)
     if _has_msg(li):
         state["localizationInfo"] = li
+        for src, dst in [
+            ("numSatellites", "gnssNumSatellites"),
+            ("horizontalAccuracy", "gnssHorizontalAccuracy"),
+            ("verticalAccuracy", "gnssVerticalAccuracy"),
+            ("positionQuality", "gnssPositionQuality"),
+            ("locNodeStatus", "gnssLocNodeStatus"),
+        ]:
+            if _has_field(li, src):
+                state[dst] = getattr(li, src)
 
     bo = getattr(msg, "baseOutput", None)
     if _has_msg(bo):
         state["baseOutput"] = bo
         if _has_field(bo, "cutHeight"):
             state["cutHeight"] = bo.cutHeight
+        twist = getattr(bo, "twist", None)
+        if _has_msg(twist):
+            if _has_field(twist, "linear"):
+                state["twistLinear"] = twist.linear
+            if _has_field(twist, "angular"):
+                state["twistAngular"] = twist.angular
 
     dp = getattr(msg, "deviceInfo", None)
     if _has_msg(dp):
@@ -173,6 +194,9 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
         pose_dict = _msg_to_point_dict(pose)
         if pose_dict:
             state["pose"] = pose_dict
+            if "theta" in pose_dict:
+                from math import degrees
+                state["mowerHeading"] = round((90 - degrees(pose_dict["theta"])) % 360, 1)
 
     lla = getattr(msg, "robotLlaCoords", None)
     if _has_msg(lla):
@@ -220,6 +244,14 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
                 state["rrResumePeriodStart"] = _msg_to_tz_dict(rr.resumePeriodStart)
             if _has_msg(getattr(rr, "resumePeriodEnd", None)):
                 state["rrResumePeriodEnd"] = _msg_to_tz_dict(rr.resumePeriodEnd)
+        rtk_bind = getattr(rc, "rtkBinding", None)
+        if rtk_bind is not None:
+            locid = getattr(rtk_bind, "rtkLocid", "")
+            if locid:
+                state["rtkSn"] = locid
+            pmode = getattr(rtk_bind, "powerMode", "")
+            if pmode:
+                state["rtkPowerMode"] = pmode
 
     wf = getattr(msg, "wifiConfigRes", None)
     if _has_msg(wf):
@@ -237,6 +269,19 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
         ]:
             if _has_field(net, key):
                 state[key] = getattr(net, key)
+
+    # taskConfig: check parent ListFields (not ByteSize) because proto3
+    # zero values (chargingMode=0) produce ByteSize=0 but are still valid.
+    if any(f.name == "taskConfig" for f, _ in msg.ListFields()):
+        tc = msg.taskConfig
+        state["taskConfig"] = tc
+        for src, dst in [
+            ("chargingMode", "chargingMode"),
+            ("zoneOrder", "zoneOrder"),
+            ("rainCleaning", "rainCleaning"),
+            ("disableChargingPark", "disableChargingPark"),
+        ]:
+            state[dst] = getattr(tc, src)
 
     rtk1 = getattr(msg, "rtkDiagnosticL1", None)
     if _has_msg(rtk1):
@@ -369,6 +414,50 @@ def point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) -> 
     return inside
 
 
+_M_PER_DEG_LAT = 111_320.0
+
+
+def _latlon_to_local_m(lon: float, lat: float, lat0: float) -> tuple[float, float]:
+    """Project (lon, lat) degrees to local planar metres about reference lat0.
+    Good enough for the sub-100 m distances we test against channel polygons."""
+    return (
+        lon * _M_PER_DEG_LAT * cos(radians(lat0)),
+        lat * _M_PER_DEG_LAT,
+    )
+
+
+def _point_seg_dist_m(
+    px: float, py: float, ax: float, ay: float, bx: float, by: float
+) -> float:
+    """Distance from point P to segment AB (all in metres)."""
+    dx, dy = bx - ax, by - ay
+    seg2 = dx * dx + dy * dy
+    if seg2 == 0.0:
+        return hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / seg2
+    t = max(0.0, min(1.0, t))
+    return hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _dist_to_polygon_m(mlon: float, mlat: float, poly: list[tuple[float, float]]) -> float:
+    """Min distance (metres) from the mower to a polygon's perimeter. `poly` is
+    [(lon, lat), ...]; the mower is assumed outside (callers test inside first)."""
+    n = len(poly)
+    if n < 2:
+        return float("inf")
+    px, py = _latlon_to_local_m(mlon, mlat, mlat)
+    best = float("inf")
+    for i in range(n):
+        alon, alat = poly[i]
+        blon, blat = poly[(i + 1) % n]
+        ax, ay = _latlon_to_local_m(alon, alat, mlat)
+        bx, by = _latlon_to_local_m(blon, blat, mlat)
+        d = _point_seg_dist_m(px, py, ax, ay, bx, by)
+        if d < best:
+            best = d
+    return best
+
+
 def _zones_from_state(state: dict[str, Any]) -> list[Any]:
     catalog = state.get("zone_catalog")
     zones = getattr(catalog, "zones", None)
@@ -380,19 +469,50 @@ def _zones_from_state(state: dict[str, Any]) -> list[Any]:
     return zones if isinstance(zones, list) else []
 
 
-def derive_current_zone(state: dict[str, Any]) -> str | None:
-    """Derive the zone containing the mower's live local pose."""
-    pose = get_robot_pose(state)
-    if not pose:
-        return None
-    work_status = state.get("workStatus")
-    if work_status not in _ACTIVE_TASK_WORK_STATUSES:
-        return None
+def _localization_active(state: dict[str, Any]) -> bool:
+    """Mower is actively positioned. Check BOTH robotStatus and workStatus: the
+    mower reliably sets robotStatus (=Mowing) but often leaves workStatus unset,
+    which previously made current zone/channel never resolve."""
+    return (
+        state.get("workStatus") in _LOCALIZE_STATUSES
+        or state.get("robotStatus") in _LOCALIZE_STATUSES
+    )
 
-    x = _get_float(pose, "x")
-    y = _get_float(pose, "y")
-    if x is None or y is None:
+
+def _polygon_latlon(pts: list[Any], ebp: Any) -> list[tuple[float, float]]:
+    """Convert ENU-metre polygon points -> [(lon, lat), ...] for WGS84 matching.
+    Handles point dicts {x,y}, (x,y) tuples, or objects with .x/.y. Returns []
+    if any point can't be converted."""
+    out: list[tuple[float, float]] = []
+    for p in pts:
+        if isinstance(p, dict):
+            px, py = p.get("x"), p.get("y")
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            px, py = p[0], p[1]
+        else:
+            px, py = getattr(p, "x", None), getattr(p, "y", None)
+        ll = enu_to_lla(ebp, {"x": px, "y": py})
+        if ll is None:
+            return []
+        out.append((ll[1], ll[0]))  # (lon, lat)
+    return out
+
+
+def derive_current_zone(state: dict[str, Any]) -> str | None:
+    """Zone whose polygon contains the mower's live position.
+
+    Matches in WGS84: the mower's GPS (robot_gps_from_state, which falls back to
+    the RTK lat/lon if pose x/y are absent) vs each zone polygon converted from
+    ENU metres to lat/lon via the map's GPS origin. (The old version matched raw
+    pose x/y and gated on workStatus, which never resolved — wrong field + a
+    coordinate assumption that didn't hold.)"""
+    if not _localization_active(state):
         return None
+    mower = robot_gps_from_state(state)
+    ebp = get_enu_base_point(state)
+    if not mower or ebp is None:
+        return None
+    mlat, mlon = mower
 
     for zone in _zones_from_state(state):
         if isinstance(zone, dict):
@@ -401,13 +521,100 @@ def derive_current_zone(state: dict[str, Any]) -> str | None:
         else:
             pts = getattr(zone, "polygon_points", []) or []
             name = getattr(zone, "name", None) or getattr(zone, "hash_id", None)
+        if not pts or len(pts) < 3:
+            continue
+        poly = _polygon_latlon(pts, ebp)
+        if len(poly) >= 3 and point_in_polygon(mlon, mlat, poly):
+            return name
+    return None
+
+
+def _channels_from_state(state: dict[str, Any]) -> list[Any]:
+    catalog = state.get("zone_catalog")
+    chans = getattr(catalog, "channels", None)
+    if isinstance(chans, list):
+        return chans
+    btmap = state.get("btMap") or {}
+    chans = btmap.get("channels") if isinstance(btmap, dict) else None
+    return chans if isinstance(chans, list) else []
+
+
+def _zone_name_by_hash(state: dict[str, Any]) -> dict[str, str]:
+    """Map zone hashId -> display name, for labelling channels by the zones they link."""
+    out: dict[str, str] = {}
+    for z in _zones_from_state(state):
+        if isinstance(z, dict):
+            h = z.get("hashId"); n = z.get("name") or z.get("zoneRename")
+        else:
+            h = getattr(z, "hash_id", None); n = getattr(z, "name", None)
+        if h:
+            out[h] = n or h
+    return out
+
+
+def derive_current_channel(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Channel whose polygon contains the mower's live pose (active mowing only).
+
+    Returns {label, channel_id, zone1, zone2, is_docking} or None. The label is
+    the human-readable link, e.g. "Front Left Main ↔ Backyard" — useful for
+    automations that fire on a transition corridor (e.g. opening a gate)."""
+    if not _localization_active(state):
+        return None
+    mower = robot_gps_from_state(state)
+    ebp = get_enu_base_point(state)
+    if not mower or ebp is None:
+        return None
+    mlat, mlon = mower
+
+    bm = state.get("channel_buffer_m")
+    buffer_m = float(bm) if bm is not None else DEFAULT_CHANNEL_BUFFER_M
+
+    names = _zone_name_by_hash(state)
+    best: dict[str, Any] | None = None
+    best_dist = float("inf")
+    for ch in _channels_from_state(state):
+        if isinstance(ch, dict):
+            pts = ch.get("points") or []
+            hid = ch.get("hashId"); z1 = ch.get("zone1", ""); z2 = ch.get("zone2", "")
+            dock = ch.get("isDockingChannel")
+        else:
+            pts = getattr(ch, "polygon_points", []) or []
+            hid = getattr(ch, "hash_id", None)
+            z1 = getattr(ch, "zone1", ""); z2 = getattr(ch, "zone2", "")
+            dock = getattr(ch, "is_docking_channel", False)
 
         if not pts or len(pts) < 3:
             continue
-        try:
-            polygon = [(float(px), float(py)) for px, py in pts]
-        except Exception:
+        poly = _polygon_latlon(pts, ebp)
+        if len(poly) < 3:
             continue
-        if point_in_polygon(x, y, polygon):
-            return name
-    return None
+
+        # Inside the polygon = distance 0. Otherwise accept the channel when the
+        # mower is within the buffer of its perimeter (thin/short corridors miss
+        # otherwise). When several channels qualify (junctions), the nearest wins.
+        if point_in_polygon(mlon, mlat, poly):
+            dist = 0.0
+        elif buffer_m > 0.0:
+            dist = _dist_to_polygon_m(mlon, mlat, poly)
+            if dist > buffer_m:
+                continue
+        else:
+            continue
+
+        if dist >= best_dist:
+            continue
+        n1 = names.get(z1, z1) or ""
+        n2 = names.get(z2, z2) or ""
+        if dock:
+            label = f"Dock ↔ {n1 or n2}".strip()
+        elif n1 and n2:
+            label = f"{n1} ↔ {n2}"
+        else:
+            label = f"Channel {hid[:6]}" if hid else "Channel"
+        best_dist = dist
+        best = {
+            "label": label, "channel_id": hid,
+            "zone1": n1, "zone2": n2, "is_docking": bool(dock),
+            "distance_m": round(dist, 2),
+        }
+    return best
