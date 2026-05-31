@@ -92,14 +92,25 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
     if getattr(msg, "version", None):
         state["version"] = msg.version
 
-    # Repeated scalar fields.
+    # Repeated scalar fields. errorCodes/warningCodes are repeated, so proto3
+    # omits them when empty — without an explicit clear they'd stay stuck at the
+    # last error after it resolved. robotInfo is a full status snapshot, so clear
+    # them when a robotInfo frame arrives carrying none (except in the Error (7)
+    # / Emergency-Stop (13) states, where the active error is legitimate).
+    ri = getattr(msg, "robotInfo", None)
+    _ri_present = _has_msg(ri)
+    _ws = getattr(ri, "workStatus", None) if _ri_present else None
     if len(getattr(msg, "errorCodes", [])):
         state["errorCodes"] = list(msg.errorCodes)
         state["errorCode"] = msg.errorCodes[0]
+    elif _ri_present and _ws not in (7, 13):
+        state["errorCodes"] = []
+        state["errorCode"] = 0
     if len(getattr(msg, "warningCodes", [])):
         state["warningCodes"] = list(msg.warningCodes)
+    elif _ri_present:
+        state["warningCodes"] = []
 
-    ri = getattr(msg, "robotInfo", None)
     if _has_msg(ri):
         state["robotInfo"] = ri
         for src, dst in [
@@ -109,13 +120,15 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
             ("lteSignalQuality", "lteSignalQuality"),
             ("btSignalQuality", "btSignalQuality"),
             ("workStatus", "workStatus"),
-            ("isRecharging", "isRecharging"),
-            ("isCharging", "isCharging"),
-            ("wifiWorking", "wifiWorking"),
-            ("lteWorking", "lteWorking"),
         ]:
             if _has_field(ri, src):
                 state[dst] = getattr(ri, src)
+        # proto3 bools are omitted from the wire when false, so the _has_field
+        # gate above would leave them stuck at their last true value (e.g.
+        # Charging never turning off after the mower leaves the dock). robotInfo
+        # is a full status snapshot, so read these directly — false then applies.
+        for b in ("isRecharging", "isCharging", "wifiWorking", "lteWorking"):
+            state[b] = bool(getattr(ri, b, False))
         if "workStatus" in state:
             state["isOnline"] = True
 
