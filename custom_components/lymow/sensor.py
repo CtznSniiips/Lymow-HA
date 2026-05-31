@@ -12,7 +12,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfArea, UnitOfLength, UnitOfTime
+from homeassistant.const import EntityCategory, PERCENTAGE, UnitOfArea, UnitOfLength, UnitOfSpeed, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -41,6 +41,8 @@ from .const import (
     RTSP_PATH,
     RTSP_PORT,
     error_label,
+    warning_label,
+    audio_label,
 )
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
@@ -215,6 +217,42 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         entity_registry_enabled_default=False,
     ),
 
+    # ── Motion ───────────────────────────────────────────────────────────
+    LymowSensorDesc(
+        key="mower_heading",
+        name="Heading",
+        native_unit_of_measurement="°",
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        icon="mdi:compass",
+        value_source="mowerHeading",
+        entity_registry_enabled_default=False,
+    ),
+    # Current Speed (twistLinear) and Turn Rate (twistAngular) are sourced from
+    # baseOutput.twist which the mower does NOT include in its MQTT broadcast.
+    # These fields may only be available via BLE. Re-enable if a future firmware
+    # update adds them to the MQTT stream.
+    #
+    # LymowSensorDesc(
+    #     key="twist_linear",
+    #     name="Current Speed",
+    #     native_unit_of_measurement=UnitOfSpeed.METERS_PER_SECOND,
+    #     device_class=SensorDeviceClass.SPEED,
+    #     state_class=SensorStateClass.MEASUREMENT,
+    #     icon="mdi:speedometer",
+    #     value_source="twistLinear",
+    #     entity_registry_enabled_default=False,
+    # ),
+    # LymowSensorDesc(
+    #     key="twist_angular",
+    #     name="Turn Rate",
+    #     native_unit_of_measurement="rad/s",
+    #     state_class=SensorStateClass.MEASUREMENT,
+    #     icon="mdi:rotate-right",
+    #     value_source="twistAngular",
+    #     entity_registry_enabled_default=False,
+    # ),
+
     # ── Clean session ────────────────────────────────────────────────────
     LymowSensorDesc(
         key="session_area",
@@ -327,6 +365,47 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         entity_registry_enabled_default=False,
     ),
 
+    # ── GNSS / Localization ─────────────────────────────────────────────────
+    LymowSensorDesc(
+        key="gnss_satellites",
+        name="GNSS Satellites",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:satellite-variant",
+        value_source="gnssNumSatellites",
+    ),
+    LymowSensorDesc(
+        key="gnss_horizontal_accuracy",
+        name="GNSS Horizontal Accuracy",
+        native_unit_of_measurement=UnitOfLength.METERS,
+        device_class=SensorDeviceClass.DISTANCE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=3,
+        icon="mdi:crosshairs-gps",
+        value_source="gnssHorizontalAccuracy",
+    ),
+    LymowSensorDesc(
+        key="gnss_vertical_accuracy",
+        name="GNSS Vertical Accuracy",
+        native_unit_of_measurement=UnitOfLength.METERS,
+        device_class=SensorDeviceClass.DISTANCE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=3,
+        icon="mdi:crosshairs-gps",
+        value_source="gnssVerticalAccuracy",
+    ),
+    LymowSensorDesc(
+        key="gnss_position_quality",
+        name="GNSS Position Quality",
+        icon="mdi:signal",
+        value_source="gnssPositionQuality",
+        # Lymow PositionQuality enum (recovered from app 3.0.7 bytecode):
+        # 0=NO_SIGNAL, 1=SINGLE_POINT, 2=FLOAT_FIXED, 3=FIXED. This is NOT the
+        # generic NMEA fix-type table — value 2 is RTK Float, not DGPS.
+        transform=lambda v: {
+            0: "No Signal", 1: "Single Point", 2: "RTK Float", 3: "RTK Fix",
+        }.get(v, f"Unknown ({v})"),
+    ),
+
     # ── GPS / RTK ─────────────────────────────────────────────────────────
     LymowSensorDesc(
         key="rtk_status",
@@ -339,7 +418,9 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         key="rtk_precision",
         name="RTK Precision",
         native_unit_of_measurement=UnitOfLength.METERS,
+        device_class=SensorDeviceClass.DISTANCE,
         state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=3,
         icon="mdi:crosshairs-gps",
         value_source=_rtk("precision"),
         entity_registry_enabled_default=False,
@@ -373,6 +454,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         name="RTK Base Status",
         icon="mdi:access-point",
         value_source=_rtk("baseStationStatus"),
+        transform=lambda v: {0: "Online", 1: "Offline", 2: "Moved", 3: "Invalid"}.get(v, f"Unknown ({v})"),
         entity_registry_enabled_default=False,
     ),
 
@@ -406,6 +488,19 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         ) if _net("currentNet")(d) is not None else None,
         entity_registry_enabled_default=False,
     ),
+    # Bluetooth Signal (btSignalQuality) is extracted from robotInfo but the
+    # mower always reports 0. May only be meaningful via BLE connection.
+    #
+    # LymowSensorDesc(
+    #     key="bt_signal",
+    #     name="Bluetooth Signal",
+    #     native_unit_of_measurement="dBm",
+    #     device_class=SensorDeviceClass.SIGNAL_STRENGTH,
+    #     state_class=SensorStateClass.MEASUREMENT,
+    #     icon="mdi:bluetooth",
+    #     value_source="btSignalQuality",
+    #     entity_registry_enabled_default=False,
+    # ),
     LymowSensorDesc(
         key="wifi_name",
         name="WiFi Network",
@@ -432,6 +527,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         name="Firmware",
         icon="mdi:chip",
         value_source=F_FW_VERSION,   # top-level string ("app2.3.9 bl0.0.1")
+        entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
@@ -439,6 +535,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         name="MCU Version",
         icon="mdi:memory",
         value_source=F_MCU_VERSION,  # top-level string ("v2.1.42_beta")
+        entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
@@ -446,7 +543,59 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         name="Serial Number",
         icon="mdi:identifier",
         value_source=F_SERIAL_NO,
+        entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="rtk_base_serial",
+        name="RTK Base Serial",
+        icon="mdi:radio-tower",
+        value_source="rtkSn",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="wheel_firmware",
+        name="Wheel Motor Firmware",
+        icon="mdi:tire",
+        value_source="wheelVer",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="blade_firmware",
+        name="Blade Motor Firmware",
+        icon="mdi:fan",
+        value_source="knifeVer",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="audio_volume",
+        name="Speaker Volume",
+        icon="mdi:volume-high",
+        value_source="audioVolume",
+        transform=lambda v: {0: "Mute", 30: "Low", 70: "Medium", 100: "High"}.get(v, f"{v}%"),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="warning",
+        name="Warning",
+        icon="mdi:alert-outline",
+        value_source=lambda d: (
+            ", ".join(warning_label(c) for c in d.get("warningCodes", []))
+            if d.get("warningCodes") else "None"
+        ),
+        entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        # Readable "last voice prompt" as text (e.g. "Docking", "Charging
+        # Started") — shows the words in History, unlike the Audio Event entity
+        # whose state is a timestamp. audioId is sticky between frames.
+        key="last_audio",
+        name="Last Audio",
+        icon="mdi:bullhorn-variant",
+        value_source=lambda d: audio_label(d["audioId"]) if d.get("audioId") is not None else None,
     ),
     LymowSensorDesc(
         key="current_zone",
@@ -547,6 +696,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         value_source=lambda d: (d.get("path_data") or {}).get("path_length_m"),
         entity_registry_enabled_default=False,
     ),
+
 )
 
 

@@ -308,6 +308,142 @@ def error_label(code: int) -> str:
 # as a code->label dict. Derived from ERROR_CODES.
 ERROR_CODE_LABELS: dict[int, str] = {code: lbl for code, (_, lbl) in ERROR_CODES.items()}
 
+
+# WarningCode enum — full table recovered from the Lymow app 3.0.7 Hermes bytecode
+# (hermes-dec disassembly). {code: (ENUM_NAME, friendly_label)}.
+WARNING_CODES: dict[int, tuple[str, str]] = {
+    0:  ("WARNING_NONE", "None"),
+    1:  ("WARNING_WHEEL_OVER_CURRENT", "Wheel Over-Current"),
+    2:  ("WARNING_WHEEL_OVER_VOLTAGE", "Wheel Over-Voltage"),
+    3:  ("WARNING_WHEEL_UNDER_VOLTAGE", "Wheel Under-Voltage"),
+    4:  ("WARNING_BAT_CURRENT_ABN", "Battery Current Abnormal"),
+    5:  ("WARNING_FIRST_LIFT_TIMEOUT", "First Lift Timeout"),
+    6:  ("WARNING_SECOND_LIFT_TIMEOUT", "Second Lift Timeout"),
+    7:  ("WARNING_FRONT_ULTRA_LOST", "Front Ultrasonic Lost"),
+    8:  ("WARNING_BACK_ULTRA_LOST", "Rear Ultrasonic Lost"),
+    9:  ("WARNING_SOC_COMM_ABN", "SOC Comm Abnormal"),
+    10: ("WARNING_MCU_THREAD_SCHEDULE_ABN", "MCU Thread Schedule Abnormal"),
+    11: ("WARNING_BLADE_OVER_TEMP", "Blade Over-Temperature"),
+    12: ("WARNING_BLADE_OVER_CURRENT", "Blade Over-Current"),
+    13: ("WARNING_BLADE_COMM_ABN", "Blade Comm Abnormal"),
+    14: ("WARNING_LOC_IGNORE_CMD", "Localization Ignoring Command"),
+    15: ("WARNING_LOC_INIT_FAILED", "Localization Init Failed"),
+    16: ("WARNING_LOC_INVALID_SENSOR_DATA", "Invalid Localization Sensor Data"),
+    17: ("WARNING_LOC_CAMERA_BLOCK", "Localization Camera Blocked"),
+    18: ("WARNING_LOC_CAMERA_DATA_UNSYNC", "Localization Camera Data Unsynced"),
+    19: ("WARNING_LOC_RTK_SIGNAL_BAD", "RTK Signal Poor"),
+    20: ("WARNING_LOC_TEXTURE_WEAK", "Visual Texture Weak"),
+    21: ("WARNING_LOC_VIO_ABN", "Visual Odometry Abnormal"),
+    22: ("WARNING_LOC_EKF_ABN", "EKF Fusion Abnormal"),
+    23: ("WARNING_SEG_LOW_LIGHT", "Segmentation Low Light"),
+    24: ("WARNING_ROBOT_ESCAPING", "Robot Escaping"),
+    25: ("WARNING_MCU_COMM_ABN", "MCU Comm Abnormal"),
+    26: ("WARNING_SENSOR_CAMERA_TEMP_ABN", "Camera Temperature Abnormal"),
+    27: ("WARNING_SENSOR_CAMERA_ABN", "Camera Sensor Abnormal"),
+    28: ("WARNING_SENSOR_IMU0_ABN", "IMU Sensor Abnormal"),
+    29: ("WARNING_SENSOR_GNSS_ABN", "GNSS Sensor Abnormal"),
+    30: ("WARNING_ROBOT_SLIP", "Wheel Slip Detected"),
+    31: ("WARNING_LOC_COMM_ABN", "Localization Comm Abnormal"),
+    32: ("WARNING_BLADE_STUCK", "Blade Stuck"),
+    33: ("WARNING_SEG_COMM_ABN", "Segmentation Comm Abnormal"),
+    34: ("WARING_PP_LATERAL_ERROR_LARGE", "Path Lateral Error Large"),
+    35: ("WARNING_LOC_LOW_LIGHT", "Localization Low Light"),
+    36: ("WARING_PP_EXECUTION", "Path Execution Warning"),
+    37: ("WARNING_ZONE_NOT_CONNECTED", "Zone Not Connected"),
+    38: ("WARNING_ZONE_END_FAR_FROM_START", "Zone End Far From Start"),
+    39: ("WARNING_ZONE_AREA_TOO_SMALL", "Zone Area Too Small"),
+    40: ("WARNING_NO_GO_NOT_IN_ZONE", "No-Go Not Inside Zone"),
+    41: ("WARNING_CHANNEL_START_NOT_IN_ZONE", "Channel Start Not In Zone"),
+    42: ("WARNING_ONLY_ONE_DOCKING_CHANNEL_ALLOWED", "Only One Docking Channel Allowed"),
+    43: ("WARNING_ZONE_EIGHT_PATH", "Zone Figure-Eight Path"),
+    44: ("WARNING_MODIFY_ZONE_FAR_FROM_EDGE", "Modified Zone Far From Edge"),
+    45: ("WARNING_MODIFY_ZONE_START_CLOSE_END", "Modified Zone Start Close To End"),
+    46: ("WARNING_MODIFY_ZONE_CHANGE_CHANNEL_POINT", "Modified Zone Changed Channel Point"),
+    47: ("WARNING_MODIFY_ZONE_INTERNAL_FAIL", "Modified Zone Internal Failure"),
+    48: ("WARNING_CAN_NOT_FIND_OBJECTS", "Cannot Find Objects"),
+    49: ("WARNING_ADD_DOCKING_CHANNEL", "Add Docking Channel"),
+    50: ("WARNING_DOCKING_CHANNEL_UNNECESSARY", "Docking Channel Unnecessary"),
+    51: ("WARNING_LOC_NO_RTK_BASE", "No RTK Base Station"),
+    52: ("WARNING_RTK_BIND_FAIL", "RTK Bind Failed"),
+    53: ("WARNING_BASE_STATION_INVALID", "Base Station Invalid"),
+    54: ("WARNING_LOC_YAW_ABN", "Heading (Yaw) Abnormal"),
+    55: ("WARNING_NOGO_ZONE_ILLEGAL", "No-Go Zone Illegal"),
+    56: ("WARNING_SCHEDULE_MODIFY", "Schedule Modified"),
+    57: ("WARNING_NOT_ENOUGH_INTERSECT", "Not Enough Intersection"),
+    58: ("WARNING_MAP_OPERATE_FAIL", "Map Operation Failed"),
+    59: ("WARNING_DIVIDE_NARROW_PART", "Divide: Narrow Part"),
+    60: ("WARNING_DIVIDE_AREA_SMALL", "Divide: Area Too Small"),
+    61: ("WARNING_CHARGE_STATION_INVALID", "Charge Station Invalid"),
+    62: ("WARNING_ZONE_NOT_OVERLAPPED", "Zone Not Overlapped"),
+    63: ("WARNING_CODE_MAX", "Max"),
+}
+
+
+def warning_label(code: int) -> str:
+    """Friendly label for a warning code; fallback to W<N> for unknown."""
+    entry = WARNING_CODES.get(code)
+    if entry:
+        return entry[1]
+    return f"W{code}"
+
+
+# AudioId enum — the robot's voice-prompt vocabulary (PbOutput.audioId, field 21),
+# recovered from app 3.0.7 bytecode. The mower broadcasts which prompt it's playing,
+# so this surfaces real-world events (slip, blade-stuck, cliff, theft, etc.) that
+# aren't otherwise in telemetry. {code: friendly_label}.
+AUDIO_ID_LABELS: dict[int, str] = {
+    0:  "None",
+    1:  "Power On",
+    2:  "Power Off",
+    3:  "Mowing",
+    4:  "Mowing Paused",
+    5:  "Mowing Resumed",
+    6:  "Docking",
+    7:  "Docking Paused",
+    8:  "Wheel Slip",
+    9:  "Blade Stuck",
+    10: "Battery Low",
+    11: "Initialization Failed",
+    12: "WiFi Connected",
+    13: "WiFi Connect Timeout",
+    14: "WiFi Connect Failed",
+    15: "User Binding Success",
+    16: "User Binding Failed",
+    17: "Firmware Update Start",
+    18: "Firmware Update Success",
+    19: "Firmware Update Failed",
+    20: "Bluetooth Pairing",
+    21: "Factory RTT Mode",
+    22: "Dock Failed",
+    23: "Factory Test Mode",
+    24: "Cliff Detected",
+    25: "Slope Detected",
+    26: "Internal Error",
+    27: "Robot Locked",
+    28: "Charging Started",
+    29: "Rain Resume",
+    30: "Stop Button Pressed",
+    31: "Theft Alarm",
+    32: "Cutting Started",
+    33: "Max",
+}
+
+
+def audio_label(code: int) -> str:
+    """Friendly label for an audio-prompt id; fallback to Audio<N>."""
+    return AUDIO_ID_LABELS.get(code, f"Audio {code}")
+
+
+def audio_event_type(code: int) -> str:
+    """Stable event_type slug for an audio id (e.g. 9 -> 'blade_stuck')."""
+    return audio_label(code).lower().replace(" ", "_")
+
+
+# Event types an audio-prompt EventEntity may fire (excludes None/Max sentinels).
+AUDIO_EVENT_TYPES: list[str] = [
+    audio_event_type(c) for c in AUDIO_ID_LABELS if c not in (0, 33)
+]
+
 # ─────────────────────────────────────────────────────────────
 # Services
 # ─────────────────────────────────────────────────────────────
