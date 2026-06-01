@@ -825,6 +825,31 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.async_update_listeners()
         return True
 
+    async def async_set_charging_mode(self, mode: int) -> bool:
+        """Set return-to-dock route (0=Direct Route, 1=Follow Perimeter)."""
+        from .protocol import encode_set_charging_mode
+        ok = self._publish(encode_set_charging_mode(mode))
+        if ok and self.data is not None:
+            self.data["chargingMode"] = mode
+            self.async_update_listeners()
+        return ok
+
+    async def async_set_audio_volume(self, volume: int) -> bool:
+        """Set speaker volume (0=Mute, 30=Low, 70=Medium, 100=High)."""
+        from .protocol import encode_set_audio_volume
+        ok = self._publish(encode_set_audio_volume(volume))
+        self._publish(encode_query_robot_config())
+        await self._wait_state_update(timeout=3.0)
+        return ok
+
+    async def async_set_dock_on_error(self, enabled: bool) -> bool:
+        """Set whether the mower returns to dock on error."""
+        from .protocol import encode_set_dock_on_error
+        ok = self._publish(encode_set_dock_on_error(enabled))
+        self._publish(encode_query_robot_config())
+        await self._wait_state_update(timeout=3.0)
+        return ok
+
     async def async_set_schedule(self, schedules: list[dict]) -> bool:
         _LOGGER.warning("set_schedule not implemented for MQTT path yet")
         return False

@@ -516,6 +516,32 @@ def encode_remote_stop() -> bytes:
     return encode_remote_control(0.0, 0.0)
 
 
+def encode_set_audio_volume(volume: int) -> bytes:
+    """Set speaker volume. Values: 0=Mute, 30=Low, 70=Medium, 100=High."""
+    msg = pb.PbInput()
+    msg.version = PB_VERSION_4_9
+    msg.robotConfig.audioVolume = int(volume)
+    msg.debugSetting.uploadRobotConfig = True
+    return msg.SerializeToString()
+
+
+def encode_set_charging_mode(mode: int) -> bytes:
+    """Set return-to-dock route. 0=Direct Route, 1=Follow Perimeter."""
+    msg = _new_input()
+    msg.userCtrl = 36  # USER_CTRL_SET_TASK_CONFIG
+    msg.taskConfig.chargingMode = int(mode)
+    return msg.SerializeToString()
+
+
+def encode_set_dock_on_error(enabled: bool) -> bytes:
+    """Set whether the mower returns to dock on error."""
+    msg = pb.PbInput()
+    msg.version = PB_VERSION_4_9
+    msg.robotConfig.dockOnError = bool(enabled)
+    msg.debugSetting.uploadRobotConfig = True
+    return msg.SerializeToString()
+
+
 def encode_set_rr_config(
     *,
     enable_rr: bool,

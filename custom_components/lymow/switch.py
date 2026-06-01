@@ -175,7 +175,7 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowSwitch(coord, desc) for desc in SWITCHES] + [LymowHeadlightsSwitch(coord)],
+        [LymowSwitch(coord, desc) for desc in SWITCHES] + [LymowHeadlightsSwitch(coord), LymowDockOnErrorSwitch(coord)],
         update_before_add=False,
     )
 
@@ -259,3 +259,24 @@ class LymowHeadlightsSwitch(LymowEntity, SwitchEntity):
                 "4": "off",
             },
         }
+
+
+class LymowDockOnErrorSwitch(LymowEntity, SwitchEntity):
+    """Switch to control whether mower returns to dock on error."""
+
+    _attr_name = "Dock On Error"
+    _attr_icon = "mdi:home-alert"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "dock_on_error_switch")
+
+    @property
+    def is_on(self) -> bool | None:
+        val = (self.coordinator.data or {}).get("dockOnError")
+        return bool(val) if val is not None else None
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self.coordinator.async_set_dock_on_error(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self.coordinator.async_set_dock_on_error(False)
