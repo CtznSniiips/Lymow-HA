@@ -758,9 +758,39 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowSensor(coord, desc) for desc in SENSORS] + [LymowMapGeoJsonSensor(coord)] + [LymowZoneHistorySensor(coord)],
+        [LymowSensor(coord, desc) for desc in SENSORS] + [LymowMapGeoJsonSensor(coord)] + [LymowZoneHistorySensor(coord)] + [LymowCurrentChannelSensor(coord)],
         update_before_add=False,
     )
+
+
+class LymowCurrentChannelSensor(LymowEntity, SensorEntity):
+    """Live channel the mower is transiting — point-in-polygon of its pose against
+    each channel polygon (active mowing only). State = readable link label
+    (e.g. "Front Left Main ↔ Backyard"); attributes carry the stable channel_id
+    and linked zones for automations (e.g. open a gate on a front↔back transit)."""
+
+    _attr_icon = "mdi:transit-connection-variant"
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "current_channel")
+        self._attr_name = "Current Channel"
+
+    @property
+    def native_value(self):
+        return (self.coordinator.data or {}).get("currentChannel")
+
+    @property
+    def extra_state_attributes(self):
+        info = (self.coordinator.data or {}).get("currentChannelInfo") or {}
+        return {
+            "channel_id": info.get("channel_id"),
+            "zone_1": info.get("zone1"),
+            "zone_2": info.get("zone2"),
+            "is_docking_channel": info.get("is_docking"),
+            "distance_m": info.get("distance_m"),
+        }
+
 
 class LymowZoneHistorySensor(LymowEntity, SensorEntity):
     _attr_icon = "mdi:map-clock"
@@ -782,6 +812,12 @@ class LymowZoneHistorySensor(LymowEntity, SensorEntity):
         return {
             "zones": history,
             "zone_count": len(history),
+            # Lymow cloud telemetry only reports a single session-level clean
+            # summary (area/time/percent) plus the list of zones in the task. It
+            # does NOT break those stats down per zone, so any duration/area/percent
+            # shown per zone is the SESSION total covering all zones, not that zone
+            # alone. This flag documents that limitation for dashboards/automations.
+            "per_zone_stats_available": False,
         }
 
 

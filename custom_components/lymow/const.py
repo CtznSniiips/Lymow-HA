@@ -481,3 +481,11 @@ F_SERIAL_NO  = "sn"            # str  robot serial number (inside fwVersion)
 
 RTSP_PORT = 10022
 RTSP_PATH = "h264ESVideoTest"
+
+# Current-channel detection buffer (metres). Lymow's channel polygons are coarse
+# and thin (3-11 points, some pinched to a triangle), so a strict point-in-
+# polygon test misses the mower on fast/straight passes. Treat the mower as "in"
+# a channel when it is inside OR within this distance of the polygon, so thin
+# corridors are reliable triggers for transit automations (gates/doors). User-
+# tunable via the Channel Detection Buffer number; 0 = strict inside only.
+DEFAULT_CHANNEL_BUFFER_M = 0.75

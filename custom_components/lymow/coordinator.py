@@ -38,6 +38,8 @@ from .api import CognitoAuth, LymowClient, LymowError
 from .const import (
     DOMAIN,
     F_DEVICE_STATE,
+    WORK_STATUS_CHARGING,
+    WORK_STATUS_CHARGING_FULL,
     WORK_STATUS_DOCKING,
     WORK_STATUS_OFFLINE,
     WORK_STATUS_PAUSE_DOCKING,
@@ -74,7 +76,15 @@ from .protocol import (
     encode_remote_control,
     encode_remote_stop,
 )
-from .state import _ACTIVE_TASK_WORK_STATUSES, derive_current_zone, merge_pboutput, robot_gps_from_state
+from .state import (
+    _ACTIVE_TASK_WORK_STATUSES,
+    _localization_active,
+    derive_current_zone,
+    derive_current_channel,
+    get_enu_base_point,
+    merge_pboutput,
+    robot_gps_from_state,
+)
 from .state_matrix import lookup as lookup_state_row
 
 _LOGGER = logging.getLogger(__name__)
@@ -97,6 +107,8 @@ _REMOTE_PULSE_SECONDS = 0.35
 class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Push-only coordinator for a single Lymow robot."""
 
+    _STICKY_KEYS = ("rtkSn", "wheelVer", "knifeVer", "rtkPowerMode")
+
     def __init__(
         self,
         hass: HomeAssistant,
@@ -106,6 +118,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         region: str,
         email: str,
         password: str,
+        config_entry: Any = None,
     ) -> None:
         super().__init__(
             hass,
@@ -120,9 +133,14 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._email     = email
         self._password  = password
         self._client_uuid = str(uuid.uuid4())
+        self._config_entry = config_entry
 
         self._state: dict[str, Any] = {}
         self.device_info_data: dict = {}
+
+        # Restore sticky device info from config entry (survives restarts)
+        if config_entry and config_entry.data.get("sticky_device_info"):
+            self._state.update(config_entry.data["sticky_device_info"])
         self.history: list[dict]    = []
 
         self._rest_online: bool    = False
@@ -226,20 +244,54 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Publish all startup queries. Also called after reconnect."""
         for raw in build_initial_query_packets(client_uuid=self._client_uuid):
             self._publish(raw)
-        
+
         self.hass.async_create_task(self._delayed_query_schedules(3))
         # Robot only responds to robotConfig query after being online for a few seconds
         self.hass.async_create_task(self._delayed_robot_config(4))
+        # The startup map query is sometimes dropped; retry until the map loads.
+        self.hass.async_create_task(self._delayed_map_query(5))
 
     def _fire_refresh_queries(self) -> None:
         """Periodic refresh — keeps IP, signal, RTK and config up to date."""
         for raw in build_refresh_query_packets(client_uuid=self._client_uuid):
             self._publish(raw)
+        # Self-heal the map: it can get lost mid-session (catalog emptied or GPS
+        # origin dropped), which makes current zone/channel impossible. The
+        # startup retry returns once loaded and won't catch a mid-mow loss, so
+        # re-request the map here whenever it's incomplete.
+        cat = self._state.get("zone_catalog")
+        has_map = (
+            cat is not None
+            and (getattr(cat, "channels", None) or getattr(cat, "zones", None))
+            and get_enu_base_point(self._state) is not None
+        )
+        if not has_map:
+            self._publish(encode_query_map())
     
     async def _delayed_robot_config(self, delay: int) -> None:
-        """Send robot config query with delay — mirrors app behavior (1s + 5s)."""
-        await asyncio.sleep(delay)
-        self._publish(encode_query_robot_config())
+        """Query robotConfig on startup, retrying with backoff until it lands.
+
+        The robot only answers a robotConfig query after it's been online for a
+        few seconds, so a single early query can be silently dropped — leaving
+        Speaker Volume / recharge config "unknown" until a manual set or the next
+        30s refresh. Retry until audioVolume populates (or attempts run out)."""
+        for wait in (delay, 6, 10, 20):
+            await asyncio.sleep(wait)
+            if self._state.get("audioVolume") is not None:
+                return
+            self._publish(encode_query_robot_config())
+
+    async def _delayed_map_query(self, delay: int) -> None:
+        """Retry the map query until the zone map loads. The startup query_map is
+        sometimes dropped (like robotConfig) and the 30s refresh never re-requests
+        it, leaving zone_catalog empty — which makes current zone/channel
+        (point-in-polygon vs the map) impossible until a manual Refresh Map."""
+        for wait in (delay, 8, 15, 30):
+            await asyncio.sleep(wait)
+            cat = self._state.get("zone_catalog")
+            if cat is not None and (getattr(cat, "channels", None) or getattr(cat, "zones", None)):
+                return
+            self._publish(encode_query_map())
     
     async def _delayed_query_schedules(self, delay: int) -> None:
         """Send robot schedules query with delay — mirrors app behavior (1s + 5s)."""
@@ -344,14 +396,38 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._state.setdefault("latitude", gps[0])
             self._state.setdefault("longitude", gps[1])
 
-        work_status = self._state.get("workStatus")
-        zone = derive_current_zone(self._state)
-
-        if work_status in _ACTIVE_TASK_WORK_STATUSES:
-            if zone:
+        # Current zone vs channel are mutually exclusive: the mower is in exactly
+        # one at a time, so the OTHER reads "Clear". Channel wins when both match
+        # (the transit corridor is the signal automations want). This gives clean
+        # edges — e.g. channel Clear -> "Front Left Main <-> Backyard" = entered
+        # the corridor (open a gate); back to Clear = left it.
+        # Sticky: on a partial frame (no position/map) keep the last reading
+        # rather than flickering to unknown. None when not mowing (parked).
+        _docked = (
+            self._state.get("robotStatus") in (WORK_STATUS_CHARGING, WORK_STATUS_CHARGING_FULL)
+            or self._state.get("workStatus") in (WORK_STATUS_CHARGING, WORK_STATUS_CHARGING_FULL)
+            or bool(self._state.get("isCharging"))
+        )
+        if _docked:
+            # Parked on the dock — give the sensors a meaningful state instead of unknown.
+            self._state["currentZone"] = "Docked"
+            self._state["currentChannel"] = "None"
+            self._state["currentChannelInfo"] = None
+        elif _localization_active(self._state) and robot_gps_from_state(self._state) and get_enu_base_point(self._state):
+            channel = derive_current_channel(self._state)
+            zone = derive_current_zone(self._state)
+            if channel:
+                self._state["currentChannel"] = channel.get("label")
+                self._state["currentChannelInfo"] = channel
+                self._state["currentZone"] = "Clear"
+            elif zone:
                 self._state["currentZone"] = zone
-        else:
-            self._state["currentZone"] = None
+                self._state["currentChannel"] = "Clear"
+                self._state["currentChannelInfo"] = None
+            # else: in neither right now (gap between polygons) — keep previous
+        # else: paused / error / idle / partial frame — keep previous (sticky).
+        # Docking (returning) IS localization-active, so it re-derives above even
+        # after a cleanReport reset currentZone=None on task cancel.
 
 
         # Flatten runTimeConfig from btMap to top-level (blade height sensor)
@@ -401,10 +477,22 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if getattr(msg.btMap, "queryMap", False):
                     catalog = parse_zone_catalog(msg.btMap)
 
-                    # Sticky catalog: update only when the packet actually carries
-                    # zones. QUERY_PATH / small btMap packets must not wipe a good
-                    # catalog previously loaded from QUERY_MAP or S3.
-                    if catalog.zones:
+                    # Persistent map: once we hold a COMPLETE catalog (zones +
+                    # channels + GPS origin), never replace it with a less-complete
+                    # packet. A partial query_map response (zones but missing
+                    # channels/origin) was silently clobbering the good map
+                    # mid-mow, killing current zone/channel. Only a complete update
+                    # (or the Refresh Map button forcing a fresh query) replaces it.
+                    existing = self._state.get("zone_catalog")
+                    existing_complete = bool(
+                        existing and getattr(existing, "zones", None)
+                        and getattr(existing, "channels", None)
+                        and getattr(existing, "enu_base_point", None)
+                    )
+                    new_complete = bool(
+                        catalog.zones and catalog.channels and catalog.enu_base_point
+                    )
+                    if catalog.zones and (new_complete or not existing_complete):
                         self._state["zone_catalog"] = catalog
                         self._state["btMap"] = catalog.to_btmap_dict()
                         self._state["backupMapDownloadError"] = None
@@ -494,8 +582,12 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 report_ts = int(report.cleanStartTime or 0)
 
                 if report_ts and self._state.get("lastCleanReportTs") != report_ts:
-                    # Reset stale current zone after job completion
-                    self._state["currentZone"] = None
+                    # NOTE: do NOT reset currentZone here. A cleanReport fires when
+                    # a task ends — including Cancel Task, which stops the mower in
+                    # place. Zeroing the zone then showed a misleading "unknown"
+                    # while the mower was physically still sitting in that zone.
+                    # The sticky/Docked/derive model already reports the right
+                    # state (last zone when stopped, re-derived on the return).
                     end_labels = {
                         0: "unknown",
                         1: "completed",
@@ -525,6 +617,22 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                     zone_history = self._state.setdefault("zone_history", {})
 
+                    # NOTE: The Lymow cloud telemetry does NOT provide a per-zone
+                    # breakdown of area/time/percent. PbCleanReport.cleanInfo carries
+                    # a single SESSION-LEVEL summary (cleanTime/cleanArea/cleanPercent),
+                    # and PbAreaInfo only lists which zone IDs were part of the task
+                    # (cleanZoneIds) plus an areaOrGlobal flag. There is no message in
+                    # the proto that attributes area/time/percent to an individual zone.
+                    #
+                    # Previously this loop copied the whole-session totals onto EVERY
+                    # zone, which made each zone falsely report the entire session's
+                    # 141m2 / 73s / 30%. That was fabricated per-zone data. We now only
+                    # record what is actually true per zone (that it participated in
+                    # this session, when it ran, and how the session ended) and keep the
+                    # session totals in a clearly session-scoped block — NOT divided
+                    # across zones.
+                    num_zones = len(event_data["zones"])
+
                     for zone_id in event_data["zones"]:
                         zone_name = self._zone_name_by_id(str(zone_id))
 
@@ -533,11 +641,17 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             "zone_name": zone_name or str(zone_id),
                             "last_mowed_at": event_data["start_time"],
                             "last_clean_start_time": report.cleanStartTime,
-                            "last_duration_s": event_data["duration_s"],
-                            "last_area_m2": event_data["area_m2"],
-                            "last_clean_percent": event_data["clean_percent"],
                             "last_end_type": event_data["end_type"],
                             "last_session_event_id": report_ts,
+                            # The cloud reports these only at the session level; they
+                            # cover ALL zones in the session combined, not this zone
+                            # alone. Surfaced here for reference but explicitly flagged
+                            # as session-wide so consumers do not treat them as per-zone.
+                            "session_total_duration_s": event_data["duration_s"],
+                            "session_total_area_m2": event_data["area_m2"],
+                            "session_clean_percent": event_data["clean_percent"],
+                            "session_zone_count": num_zones,
+                            "per_zone_stats_available": False,
                         }
 
                     self._state["lastCleanReport"] = report
@@ -568,6 +682,19 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._state_event.set()
         self.async_set_updated_data(self._state)
+        self._persist_sticky_values()
+
+    def _persist_sticky_values(self) -> None:
+        """Save one-shot device info to config entry so it survives restarts."""
+        if not self._config_entry:
+            return
+        sticky = {k: self._state[k] for k in self._STICKY_KEYS if self._state.get(k)}
+        existing = self._config_entry.data.get("sticky_device_info", {})
+        if sticky and sticky != existing:
+            self.hass.config_entries.async_update_entry(
+                self._config_entry,
+                data={**self._config_entry.data, "sticky_device_info": sticky},
+            )
 
     def _handle_notify_app(self, payload: dict) -> None:
         rs = payload.get("robotState")
@@ -658,6 +785,9 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ("sn", "sn"),
                     ("macAddress", "macAddress"),
                     ("simId", "simId"),
+                    ("rtkSn", "rtkSn"),
+                    ("wheelVer", "wheelVer"),
+                    ("knifeVer", "knifeVer"),
                     ("mcuVersion", "fwVersion"),
                     ("mcuVersion", "appFwVersion"),
                     ("softwareVersion", "mcuVersion"),
@@ -673,6 +803,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     rest_state["longitude"] = loc[1]
 
                 self._merge_state(rest_state)
+
 
                 # Lightweight feature data: theft/find settings, notification switches.
                 try:
@@ -1000,6 +1131,15 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Set battery percentage where mower should resume mowing."""
         value = max(1, min(100, int(value)))
         return await self._send_rr_update(resume_bat=value)
+
+    @callback
+    def set_channel_buffer_m(self, value: float) -> None:
+        """Local-only setting: how far (metres) outside a channel polygon the
+        mower still counts as 'in' the channel. Not sent to the device — only
+        affects current-channel derivation. Pushes an update so the next derive
+        and the number entity both see it."""
+        self._state["channel_buffer_m"] = max(0.0, float(value))
+        self.async_set_updated_data(self._state)
 
 
     async def cmd_set_resume_threshold(self, value: int) -> bool:

@@ -127,6 +127,9 @@ class LymowMapCamera(LymowEntity, Camera):
         zones = btmap.get("zones") or []
         nogo_zones = btmap.get("nogoZones") or []
         channels = btmap.get("channels") or []
+        _zname = {
+            z.get("hashId"): z.get("name") for z in zones if isinstance(z, dict)
+        }
 
         return {
             "render_mode": "diagnostic_png",
@@ -142,6 +145,16 @@ class LymowMapCamera(LymowEntity, Camera):
             ),
             "first_zone_points_count": len(zones[0].get("points") or []) if zones else 0,
             "channel_count": len(channels),
+            "channels_detail": [
+                {
+                    "from": _zname.get(c.get("zone1")) or c.get("zone1"),
+                    "to": _zname.get(c.get("zone2")) or c.get("zone2"),
+                    "points": c.get("points_count", len(c.get("points") or [])),
+                    "docking": bool(c.get("isDockingChannel")),
+                }
+                for c in channels
+                if isinstance(c, dict)
+            ],
             "nogo_zone_count": len(nogo_zones),
             "nogo_zones_with_points": sum(
                 1 for z in nogo_zones
