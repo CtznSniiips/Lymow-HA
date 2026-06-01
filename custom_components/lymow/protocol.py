@@ -571,25 +571,28 @@ def encode_set_rr_config(
     msg.debugSetting.uploadRobotConfig = True
     return msg.SerializeToString()
 
+# SocSignal — real-time commands carried on PbRobotConfig.signal (field 8).
+SIGNAL_TURN_ON_CAMERA_LIGHT  = 6
+SIGNAL_TURN_OFF_CAMERA_LIGHT = 7
+
+
 def encode_set_headlights(enabled: bool) -> bytes:
-    """Turn mower headlights / camera LED on or off.
+    """Turn the headlight (camera LED) on or off.
 
-    Command field:
-      PbInput.robotConfig.isOpenLed = true/false
+    Matches the app's RobotCommands.switchCameraLed(): a real-time SocSignal on
+    PbRobotConfig.signal (field 8) — SIGNAL_TURN_ON_CAMERA_LIGHT (6) /
+    SIGNAL_TURN_OFF_CAMERA_LIGHT (7) — with an otherwise-empty robotConfig.
 
-    The robot does not return isOpenLed as state. The real state is read from
-    PbRobotConfig.camLedStatus:
-      3 = on
-      4 = off
+    NOTE: the old code set isOpenLed (field 7), which this firmware IGNORES —
+    confirmed via app bytecode. State reads back from camLedStatus (3=on, 4=off).
+    Only effective while the mower is awake/IoT-connected; the firmware auto-offs
+    the camera LED on dock/charge regardless.
     """
     msg = pb.PbInput()
     msg.version = PB_VERSION_4_9
-
-    msg.robotConfig.isOpenLed = bool(enabled)
-
-    # Ask the robot to send back updated robotConfig
-    msg.debugSetting.uploadRobotConfig = True
-
+    msg.robotConfig.signal = (
+        SIGNAL_TURN_ON_CAMERA_LIGHT if enabled else SIGNAL_TURN_OFF_CAMERA_LIGHT
+    )
     return msg.SerializeToString()
 
 
