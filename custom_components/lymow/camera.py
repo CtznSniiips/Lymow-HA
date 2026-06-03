@@ -166,22 +166,46 @@ class LymowMapCamera(LymowEntity, Camera):
 
 # ── RTSP live camera ─────────────────────────────────────────────────────────
 
-class LymowRTSPCamera(LymowEntity, Camera):
-    """Live camera via RTSP → HLS transcoding by HA's stream component.
+import asyncio
+import contextlib
+import os
+import shutil
+import socket
+import tempfile
+import threading
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 
-    Once the robot IP is known, the camera card in Lovelace will display
-    a live video feed without any extra configuration.  The `stream`
-    integration (enabled by default in HA) handles the RTSP→HLS leg.
+
+def _find_free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+class LymowRTSPCamera(LymowEntity, Camera):
+    """Live camera via FFmpeg HLS proxy → HA stream component.
+
+    FFmpeg connects to the mower's RTSP stream with generous probe/analyze
+    time (so it waits for the first IDR/SPS/PPS frame), transcodes to HLS
+    segments served by a local HTTP server, and HA's stream component picks
+    up the playlist.  This works around HA's hard-coded libav probe timeout
+    which is too short for the mower's LIVE555 server.
     """
 
     _attr_name = "Live Camera"
     _attr_icon = "mdi:cctv"
-    _attr_content_type = "image/png"
     _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
         LymowEntity.__init__(self, coordinator, "rtsp_camera")
         Camera.__init__(self)
+        self.stream_options = {"rtsp_transport": "tcp"}
+        self._proxy_process: asyncio.subprocess.Process | None = None
+        self._http_server: HTTPServer | None = None
+        self._http_thread: threading.Thread | None = None
+        self._hls_port: int | None = None
+        self._hls_dir: str | None = None
+        self._proxy_source_ip: str | None = None  # IP used when proxy was started
 
     @property
     def available(self) -> bool:
@@ -191,19 +215,126 @@ class LymowRTSPCamera(LymowEntity, Camera):
         ip = _get_robot_ip(self.coordinator.data or {})
         return f"rtsp://{ip}:{RTSP_PORT}/{RTSP_PATH}" if ip else None
 
+    # ── lifecycle ────────────────────────────────────────────────
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        # Start proxy now if IP is already known; otherwise the coordinator
+        # listener below will start it when data first arrives.
+        if self._rtsp_url():
+            await self._start_hls_proxy()
+        # Listen for coordinator updates so we can (re)start when IP appears
+        self.async_on_remove(
+            self.coordinator.async_add_listener(self._async_on_coordinator_update)
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        await self._stop_hls_proxy()
+
+    def _async_on_coordinator_update(self) -> None:
+        """Restart proxy if the robot IP changed or proxy isn't running yet."""
+        current_ip = _get_robot_ip(self.coordinator.data or {})
+        if not current_ip:
+            return
+        if self._proxy_process is None or current_ip != self._proxy_source_ip:
+            self.hass.async_create_task(self._restart_hls_proxy())
+
+    async def _restart_hls_proxy(self) -> None:
+        await self._stop_hls_proxy()
+        await self._start_hls_proxy()
+
+    # ── proxy management ─────────────────────────────────────────
+
+    async def _start_hls_proxy(self) -> None:
+        url = self._rtsp_url()
+        if not url:
+            _LOGGER.debug("Lymow camera: no robot IP, skipping HLS proxy start")
+            return
+
+        self._hls_dir = tempfile.mkdtemp(prefix="lymow_hls_")
+        self._hls_port = _find_free_port()
+        self._proxy_source_ip = _get_robot_ip(self.coordinator.data or {})
+
+        # Tiny HTTP server that serves HLS segments from the temp dir
+        hls_dir = self._hls_dir
+
+        class _QuietHandler(SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=hls_dir, **kwargs)
+
+            def log_message(self, format, *args):  # noqa: A002
+                pass  # suppress per-request noise in HA logs
+
+        self._http_server = HTTPServer(("127.0.0.1", self._hls_port), _QuietHandler)
+        self._http_thread = threading.Thread(
+            target=self._http_server.serve_forever, daemon=True, name="lymow_hls_http"
+        )
+        self._http_thread.start()
+        _LOGGER.debug("Lymow HLS HTTP server started on port %s", self._hls_port)
+
+        # FFmpeg: RTSP in (TCP, generous probe) → HLS out
+        self._proxy_process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-loglevel", "warning",
+            "-rtsp_transport", "tcp",
+            "-analyzeduration", "3000000",   # 3 s — waits for first IDR frame
+            "-probesize", "5000000",
+            "-i", url,
+            "-c:v", "copy",                  # no re-encode; just remux
+            "-f", "hls",
+            "-hls_time", "1",                # 1-second segments → low latency
+            "-hls_list_size", "3",           # rolling 3-segment window
+            "-hls_flags", "delete_segments+append_list",
+            "-hls_segment_filename", os.path.join(self._hls_dir, "seg%03d.ts"),
+            os.path.join(self._hls_dir, "stream.m3u8"),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        _LOGGER.debug(
+            "Lymow FFmpeg HLS proxy started (pid=%s) → %s",
+            self._proxy_process.pid,
+            url,
+        )
+
+    async def _stop_hls_proxy(self) -> None:
+        if self._proxy_process:
+            with contextlib.suppress(ProcessLookupError):
+                self._proxy_process.terminate()
+                await self._proxy_process.wait()
+            self._proxy_process = None
+
+        if self._http_server:
+            self._http_server.shutdown()
+            self._http_server = None
+            self._http_thread = None
+
+        if self._hls_dir and os.path.isdir(self._hls_dir):
+            shutil.rmtree(self._hls_dir, ignore_errors=True)
+            self._hls_dir = None
+
+        self._hls_port = None
+        self._proxy_source_ip = None
+        _LOGGER.debug("Lymow HLS proxy stopped")
+
+    # ── camera interface ─────────────────────────────────────────
+
     async def stream_source(self) -> str | None:
-        """Return the RTSP URL consumed by HA's stream component."""
+        """HLS playlist served by local proxy, or raw RTSP as fallback."""
+        if self._hls_port and self._hls_dir:
+            return f"http://127.0.0.1:{self._hls_port}/stream.m3u8"
         return self._rtsp_url()
 
     @property
     def extra_state_attributes(self) -> dict:
         url = self._rtsp_url()
-        return {"rtsp_url": url} if url else {}
+        attrs: dict = {"rtsp_url": url} if url else {}
+        if self._hls_port:
+            attrs["hls_proxy_url"] = f"http://127.0.0.1:{self._hls_port}/stream.m3u8"
+        return attrs
 
     def camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        # Fallback still image shown before the stream is available.
         return text_png("Lymow Live Camera", self._rtsp_url() or "Waiting for robot IP…")
 
     async def async_camera_image(
