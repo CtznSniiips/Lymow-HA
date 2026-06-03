@@ -206,22 +206,24 @@ service: lymow.cancel_task
 
 ## Session history automations
 
-The `event.lymow_session_completed` entity fires whenever a new completed session is detected. Use it to send a notification when mowing finishes:
+The `event.lymow_<<mowername>>_last_session` entity fires whenever a new completed session is detected. Use it to send a notification when mowing finishes:
 
 ```yaml
 automation:
   trigger:
     platform: state
-    entity_id: event.lymow_session_completed
+    entity_id: event.lymow_<<mowername>>_last_session
   action:
     service: notify.mobile_app
     data:
       title: "Mowing complete"
       message: >
-        Mowed {{ state_attr('event.lymow_session_completed', 'area_m2') }} m²
-        in {{ (state_attr('event.lymow_session_completed', 'duration_s') / 60) | round }} min.
-        Used {{ state_attr('event.lymow_session_completed', 'used_battery') }}% battery.
+        Mowed {{ state_attr('event.lymow_<<mowername>>_last_session', 'area_m2') }} m²
+        in {{ (state_attr('event.lymow_<<mowername>>_last_session', 'duration_s') / 60) | round }} min.
+        Used {{ state_attr('event.lymow_<<mowername>>_last_session', 'used_battery') }}% battery.
 ```
+
+> Replace `<<mowername>>` with your own enitity mower name.
 
 ---
 
