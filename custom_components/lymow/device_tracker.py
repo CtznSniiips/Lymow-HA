@@ -19,7 +19,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from .const import DOMAIN
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
-from .state import get_enu_base_point, robot_gps_from_state
+from .state import get_enu_base_point, get_robot_pose, robot_gps_from_state
 
 
 def _read_float(obj, key: str) -> float | None:
@@ -93,6 +93,17 @@ class LymowMowerTracker(_LymowTrackerBase):
     def _coords(self) -> tuple[float, float] | None:
         return robot_gps_from_state(self.coordinator.data or {})
 
+    def _heading(self) -> float | None:
+        pose = get_robot_pose(self.coordinator.data or {})
+        if pose is None:
+            return None
+
+        heading = _read_float(pose, "heading")
+        if heading is not None:
+            return heading
+
+        return _read_float(pose, "theta")
+
     @property
     def latitude(self) -> float | None:
         live = self._coords()
@@ -106,6 +117,12 @@ class LymowMowerTracker(_LymowTrackerBase):
         if live is not None:
             return live[1]
         return self._restored_lon
+
+    @property
+    def extra_state_attributes(self) -> dict[str, float]:
+        if (heading := self._heading()) is None:
+            return {}
+        return {"heading": heading}
 
 
 async def async_setup_entry(
