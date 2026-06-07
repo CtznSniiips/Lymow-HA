@@ -10,7 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import AUDIO_EVENT_TYPES, DOMAIN, audio_event_type, audio_label
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
 
@@ -23,7 +23,44 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([LymowSessionEvent(coord)], update_before_add=False)
+    async_add_entities(
+        [LymowSessionEvent(coord), LymowAudioEvent(coord)],
+        update_before_add=False,
+    )
+
+
+class LymowAudioEvent(LymowEntity, EventEntity):
+    """Fires when the mower plays a voice prompt (PbOutput.audioId). Surfaces
+    real-world events — slip, blade-stuck, cliff, slope, theft alarm, charging —
+    that aren't otherwise in telemetry. event_type = slug (e.g. 'blade_stuck')."""
+
+    _attr_name = "Audio Event"
+    _attr_icon = "mdi:bullhorn"
+    _attr_event_types = AUDIO_EVENT_TYPES
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "audio_event")
+        self._last_audio_id: int | None = None
+
+    def _handle_coordinator_update(self) -> None:
+        data = self.coordinator.data or {}
+        aid = data.get("audioId")
+        # audioId is sticky between frames; fire only on a new, non-None/Max prompt.
+        if isinstance(aid, int) and aid not in (0, 33) and aid != self._last_audio_id:
+            self._last_audio_id = aid
+            etype = audio_event_type(aid)
+            if etype in AUDIO_EVENT_TYPES:
+                _LOGGER.debug("Lymow audio event for %s: %s (%s)",
+                              self.coordinator.thing_name, aid, audio_label(aid))
+                self._trigger_event(etype, {"audio_id": aid, "label": audio_label(aid)})
+        super()._handle_coordinator_update()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        aid = (self.coordinator.data or {}).get("audioId")
+        if isinstance(aid, int):
+            return {"audio_id": aid, "label": audio_label(aid)}
+        return {}
 
 
 class LymowSessionEvent(LymowEntity, EventEntity):

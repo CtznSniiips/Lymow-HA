@@ -6,20 +6,36 @@ payloads directly, so command preflight/watchdog logic stays in one place.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Awaitable, Callable
+
+from datetime import datetime, timezone
+import re
+
+from homeassistant.util import dt as dt_util
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.exceptions import HomeAssistantError
 
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    MOWING_STATUSES,
+    WORK_STATUS_EMERGENCY_STOP,
+    WORK_STATUS_ERROR,
+    WORK_STATUS_ESCAPING,
+    WORK_STATUS_PAUSE,
+)
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
 from .protocol import encode_query_map, encode_query_robot_config, encode_query_schedules
 
 _LOGGER = logging.getLogger(__name__)
+
+# Dock (RECHARGE_DOCK) only acts with a live, resumable task to come home to.
+DOCKABLE_STATUSES = MOWING_STATUSES | {WORK_STATUS_PAUSE, WORK_STATUS_ESCAPING}
 
 
 async def async_setup_entry(
@@ -36,6 +52,45 @@ async def async_setup_entry(
             LymowDockButton(coord),
             LymowCancelTaskButton(coord),
             LymowDockCancelButton(coord),
+            LymowClearErrorButton(coord),
+
+            # Remote control buttons
+            LymowRemoteButton(
+                coord,
+                key="remote_forward",
+                name="Remote forward",
+                icon="mdi:arrow-up-bold",
+                action="async_remote_forward",
+            ),
+            LymowRemoteButton(
+                coord,
+                key="remote_backward",
+                name="Remote backward",
+                icon="mdi:arrow-down-bold",
+                action="async_remote_backward",
+            ),
+            LymowRemoteButton(
+                coord,
+                key="remote_left",
+                name="Remote left",
+                icon="mdi:arrow-left-bold",
+                action="async_remote_left",
+            ),
+            LymowRemoteButton(
+                coord,
+                key="remote_right",
+                name="Remote right",
+                icon="mdi:arrow-right-bold",
+                action="async_remote_right",
+            ),
+            LymowRemoteButton(
+                coord,
+                key="remote_stop",
+                name="Remote stop",
+                icon="mdi:stop-circle",
+                action="async_remote_stop",
+            ),
+
             LymowRefreshMapButton(coord),
             LymowRefreshRobotConfigButton(coord),
             LymowRefreshSchedulesButton(coord),
@@ -78,6 +133,33 @@ async def async_setup_entry(
     # Poi crea i bottoni quando arrivano via MQTT
     entry.async_on_unload(coord.async_add_listener(_maybe_add_schedule_buttons))
 
+class LymowRemoteButton(LymowEntity, ButtonEntity):
+    def __init__(
+        self,
+        coordinator: LymowCoordinator,
+        *,
+        key: str,
+        name: str,
+        icon: str,
+        action: str,
+    ) -> None:
+        super().__init__(coordinator, key)
+
+        self._key = key
+        self._attr_name = name
+        self._attr_icon = icon
+        self._action = action
+
+    async def async_press(self) -> None:
+        method = getattr(self.coordinator, self._action, None)
+
+        if method is None:
+            raise HomeAssistantError(f"Remote action not found: {self._action}")
+
+        ok = await method()
+
+        if ok is False:
+            raise HomeAssistantError(f"Remote action failed: {self._action}")
 
 class _LymowButton(LymowEntity, ButtonEntity):
     """Base for all Lymow command buttons."""
@@ -131,13 +213,26 @@ class LymowResumeButton(_LymowButton):
 
 
 class LymowDockButton(_LymowButton):
-    """Return to dock and keep task progress when possible."""
+    """Return to dock and keep task progress so the mow can resume (RECHARGE_DOCK).
+
+    Only available while there's a live, resumable task — an active mow or a
+    pause mid-mow. From idle the firmware has nothing to resume and ignores the
+    command, so the button is gray then; use "Dock & Cancel" to send it home
+    from any other state."""
 
     _attr_name = "Dock"
     _attr_icon = "mdi:home-import-outline"
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
         super().__init__(coordinator, "btn_dock")
+
+    @property
+    def available(self) -> bool:
+        d = self.coordinator.data or {}
+        return super().available and (
+            d.get("workStatus") in DOCKABLE_STATUSES
+            or d.get("robotStatus") in DOCKABLE_STATUSES
+        )
 
     async def async_press(self) -> None:
         _LOGGER.debug("Lymow Dock button pressed")
@@ -282,13 +377,26 @@ class LymowScheduleStartButton(_LymowButton):
             return f"Start Schedule {self._schedule_id}"
 
         days = ", ".join(task.get("dayNames") or [])
-        time = task.get("time") or f"{task.get('hour', 0):02d}:{task.get('minute', 0):02d}"
-        zones = task.get("zoneHashIds") or []
+        time = self._local_time_from_task(task)
+
+        zone_names = self._zone_display_names(task)
+        readable_zone_names = [
+            z for z in zone_names
+            if z and not self._is_hash_like(z)
+        ]
+
+        if readable_zone_names:
+            zones_label = ", ".join(readable_zone_names[:3])
+            if len(readable_zone_names) > 3:
+                zones_label += f" +{len(readable_zone_names) - 3}"
+        else:
+            zones = task.get("zoneHashIds") or []
+            zones_label = f"{len(zones)} zones"
 
         if days:
-            return f"Start Schedule {days} {time} ({len(zones)} zones)"
+            return f"Start Schedule {days} {time} ({zones_label})"
 
-        return f"Start Schedule {time} ({len(zones)} zones)"
+        return f"Start Schedule {time} ({zones_label})"
 
     @property
     def available(self) -> bool:
@@ -316,21 +424,190 @@ class LymowScheduleStartButton(_LymowButton):
                 "available": False,
             }
 
+        zone_hash_ids = task.get("zoneHashIds") or []
+        zone_display_names = self._zone_display_names(task)
+
         return {
             "schedule_id": self._schedule_id,
             "enabled": task.get("enabled"),
-            "time": task.get("time"),
-            "hour": task.get("hour"),
-            "minute": task.get("minute"),
+
+            # Original robot schedule time.
+            "time_utc": task.get("time"),
+            "hour_utc": task.get("hour"),
+            "minute_utc": task.get("minute"),
+
+            # Schedule time converted to the Home Assistant timezone.
+            "time_local": self._local_time_from_task(task),
+            "timezone": self.coordinator.hass.config.time_zone,
+
             "days_of_week": task.get("daysOfWeek") or [],
             "day_names": task.get("dayNames") or [],
-            "timezone": task.get("timezone"),
             "is_repeated": task.get("isRepeated"),
             "is_disabled": task.get("isDisabled"),
             "is_angle_offset": task.get("isAngleOffset"),
             "mow_angle": task.get("mowAngle"),
-            "zone_hash_ids": task.get("zoneHashIds") or [],
+
+            "zone_hash_ids": zone_hash_ids,
+            "zone_names": zone_display_names,
             "zones": task.get("zones") or [],
+
             "config": task.get("config") or [],
             "config_count": task.get("config_count"),
         }
+    
+    def _local_time_from_task(self, task: dict[str, Any]) -> str:
+        """Return the schedule time converted from UTC to the Home Assistant timezone."""
+
+        try:
+            hour = int(task.get("hour", 0))
+            minute = int(task.get("minute", 0))
+        except (TypeError, ValueError):
+            return task.get("time") or "00:00"
+
+        # The task only contains hour/minute, not a full date.
+        # Use today's UTC date so Home Assistant can apply the configured
+        # timezone correctly, including the current DST offset.
+        now_utc = dt_util.utcnow()
+        utc_dt = datetime(
+            now_utc.year,
+            now_utc.month,
+            now_utc.day,
+            hour,
+            minute,
+            tzinfo=timezone.utc,
+        )
+
+        local_dt = dt_util.as_local(utc_dt)
+        return local_dt.strftime("%H:%M")
+
+
+    def _is_hash_like(self, value: Any) -> bool:
+        """Return True if the value looks like an internal zone hash id."""
+
+        if not isinstance(value, str):
+            return False
+
+        value = value.strip()
+        if not value:
+            return False
+
+        # Typical zone hashes look like jNHSquRg, Ywl0HqOo, etc.
+        return bool(re.fullmatch(r"[A-Za-z0-9_-]{6,}", value))
+
+
+    def _zone_name_map(self) -> dict[str, str]:
+        """Build a hash_id -> readable zone name map from coordinator data."""
+
+        data = self.coordinator.data or {}
+
+        # Try multiple possible locations because the zone catalog may be stored
+        # in different coordinator keys depending on the integration version.
+        candidates = []
+
+        for key in (
+            "zone_catalog",
+            "zones",
+            "map_zones",
+        ):
+            value = data.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+
+        map_data = data.get("map_data") or {}
+        if isinstance(map_data, dict):
+            for key in (
+                "zone_catalog",
+                "zones",
+                "map_zones",
+            ):
+                value = map_data.get(key)
+                if isinstance(value, list):
+                    candidates.extend(value)
+
+        result: dict[str, str] = {}
+
+        for zone in candidates:
+            if not isinstance(zone, dict):
+                continue
+
+            hash_id = (
+                zone.get("hashId")
+                or zone.get("hash_id")
+                or zone.get("id")
+                or zone.get("zoneHashId")
+            )
+
+            name = (
+                zone.get("name")
+                or zone.get("zoneName")
+                or zone.get("label")
+            )
+
+            if not hash_id or not name:
+                continue
+
+            hash_id = str(hash_id).strip()
+            name = str(name).strip()
+
+            # Only expose the name if it is actually user-friendly.
+            # Ignore names that are empty, equal to the hash id, or look like hashes.
+            if not name or name == hash_id or self._is_hash_like(name):
+                continue
+
+            result[hash_id] = name
+
+        return result
+
+
+    def _zone_display_names(self, task: dict[str, Any]) -> list[str]:
+        """Return readable zone names for a schedule, falling back to hash ids."""
+
+        zone_hash_ids = task.get("zoneHashIds") or []
+        name_map = self._zone_name_map()
+
+        names: list[str] = []
+
+        for zone_hash_id in zone_hash_ids:
+            zone_hash_id = str(zone_hash_id)
+            readable_name = name_map.get(zone_hash_id)
+
+            if readable_name:
+                names.append(readable_name)
+            else:
+                names.append(zone_hash_id)
+
+        return names
+
+
+class LymowClearErrorButton(_LymowButton):
+    """Clear/acknowledge a mower error so a task can resume. Sends a Pause
+    (userCtrl=3) — exactly what the app's contextual 'Clear Error' button does.
+
+    ALWAYS VISIBLE (not gated by availability) so users can find the control on a
+    healthy mower instead of it vanishing until an error fires. The press is a
+    NO-OP unless there's actually something to clear — an active error: obstacle
+    errors (E74) set robotStatus=Error + errorCode but leave workStatus unset, so
+    we check all three before sending the Pause."""
+
+    _attr_name = "Clear Error"
+    _attr_icon = "mdi:alert-circle-check-outline"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "btn_clear_error")
+
+    def _has_error(self) -> bool:
+        d = self.coordinator.data or {}
+        return (
+            d.get("workStatus") in (WORK_STATUS_ERROR, WORK_STATUS_EMERGENCY_STOP)
+            or d.get("robotStatus") in (WORK_STATUS_ERROR, WORK_STATUS_EMERGENCY_STOP)
+            or bool(d.get("errorCode"))
+        )
+
+    async def async_press(self) -> None:
+        # Always pressable; do nothing unless there's a live error, so a press on a
+        # healthy mower can't send a spurious Pause/clear command.
+        if not self._has_error():
+            _LOGGER.debug("Lymow Clear Error pressed with no active error — no-op")
+            return
+        _LOGGER.debug("Lymow Clear Error button pressed")
+        await self.coordinator.async_clear_error()

@@ -35,6 +35,8 @@ USER_CTRL_PAUSE_DOCK             = 21
 USER_CTRL_RESUME_DOCK            = 22
 USER_CTRL_QUERY_PATH             = 23
 USER_CTRL_QUERY_CLEANING         = 24
+USER_CTRL_OTA                    = 26   # trigger firmware OTA
+USER_CTRL_ABORT_OTA              = 27   # abort in-progress OTA
 USER_CTRL_FORCE_REINIT           = 28
 USER_CTRL_RECHARGE_DOCK          = 33
 USER_CTRL_QUERY_CLEANING_SUMMARY = 34
@@ -396,11 +398,19 @@ def encode_query_net_detail() -> bytes:
 
 
 def encode_query_rtk_l1() -> bytes:
-    return encode_userctrl(USER_CTRL_QUERY_RTK_L1)
+    """RTK L1 query — uses version=49 (app 3.0.6) instead of global PB_VERSION."""
+    msg = pb.PbInput()
+    msg.version = 49
+    msg.userCtrl = USER_CTRL_QUERY_RTK_L1
+    return msg.SerializeToString()
 
 
 def encode_query_rtk_l2() -> bytes:
-    return encode_userctrl(USER_CTRL_QUERY_RTK_L2)
+    """RTK L2 query — uses version=49 (app 3.0.6) instead of global PB_VERSION."""
+    msg = pb.PbInput()
+    msg.version = 49
+    msg.userCtrl = USER_CTRL_QUERY_RTK_L2
+    return msg.SerializeToString()
 
 
 def encode_debug_setting(
@@ -444,7 +454,7 @@ def encode_upload_robot_config() -> bytes:
 
 def encode_app_connect(client_uuid: str) -> bytes:
     msg = _new_input()
-    msg.appConnect = 1
+    msg.appConnect = 2
     msg.uuid = client_uuid
     return msg.SerializeToString()
 
@@ -481,6 +491,58 @@ def encode_set_clean_mode(mode_int: int) -> bytes:
     robot_config = _raw_enc_i32(7, int(mode_int))
     return _raw_enc_i32(2, PB_VERSION_4_9) + _raw_enc_len(13, robot_config)
 
+def encode_remote_control(
+    linear_speed: float = 0.0,
+    angular_speed: float = 0.0,
+) -> bytes:
+    """Encode remote/manual movement command.
+
+    linear_speed:
+      > 0 forward
+      < 0 backward
+
+    angular_speed:
+      > 0 rotate one direction
+      < 0 rotate the opposite direction
+
+    The sign for left/right may need to be swapped after testing.
+    """
+    msg = _new_input()
+    msg.remoteControl.linearSpeed = float(linear_speed)
+    msg.remoteControl.angularSpeed = float(angular_speed)
+    return msg.SerializeToString()
+
+
+def encode_remote_stop() -> bytes:
+    """Stop remote/manual movement."""
+    return encode_remote_control(0.0, 0.0)
+
+
+def encode_set_audio_volume(volume: int) -> bytes:
+    """Set speaker volume. Values: 0=Mute, 30=Low, 70=Medium, 100=High."""
+    msg = pb.PbInput()
+    msg.version = PB_VERSION_4_9
+    msg.robotConfig.audioVolume = int(volume)
+    msg.debugSetting.uploadRobotConfig = True
+    return msg.SerializeToString()
+
+
+def encode_set_charging_mode(mode: int) -> bytes:
+    """Set return-to-dock route. 0=Direct Route, 1=Follow Perimeter."""
+    msg = _new_input()
+    msg.userCtrl = 36  # USER_CTRL_SET_TASK_CONFIG
+    msg.taskConfig.chargingMode = int(mode)
+    return msg.SerializeToString()
+
+
+def encode_set_dock_on_error(enabled: bool) -> bytes:
+    """Set whether the mower returns to dock on error."""
+    msg = pb.PbInput()
+    msg.version = PB_VERSION_4_9
+    msg.robotConfig.dockOnError = bool(enabled)
+    msg.debugSetting.uploadRobotConfig = True
+    return msg.SerializeToString()
+
 
 def encode_set_rr_config(
     *,
@@ -511,25 +573,28 @@ def encode_set_rr_config(
     msg.debugSetting.uploadRobotConfig = True
     return msg.SerializeToString()
 
+# SocSignal — real-time commands carried on PbRobotConfig.signal (field 8).
+SIGNAL_TURN_ON_CAMERA_LIGHT  = 6
+SIGNAL_TURN_OFF_CAMERA_LIGHT = 7
+
+
 def encode_set_headlights(enabled: bool) -> bytes:
-    """Turn mower headlights / camera LED on or off.
+    """Turn the headlight (camera LED) on or off.
 
-    Command field:
-      PbInput.robotConfig.isOpenLed = true/false
+    Matches the app's RobotCommands.switchCameraLed(): a real-time SocSignal on
+    PbRobotConfig.signal (field 8) — SIGNAL_TURN_ON_CAMERA_LIGHT (6) /
+    SIGNAL_TURN_OFF_CAMERA_LIGHT (7) — with an otherwise-empty robotConfig.
 
-    The robot does not return isOpenLed as state. The real state is read from
-    PbRobotConfig.camLedStatus:
-      3 = on
-      4 = off
+    NOTE: the old code set isOpenLed (field 7), which this firmware IGNORES —
+    confirmed via app bytecode. State reads back from camLedStatus (3=on, 4=off).
+    Only effective while the mower is awake/IoT-connected; the firmware auto-offs
+    the camera LED on dock/charge regardless.
     """
     msg = pb.PbInput()
     msg.version = PB_VERSION_4_9
-
-    msg.robotConfig.isOpenLed = bool(enabled)
-
-    # Ask the robot to send back updated robotConfig
-    msg.debugSetting.uploadRobotConfig = True
-
+    msg.robotConfig.signal = (
+        SIGNAL_TURN_ON_CAMERA_LIGHT if enabled else SIGNAL_TURN_OFF_CAMERA_LIGHT
+    )
     return msg.SerializeToString()
 
 
@@ -545,6 +610,12 @@ def build_initial_query_packets(
         encode_query_map(query_index),
         encode_query_schedules(),
         encode_upload_robot_config(),
+        # Ask for live/status data immediately, not only after 90s
+        encode_query_cleaning_info(),
+        encode_query_net_detail(),
+        encode_query_robot_config(),
+        encode_query_wifi_4g(),
+        encode_query_cleaning_summary(),
     ])
     return packets
 

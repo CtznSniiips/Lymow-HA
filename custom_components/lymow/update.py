@@ -18,6 +18,7 @@ from homeassistant.components.update import (
     UpdateEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -50,11 +51,21 @@ class LymowFirmwareUpdate(LymowEntity, UpdateEntity):
 
     _attr_name         = "Firmware"
     _attr_device_class = UpdateDeviceClass.FIRMWARE
-    # No INSTALL feature — we can't trigger OTA from HA
-    _attr_supported_features = UpdateEntityFeature.RELEASE_NOTES
+    _attr_entity_category = EntityCategory.CONFIG
+    # OTA trigger recovered from app bytecode (userCtrl=26). HA only shows the
+    # Install button when latest_version > installed_version, so this can't fire
+    # an OTA unless one is genuinely available.
+    _attr_supported_features = (
+        UpdateEntityFeature.RELEASE_NOTES | UpdateEntityFeature.INSTALL
+    )
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
         super().__init__(coordinator, "firmware_update")
+
+    async def async_install(self, version: str | None, backup: bool, **kwargs: Any) -> None:
+        """Trigger the firmware OTA on the mower (userCtrl=26)."""
+        _LOGGER.info("Lymow firmware OTA install requested for %s", self.coordinator.thing_name)
+        await self.coordinator.async_ota_update()
 
     # ── installed version ────────────────────────────────────────
 
