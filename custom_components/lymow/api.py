@@ -13,8 +13,6 @@ IoT shadow writes have been removed entirely.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import urllib.parse
@@ -32,90 +30,6 @@ except ImportError:
 from .const import API_ENDPOINTS, COGNITO_CONFIG, COGNITO_DOMAINS
 
 _LOGGER = logging.getLogger(__name__)
-
-# Amplify Storage buckets extracted from the official Lymow app config.
-S3_BUCKETS: dict[str, str] = {
-    "eu-west-1": "lymow-user-data-eu-west-1",
-    "ap-southeast-2": "lymow-user-data-ap-southeast-2",
-    "us-east-2": "lymow-user-data-us-east-2",
-    "ap-east-1": "lymow-user-data-ap-east-1",
-}
-
-
-
-# ─────────────────────────────────────────────
-# SigV4 (used for S3 signed downloads)
-# ─────────────────────────────────────────────
-
-def _sign(key: bytes, msg: str) -> bytes:
-    return hmac.new(key, msg.encode(), hashlib.sha256).digest()
-
-
-def _signing_key(secret: str, date: str, region: str, service: str) -> bytes:
-    k = _sign(("AWS4" + secret).encode(), date)
-    k = _sign(k, region)
-    k = _sign(k, service)
-    return _sign(k, "aws4_request")
-
-
-def _sigv4_headers(
-    method: str,
-    url: str,
-    payload: bytes,
-    service: str,
-    region: str,
-    access_key: str,
-    secret_key: str,
-    session_token: str | None = None,
-) -> dict[str, str]:
-    parsed        = urllib.parse.urlparse(url)
-    host          = parsed.netloc
-    canonical_uri = parsed.path or "/"
-    qs_params     = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    canonical_qs  = urllib.parse.urlencode(sorted(qs_params))
-
-    now        = datetime.now(UTC)
-    amz_date   = now.strftime("%Y%m%dT%H%M%SZ")
-    date_stamp = now.strftime("%Y%m%d")
-    body_hash  = hashlib.sha256(payload).hexdigest()
-
-    hdrs: dict[str, str] = {
-        "host":                 host,
-        "x-amz-date":           amz_date,
-        "x-amz-content-sha256": body_hash,
-    }
-    if session_token:
-        hdrs["x-amz-security-token"] = session_token
-
-    signed_list    = sorted(hdrs)
-    canonical_hdrs = "".join(f"{k}:{hdrs[k]}\n" for k in signed_list)
-    signed_headers = ";".join(signed_list)
-
-    canonical_req = "\n".join([
-        method.upper(), canonical_uri, canonical_qs,
-        canonical_hdrs, signed_headers, body_hash,
-    ])
-
-    scope          = f"{date_stamp}/{region}/{service}/aws4_request"
-    string_to_sign = "\n".join([
-        "AWS4-HMAC-SHA256", amz_date, scope,
-        hashlib.sha256(canonical_req.encode()).hexdigest(),
-    ])
-    sig = hmac.new(
-        _signing_key(secret_key, date_stamp, region, service),
-        string_to_sign.encode(), hashlib.sha256,
-    ).hexdigest()
-
-    return {
-        "Authorization": (
-            f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
-            f"SignedHeaders={signed_headers}, Signature={sig}"
-        ),
-        "x-amz-date":           amz_date,
-        "x-amz-content-sha256": body_hash,
-        **({'x-amz-security-token': session_token} if session_token else {}),
-    }
-
 
 # ─────────────────────────────────────────────
 # Cognito auth
@@ -468,56 +382,18 @@ class LymowClient:
             return data
         return {}
 
+    # ── ENTRY POINT: backup-map restore (future feature, not yet built) ──────────
+    # The Lymow app can back up the current map to AWS S3 and reload it later. This
+    # endpoint lists a device's backup-map S3 keys (e.g. "device_xxx/map/map.pb") and
+    # is the hook for adding "restore a saved map" to the integration.
+    # The download+decode implementation (SigV4-signed S3 GET via the Cognito AWS creds,
+    # then PbMap decode) was removed as unused — recover it from git history at the
+    # "remove dead/abandoned code" commit when picking this feature up. Steps to rebuild:
+    #   1) get_backup_map(thing_name) -> list of S3 keys (below, live)
+    #   2) SigV4-signed GET from bucket lymow-user-data-<region> using self._auth's AWS creds
+    #   3) decode the PbMap bytes and load the zones/channels into state.
     async def get_backup_map(self, thing_name: str) -> dict | None:
         return await self._api_get("s3Api", f"/get-backup-map?deviceThingName={thing_name}")
-
-    async def download_s3_object(self, key: str) -> bytes | None:
-        """Download a private object from the official Amplify Storage bucket.
-
-        Backup map files returned by ``get_backup_map`` are S3 keys, for example
-        ``device_xxx/map/map.pb``. The official app downloads them with
-        Amplify Storage.getUrl(), using bucket ``lymow-user-data-<region>``.
-        This method performs the same GET with SigV4 headers and the Cognito
-        Identity temporary credentials already stored in ``CognitoAuth``.
-        """
-        bucket = S3_BUCKETS.get(self._region)
-        if not bucket:
-            _LOGGER.warning("No Lymow S3 bucket configured for region %s", self._region)
-            return None
-        if not (self._auth.access_key_id and self._auth.secret_access_key and self._auth.session_token):
-            await self._auth.get_aws_credentials()
-
-        encoded_key = urllib.parse.quote(key, safe="/~")
-        url = f"https://{bucket}.s3.{self._region}.amazonaws.com/{encoded_key}"
-        hdrs = _sigv4_headers(
-            method="GET",
-            url=url,
-            payload=b"",
-            service="s3",
-            region=self._region,
-            access_key=self._auth.access_key_id,
-            secret_key=self._auth.secret_access_key,
-            session_token=self._auth.session_token,
-        )
-        try:
-            async with self._session.get(url, headers=hdrs) as r:
-                body = await r.read()
-                if r.status >= 400:
-                    _LOGGER.warning(
-                        "S3 download failed for %s/%s: %s %s",
-                        bucket, key, r.status, body[:500].decode("utf-8", errors="replace"),
-                    )
-                    return None
-                return body
-        except Exception as e:
-            _LOGGER.warning("S3 download error for %s: %s", key, e)
-            return None
-
-    async def get_download_url(self, file_key: str) -> dict:
-        """Legacy/debug endpoint. Not used for backup maps."""
-        key = urllib.parse.quote(file_key, safe="")
-        data = await self._api_get("s3Api", f"/get-download-url?key={key}")
-        return data or {}
 
     async def check_update(self, thing_name: str) -> dict:
         data = await self._api_get("checkUpdateApi", f"/check-update?deviceThingName={thing_name}")
@@ -533,6 +409,3 @@ class LymowError(Exception):
 
 class LymowAuthError(LymowError):
     """Authentication error."""
-
-class LymowAPIError(LymowError):
-    """API call error."""
