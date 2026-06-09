@@ -170,16 +170,10 @@ import asyncio
 import contextlib
 import os
 import shutil
-import socket
 import tempfile
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
-
-def _find_free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
 
 
 class LymowRTSPCamera(LymowEntity, Camera):
@@ -190,11 +184,19 @@ class LymowRTSPCamera(LymowEntity, Camera):
     segments served by a local HTTP server, and HA's stream component picks
     up the playlist.  This works around HA's hard-coded libav probe timeout
     which is too short for the mower's LIVE555 server.
+
+    A watchdog task monitors the FFmpeg process and restarts it automatically
+    if it exits unexpectedly (e.g. stream drop, mower out of range). An
+    asyncio.Lock serialises all start/stop operations so rapid coordinator
+    updates can't produce overlapping proxy instances.
     """
 
     _attr_name = "Live Camera"
     _attr_icon = "mdi:cctv"
     _attr_supported_features = CameraEntityFeature.STREAM
+
+    # How often the watchdog polls the FFmpeg process for unexpected exits.
+    _WATCHDOG_INTERVAL = 15  # seconds
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
         LymowEntity.__init__(self, coordinator, "rtsp_camera")
@@ -206,6 +208,8 @@ class LymowRTSPCamera(LymowEntity, Camera):
         self._hls_port: int | None = None
         self._hls_dir: str | None = None
         self._proxy_source_ip: str | None = None  # IP used when proxy was started
+        self._proxy_lock = asyncio.Lock()           # serialises start/stop ops
+        self._watchdog_task: asyncio.Task | None = None
 
     @property
     def available(self) -> bool:
@@ -222,40 +226,81 @@ class LymowRTSPCamera(LymowEntity, Camera):
         # Start proxy now if IP is already known; otherwise the coordinator
         # listener below will start it when data first arrives.
         if self._rtsp_url():
-            await self._start_hls_proxy()
-        # Listen for coordinator updates so we can (re)start when IP appears
+            await self._restart_hls_proxy()
+        # Listen for coordinator updates so we can (re)start when IP appears.
         self.async_on_remove(
             self.coordinator.async_add_listener(self._async_on_coordinator_update)
         )
+        # Launch the watchdog.
+        self._watchdog_task = self.hass.async_create_background_task(
+            self._watchdog(), name="lymow_camera_watchdog"
+        )
+        self.async_on_remove(self._cancel_watchdog)
 
     async def async_will_remove_from_hass(self) -> None:
         await self._stop_hls_proxy()
+
+    def _cancel_watchdog(self) -> None:
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+        self._watchdog_task = None
 
     def _async_on_coordinator_update(self) -> None:
         """Restart proxy if the robot IP changed or proxy isn't running yet."""
         current_ip = _get_robot_ip(self.coordinator.data or {})
         if not current_ip:
             return
+        # _proxy_process being None means it was never started or was explicitly
+        # stopped. A live but exited process is caught by the watchdog instead.
         if self._proxy_process is None or current_ip != self._proxy_source_ip:
             self.hass.async_create_task(self._restart_hls_proxy())
 
-    async def _restart_hls_proxy(self) -> None:
-        await self._stop_hls_proxy()
-        await self._start_hls_proxy()
+    # ── watchdog ─────────────────────────────────────────────────
+
+    async def _watchdog(self) -> None:
+        """Periodically check that FFmpeg is still running; restart if not."""
+        while True:
+            await asyncio.sleep(self._WATCHDOG_INTERVAL)
+            proc = self._proxy_process
+            if proc is not None and proc.returncode is not None:
+                # Collect any stderr output that was buffered before exit.
+                stderr_out = ""
+                if proc.stderr is not None:
+                    with contextlib.suppress(Exception):
+                        raw = await asyncio.wait_for(proc.stderr.read(4096), timeout=1.0)
+                        stderr_out = raw.decode(errors="replace").strip()
+                _LOGGER.warning(
+                    "Lymow HLS proxy exited unexpectedly (rc=%s)%s — restarting",
+                    proc.returncode,
+                    f": {stderr_out}" if stderr_out else "",
+                )
+                await self._restart_hls_proxy()
 
     # ── proxy management ─────────────────────────────────────────
 
-    async def _start_hls_proxy(self) -> None:
+    async def _restart_hls_proxy(self) -> None:
+        """Stop then start the proxy, serialised by _proxy_lock."""
+        async with self._proxy_lock:
+            await self._stop_hls_proxy_unlocked()
+            await self._start_hls_proxy_unlocked()
+
+    async def _stop_hls_proxy(self) -> None:
+        """Public stop — acquires the lock."""
+        async with self._proxy_lock:
+            await self._stop_hls_proxy_unlocked()
+
+    async def _start_hls_proxy_unlocked(self) -> None:
+        """Start the FFmpeg HLS proxy. Must be called with _proxy_lock held."""
         url = self._rtsp_url()
         if not url:
             _LOGGER.debug("Lymow camera: no robot IP, skipping HLS proxy start")
             return
 
         self._hls_dir = tempfile.mkdtemp(prefix="lymow_hls_")
-        self._hls_port = _find_free_port()
         self._proxy_source_ip = _get_robot_ip(self.coordinator.data or {})
 
-        # Tiny HTTP server that serves HLS segments from the temp dir
+        # Bind to port 0 and let the OS assign a free port — avoids the
+        # TOCTOU race of finding a free port then binding separately.
         hls_dir = self._hls_dir
 
         class _QuietHandler(SimpleHTTPRequestHandler):
@@ -265,14 +310,16 @@ class LymowRTSPCamera(LymowEntity, Camera):
             def log_message(self, format, *args):  # noqa: A002
                 pass  # suppress per-request noise in HA logs
 
-        self._http_server = HTTPServer(("127.0.0.1", self._hls_port), _QuietHandler)
+        self._http_server = HTTPServer(("127.0.0.1", 0), _QuietHandler)
+        self._hls_port = self._http_server.server_address[1]
         self._http_thread = threading.Thread(
             target=self._http_server.serve_forever, daemon=True, name="lymow_hls_http"
         )
         self._http_thread.start()
         _LOGGER.debug("Lymow HLS HTTP server started on port %s", self._hls_port)
 
-        # FFmpeg: RTSP in (TCP, generous probe) → HLS out
+        # FFmpeg: RTSP in (TCP, generous probe) → HLS out.
+        # stderr is captured via PIPE so the watchdog can log it on exit.
         self._proxy_process = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-loglevel", "warning",
@@ -288,7 +335,7 @@ class LymowRTSPCamera(LymowEntity, Camera):
             "-hls_segment_filename", os.path.join(self._hls_dir, "seg%03d.ts"),
             os.path.join(self._hls_dir, "stream.m3u8"),
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,  # captured for watchdog diagnostics
         )
         _LOGGER.debug(
             "Lymow FFmpeg HLS proxy started (pid=%s) → %s",
@@ -296,7 +343,8 @@ class LymowRTSPCamera(LymowEntity, Camera):
             url,
         )
 
-    async def _stop_hls_proxy(self) -> None:
+    async def _stop_hls_proxy_unlocked(self) -> None:
+        """Stop the proxy. Must be called with _proxy_lock held."""
         if self._proxy_process:
             with contextlib.suppress(ProcessLookupError):
                 self._proxy_process.terminate()
