@@ -33,6 +33,7 @@ from .entity_base import LymowEntity
 @dataclass(frozen=True, kw_only=True)
 class LymowBinDesc(BinarySensorEntityDescription):
     value_fn: Callable[[dict], bool] = lambda d: False
+    description: str | None = None   # surfaced as a more-info attribute
 
 
 BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
@@ -70,6 +71,7 @@ BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
         name="Error",
         device_class=BinarySensorDeviceClass.PROBLEM,
         icon="mdi:alert",
+        description="WHETHER the mower currently has a fault — ON for an active error or emergency-stop, OFF when healthy. This is the on/off flag (good for automations/alerts); the 'Error Detail' sensor says WHAT the fault is.",
         value_fn=lambda d: (
             d.get("workStatus") in (WORK_STATUS_ERROR, WORK_STATUS_EMERGENCY_STOP)
             or bool(d.get("errorCode") and d.get("errorCode") != 0)
@@ -93,19 +95,14 @@ BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
             or (d.get("netDetailInfo") or {}).get("currentNet") == 2,
         entity_registry_enabled_default=False,
     ),
-    LymowBinDesc(
-        key="rain_delay",
-        name="Rain Delay",
-        device_class=BinarySensorDeviceClass.MOISTURE,
-        icon="mdi:weather-rainy",
-        value_fn=lambda d: bool(d.get("rainDelay") or d.get("rain_delay")),
-        entity_registry_enabled_default=False,
-    ),
 
     LymowBinDesc(
         key="theft_detection",
-        name="Theft Detection",
-        device_class=BinarySensorDeviceClass.SAFETY,
+        # Restored wording from the fix-rtk-version line (lost in the move to
+        # beta.4). NOTE: no SAFETY device_class — theftDetectionSwitch=on means
+        # anti-theft is ENABLED (good), but SAFETY renders "on" as "Unsafe",
+        # which inverts the meaning. Plain on/off reads correctly as a status.
+        name="Anti-Theft",
         icon="mdi:shield-lock",
         value_fn=lambda d: bool(d.get("theftDetectionSwitch")),
         entity_registry_enabled_default=False,
@@ -161,3 +158,9 @@ class LymowBinarySensor(LymowEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool:
         return self.entity_description.value_fn(self.coordinator.data or {})
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        if self.entity_description.description:
+            return {"description": self.entity_description.description}
+        return None
