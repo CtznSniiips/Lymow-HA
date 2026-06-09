@@ -10,7 +10,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import AUDIO_EVENT_TYPES, DOMAIN, audio_event_type, audio_label
+from .const import (
+    AUDIO_EVENT_TYPES,
+    DOMAIN,
+    audio_event_type,
+    audio_label,
+)
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
 

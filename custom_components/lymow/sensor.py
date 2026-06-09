@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
+
+from homeassistant.core import callback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -12,7 +16,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory, PERCENTAGE, UnitOfArea, UnitOfLength, UnitOfSpeed, UnitOfTime
+from homeassistant.const import EntityCategory, PERCENTAGE, UnitOfArea, UnitOfLength, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -78,6 +82,43 @@ WORK_STATUS_LABELS: dict[int, str] = {
 
 NET_TYPE_LABELS: dict[int, str] = {0: "None", 1: "WiFi", 2: "LTE"}
 
+# Cellular enums decoded from the Lymow app (3.0.7) — authoritative app labels.
+# CARD_REGIST_*: NONE=0, REGISTERED=1, SEARCHING=2, NO_REGISTERED=3
+CELL_REGIST_LABELS: dict[int, str] = {0: "None", 1: "Registered", 2: "Searching", 3: "No Registered"}
+# CARD_STATUS_*: NONE=0, READY=1, NO_CARD=2, ERROR=3
+SIM_CARD_STATUS_LABELS: dict[int, str] = {0: "None", 1: "Ready", 2: "No Card", 3: "Error"}
+
+# PbMutateResult.code = the mower's ack to the last "mutate" command (zone/channel/
+# settings change). Decoded from the app's MutateRes enum (re-3.0.7 bundle, confirmed
+# via its name↔int switch). The mower persistently echoes the LAST result, so the
+# steady-state value reflects the most recent config change (code 5 = a zone-info edit
+# that applied cleanly). Friendly wording replaces the raw "code N".
+MUTATE_RESULT_LABELS: dict[int, str] = {
+    0: "None",
+    1: "Zone Cleared",
+    2: "Clear Zone Failed",
+    3: "Channel Deleted",
+    4: "Delete Channel Failed",
+    5: "Zone Settings Updated",
+    6: "Zone Update Failed",
+    7: "All Zones/Channels Cleared",
+    8: "Clear All Failed",
+    9: "RTK Bound",
+    10: "RTK Binding Failed",
+    11: "Factory Restore Failed",
+    12: "Factory Restored",
+    13: "Channel Updated",
+    14: "Channel Update Failed",
+    15: "Global Settings Updated",
+    16: "Global Settings Failed",
+    17: "Runtime Settings Updated",
+    18: "Runtime Settings Failed",
+    19: "Zones Merged",
+    20: "Merge Zones Failed",
+    21: "Zone Cut",
+    22: "Cut Zone Failed",
+}
+
 
 # ── Descriptor ────────────────────────────────────────────────
 
@@ -85,6 +126,11 @@ NET_TYPE_LABELS: dict[int, str] = {0: "None", 1: "WiFi", 2: "LTE"}
 class LymowSensorDesc(SensorEntityDescription):
     value_source: str | Callable[[dict], Any] = ""
     transform: Callable[[Any], Any] | None = None
+    attrs_source: Callable[[dict], dict] | None = None
+    # Plain-language explanation surfaced as a `description` attribute in the HA
+    # more-info dialog, so a user troubleshooting can understand what the value
+    # means and which direction is good/bad without leaving HA.
+    description: str | None = None
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -113,12 +159,27 @@ def _robot_ip(d: dict) -> str | None:
     return d.get(F_IP_ADDRESS) or _read(d.get(F_NET_DETAIL), "wifiIp") or d.get("rest_ip_address")
 
 
+def _rtk_link_state(d: dict) -> str | None:
+    """At-a-glance RTK correction-link health from differential age + fix status.
+    Reads coordinator state directly (rtkDiffAge + rtkStatus) so it is independent
+    of whether the detailed RTK sensors are enabled."""
+    age = d.get("rtkDiffAge")
+    if age is None:
+        return None  # no RTK frame yet → unknown
+    if age >= 15:
+        return "Lost"      # corrections gone (LoRa packets stopped)
+    if age >= 5:
+        return "Stale"     # corrections slowing
+    st = d.get("rtkStatus")
+    if st == 2:            # RTK_STATUS_FIX (~2 cm)
+        return "Healthy"
+    if st == 1:            # RTK_STATUS_FLOAT_FIX (~40 cm)
+        return "Degraded"
+    return "Acquiring"     # fresh corrections, no fix yet
+
+
 def _history_summary(key: str) -> Callable[[dict], Any]:
     return lambda d: (d.get("cleanHistorySummary") or {}).get(key)
-
-
-def _btmap(key: str) -> Callable[[dict], Any]:
-    return lambda d: (d.get("btMap") or {}).get(key)
 
 
 def _zone_catalog_value(key: str) -> Callable[[dict], Any]:
@@ -165,8 +226,9 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
     ),
     LymowSensorDesc(
         key="error",
-        name="Error",
+        name="Error Detail",
         icon="mdi:alert-circle-outline",
+        description="WHAT the current fault is — the decoded error code/name, or 'None' when the mower is OK. The companion 'Error' binary sensor is the on/off flag for WHETHER a fault is active; this one says what it is.",
         value_source=F_ERROR_CODE,
         transform=lambda v: error_label(v) if v else "None",
         entity_registry_enabled_default=False,
@@ -226,6 +288,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         suggested_display_precision=1,
         icon="mdi:compass",
         value_source="mowerHeading",
+        description="The mower's compass heading in degrees (0°=North, 90°=East), derived from its RTK pose orientation. This is what rotates the mower icon on the map to point the way it's driving.",
         entity_registry_enabled_default=False,
     ),
     # Current Speed (twistLinear) and Turn Rate (twistAngular) are sourced from
@@ -280,8 +343,10 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:progress-check",
-        value_source="cleanPercent",
-        transform=lambda v: int(round(float(v) * 100)) if v is not None else None,
+        # Derived in the coordinator: monotonic within a task, pinned to 100% on completion
+        # (raw cleanPercent dips backward as the planned total grows and resets to 0 on dock).
+        value_source="session_percent_display",
+        transform=lambda v: int(v) if v is not None else None,
     ),
     LymowSensorDesc(
         key="session_remain",
@@ -293,6 +358,18 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         value_source="remainCleanTime",
         transform=lambda v: int(float(v)) if v is not None else None,
         entity_registry_enabled_default=False,
+    ),
+    LymowSensorDesc(
+        key="last_session_travel_time",
+        name="Last Session Travel Time",
+        native_unit_of_measurement=UnitOfTime.MINUTES,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:transit-connection-variant",
+        # Time the mower spent in transit (between zones / to-from dock), NOT mowing —
+        # accumulated per session by the zone-visit logger (coordinator _zv_travel_s).
+        value_source="last_session_travel_minutes",
+        description="Minutes the mower spent travelling (between zones and to/from the dock) during the last session — transit time, separate from mowing time.",
     ),
     LymowSensorDesc(
         key="map_area",
@@ -365,14 +442,110 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         entity_registry_enabled_default=False,
     ),
 
-    # ── GNSS / Localization ─────────────────────────────────────────────────
+    # ── Path engine (zone-analytics Phase 1) ─────────────────────────────
     LymowSensorDesc(
-        key="gnss_satellites",
-        name="GNSS Satellites",
+        key="coverage_points",
+        name="Coverage Points",
         state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:satellite-variant",
-        value_source="gnssNumSatellites",
+        icon="mdi:map-marker-path",
+        # Coverage = the breadcrumb pose-trail (robot's actual position every frame):
+        # dense, time-ordered, order-independent. Replaced the sparse QUERY_PATH-delta
+        # accumulator (which also made coverage depend on whether/when the perimeter
+        # segment appeared). Updates every frame.
+        value_source=lambda d: len(d.get("breadcrumb_track") or []) or None,
+        description="Count of GPS pose-trail points captured this mow — the dense breadcrumb that feeds the coverage map, the Pass Coverage analysis, and the per-zone stats. The 'by_zone' attribute breaks the count down per zone (point-in-polygon attribution).",
+        # Per-zone breakdown (geometric attribution): {zone: {coverage_points}}.
+        attrs_source=lambda d: {"by_zone": d.get("zone_stats") or {}},
     ),
+    LymowSensorDesc(
+        key="planned_path_points",
+        # Renamed: the large STATIC QUERY_PATH segment is the PERIMETER / structural
+        # lap, not a precomputed plan (proven 2026-06-03 by a perimeter-last run where
+        # it appeared at 85% instead of the start). Entity id stays planned_path_points
+        # for continuity; the displayed name reflects what it actually is.
+        name="Perimeter / Structural Path",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:vector-square",
+        description="Points in the mower's perimeter / structural lap — the large static QUERY_PATH segment. It's the ACTUAL perimeter the mower drives (not a precomputed plan), debounced so it doesn't flicker while being laid down.",
+        value_source=lambda d: (d.get("path_engine") or {}).get("planned_points"),
+        attrs_source=lambda d: {"segment_markers": d.get("segment_markers") or []},
+    ),
+    # Path Deviations sensor removed 2026-06-04 — it measured actual-vs-PLANNED, but the
+    # mower never sends a planned route, so it was undefinable. Obstacles is now detected
+    # plan-free from coverage holes (see below).
+    LymowSensorDesc(
+        key="obstacles",
+        name="Obstacles",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:bullseye-arrow",
+        description="Distinct obstacles the mower routed around this session — detected plan-free as UN-MOWED islands surrounded by mowed area inside a zone (and not explained by a no-go). Each one's location + footprint is in the attribute. Updates as the mow progresses; a tree/post/bed shows up once the mower has worked around it.",
+        # Coverage-hole obstacle events (obstacles.detect_obstacles): an enclosed un-mowed
+        # island = something routed around. Attribute carries each event's center/size.
+        value_source=lambda d: (d.get("path_engine") or {}).get("obstacle_count"),
+        attrs_source=lambda d: {"obstacles": [
+            {"center": list(c.get("center", ())), "cells": c.get("cells"),
+             "object_m": list(c.get("object_m", ())),
+             "footprint_m": list(c.get("footprint_m", ())), "zone": c.get("zone")}
+            for c in (d.get("obstacle_events") or [])[:50]
+        ]},
+    ),
+    LymowSensorDesc(
+        key="anomalies",
+        name="Anomalies",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:alert-decagram-outline",
+        description="Count of FLAGGED stuck-spot anomalies this session — the mower pinned in one spot while mowing. Classed by yard wear: spin (crop-circle), jitter (>=4 m thrash, heavy wear), struggle (2-4 m), excess-turn (>half a turn). Stationary 'paused' events (E-stop / RTK lock) are NOT counted but listed in the attribute. Each carries center/duration/path/turns/zone.",
+        value_source=lambda d: sum(
+            1 for e in (d.get("anomaly_events") or [])
+            if e.get("kind") in ("spin", "jitter", "struggle", "excess-turn")),
+        attrs_source=lambda d: {
+            "flagged": [e for e in (d.get("anomaly_events") or [])
+                        if e.get("kind") in ("spin", "jitter", "struggle", "excess-turn")][-20:],
+            "paused": [e for e in (d.get("anomaly_events") or []) if e.get("kind") == "paused"][-20:],
+            "last": ((d.get("anomaly_events") or [None])[-1]),
+        },
+    ),
+    LymowSensorDesc(
+        key="double_coverage",
+        name="Double Coverage",
+        icon="mdi:check-all",
+        native_unit_of_measurement=PERCENTAGE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        description="On a checkerboard ('chess') mow every spot should be covered TWICE — once per infill axis. This is the % of the infill-mowed area that actually got both passes. Less than ~100% means Lymow's planner skipped the perpendicular return pass somewhere (a real, submittable path-planning bug). Measured on the two infill axes only, so perimeter laps don't skew it. The 'skipped' attribute lists each single-pass spot (size + location + which axis covered it) — useful to report to Lymow as 'it keeps missing here when mowing this direction'. Computed during a mow once enough coverage exists.",
+        value_source=lambda d: (d.get("pass_coverage") or {}).get("double_pct"),
+        attrs_source=lambda d: {
+            "single_pass_m2": (d.get("pass_coverage") or {}).get("single_pass_m2"),
+            "missed_m2": (d.get("pass_coverage") or {}).get("missed_m2"),
+            "missed_count": (d.get("pass_coverage") or {}).get("missed_count"),
+            "infill_area_m2": (d.get("pass_coverage") or {}).get("infill_area_m2"),
+            "single_direction": (d.get("pass_coverage") or {}).get("single_direction"),
+            "skipped": (d.get("pass_coverage") or {}).get("clusters") or [],
+        },
+    ),
+    LymowSensorDesc(
+        key="last_command_result",
+        name="Last Command Result",
+        icon="mdi:message-alert-outline",
+        description="The mower's acknowledgement of the most recent config command (a zone/channel/settings change), decoded to a readable result like 'Zone Settings Updated'. It's STICKY — it holds the last result until a new command, so during a mow it reflects your most recent change, not the mowing itself.",
+        # promptInfo.mutateRet — the mower's ack to the last mutate command (zone/
+        # channel/settings change). Prefer a human-readable label from the decoded
+        # MutateRes enum; fall back to any firmware errorMsg, then a raw code.
+        value_source=lambda d: (
+            None if not d.get("mutateResult")
+            else ((d["mutateResult"].get("errorMsg") or "").strip()
+                  or MUTATE_RESULT_LABELS.get(d["mutateResult"].get("code"))
+                  or f"Code {d['mutateResult'].get('code')}")
+        ),
+        # Keep the raw code/errorMsg in attributes for debugging.
+        attrs_source=lambda d: dict(d.get("mutateResult") or {}),
+    ),
+
+    # ── GNSS / Localization ─────────────────────────────────────────────────
+    # NOTE: there is deliberately NO "GNSS Satellites" sensor. The mower's
+    # localization numSatellites field is a flat constant (~10) that never tracks
+    # reality — it even exceeded the RTK count (10 vs 9) in a weak zone, so it can't
+    # be a real in-view/common-visibility count. The single true satellite metric is
+    # "RTK Satellites" (satelliteCount) below, which varies with sky/zone.
     LymowSensorDesc(
         key="gnss_horizontal_accuracy",
         name="GNSS Horizontal Accuracy",
@@ -382,6 +555,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         suggested_display_precision=3,
         icon="mdi:crosshairs-gps",
         value_source="gnssHorizontalAccuracy",
+        description="Estimated horizontal position accuracy in metres. LOWER is better.",
     ),
     LymowSensorDesc(
         key="gnss_vertical_accuracy",
@@ -392,6 +566,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         suggested_display_precision=3,
         icon="mdi:crosshairs-gps",
         value_source="gnssVerticalAccuracy",
+        description="Estimated vertical (up/down) position accuracy in metres. LOWER is better — the vertical companion to GNSS Horizontal Accuracy.",
     ),
     LymowSensorDesc(
         key="gnss_position_quality",
@@ -404,6 +579,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         transform=lambda v: {
             0: "No Signal", 1: "Single Point", 2: "RTK Float", 3: "RTK Fix",
         }.get(v, f"Unknown ({v})"),
+        description="GNSS fix quality: RTK Fix (best, ~2cm), RTK Float (~40cm), DGPS, or lower.",
     ),
 
     # ── GPS / RTK ─────────────────────────────────────────────────────────
@@ -424,6 +600,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         icon="mdi:crosshairs-gps",
         value_source=_rtk("precision"),
         entity_registry_enabled_default=False,
+        description="Estimated RTK horizontal accuracy in metres. LOWER is better — an RTK Fix is ~0.02m (2cm), Float is ~0.4m.",
     ),
     LymowSensorDesc(
         key="rtk_satellites",
@@ -431,7 +608,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:satellite-variant",
         value_source=_rtk("satelliteCount"),
-        entity_registry_enabled_default=False,
+        description="Satellites used in the RTK position solution (all bands) — the count the Lymow app shows. Varies with sky view and zone (drops in obstructed areas). HIGHER is better.",
     ),
     LymowSensorDesc(
         key="rtk_l1_satellites",
@@ -440,6 +617,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         icon="mdi:satellite-variant",
         value_source=_rtk("l1SatelliteCount"),
         entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
     LymowSensorDesc(
         key="rtk_l2_satellites",
@@ -448,6 +626,110 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         icon="mdi:satellite-variant",
         value_source=_rtk("l2SatelliteCount"),
         entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    LymowSensorDesc(
+        key="rtk_diff_age",
+        name="RTK Differential Age",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        icon="mdi:timer-sand",
+        # Age of the RTK correction data — the LoRa-link heartbeat. Normally ~2s
+        # (one LoRa correction cycle); climbing = corrections have stopped arriving
+        # (LoRa packets lost). Off by default (maintainer's call whether to surface);
+        # users can enable it — it's the single best at-a-glance RTK-link health signal.
+        value_source=lambda d: d.get("rtkDiffAge"),
+        entity_registry_enabled_default=False,
+        description="Age of the latest RTK correction in seconds — the LoRa-link heartbeat. ~2-3s is normal (one LoRa cycle). LOWER is better; a climbing value means corrections have stopped arriving (LoRa packets lost).",
+    ),
+    LymowSensorDesc(
+        key="rtk_base_data_error_rate",
+        name="RTK Base Data Error Rate",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=PERCENTAGE,
+        icon="mdi:alert-circle-outline",
+        value_source=lambda d: d.get("rtkBaseDataErrorRate"),
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        description="Error rate of correction data from the RTK base. LOWER is better; high = corrupted/lost correction packets.",
+    ),
+    LymowSensorDesc(
+        key="rtk_l1_snr",
+        name="RTK L1 SNR",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:signal",
+        value_source=lambda d: d.get("rtkL1Snr"),
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        description="Signal-to-noise ratio of the L1 GNSS band. HIGHER is better (stronger satellite signal).",
+    ),
+    LymowSensorDesc(
+        key="rtk_l2_snr",
+        name="RTK L2 SNR",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:signal",
+        value_source=lambda d: d.get("rtkL2Snr"),
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        description="Signal-to-noise ratio of the L2 GNSS band. HIGHER is better.",
+    ),
+    LymowSensorDesc(
+        key="rtk_l5_satellites",
+        name="RTK L5 Satellites",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:satellite-variant",
+        value_source=lambda d: d.get("rtkL5Satellites"),
+        description="Satellites the RTK receiver is tracking on the GNSS L5 band. Tracking more frequency bands (L1/L2/L5) makes the centimetre fix more robust, especially near obstructions.",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    LymowSensorDesc(
+        key="rtk_radio_link",
+        name="RTK Radio Link",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:radio-tower",
+        # RTK base↔rover radio (LoRa) link rate — best of the 3 channels. Per-channel
+        # rate + advanced CW-interference/antenna/HW diagnostics in attributes.
+        value_source=lambda d: max(d.get("rtkLoraBps") or [0]) or None,
+        attrs_source=lambda d: {
+            "lora_bps": d.get("rtkLoraBps"),
+            "cw_ratio": d.get("rtkCwRatio"),
+            "ant_value": d.get("rtkAntValue"),
+            "hw_dc": d.get("rtkHwDc"),
+            "l5_snr": d.get("rtkL5Snr"),
+        },
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        description="RTK correction radio (LoRa) data rate in bits/sec, best of 3 channels. HIGHER = healthier link throughput.",
+    ),
+    LymowSensorDesc(
+        key="rtk_interference",
+        name="RTK Interference",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:waveform",
+        # Carrier-wave (CW) interference ratio on the RTK LoRa band — worst of the
+        # 3 radio channels. A nearby RF transmitter raises this and degrades the
+        # correction link. Complements RTK Radio Link (link *rate*) and Differential
+        # Age (link *freshness*): this is link *noise*. Direction/scale TBD live.
+        value_source=lambda d: max(d.get("rtkCwRatio") or [0]) or None,
+        attrs_source=lambda d: {"per_channel": d.get("rtkCwRatio")},
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        description="Carrier-wave (CW) interference indicator on the RTK LoRa band, worst of 3 channels (0 = clean, see per_channel attribute). HIGHER = MORE interference = worse. Direction inferred from data, not yet validated against a known source.",
+    ),
+    LymowSensorDesc(
+        key="rtk_link_status",
+        name="RTK Link Status",
+        device_class=SensorDeviceClass.ENUM,
+        options=["Healthy", "Degraded", "Acquiring", "Stale", "Lost"],
+        icon="mdi:access-point-network",
+        # Derived at-a-glance RTK correction-link health (see _rtk_link_state).
+        # Healthy = fresh corrections + Fixed; Degraded = fresh + Float; Acquiring =
+        # fresh, no fix yet; Stale = diffAge 5-15s (slowing); Lost = diffAge >15s
+        # (LoRa packets stopped). Independent of the detailed RTK sensors.
+        value_source=_rtk_link_state,
+        entity_registry_enabled_default=False,
+        description="Overall RTK correction-link health. Healthy = fresh corrections + cm-level Fixed; Degraded = fresh but only Float (~40cm); Acquiring = fresh, no fix yet; Stale = corrections slowing (diffAge 5-15s); Lost = corrections stopped (>15s, LoRa packets lost).",
     ),
     LymowSensorDesc(
         key="rtk_base_status",
@@ -456,6 +738,8 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         value_source=_rtk("baseStationStatus"),
         transform=lambda v: {0: "Online", 1: "Offline", 2: "Moved", 3: "Invalid"}.get(v, f"Unknown ({v})"),
         entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        description="RTK base station state: Online (good), Offline, Moved, or Invalid.",
     ),
 
     # ── Connectivity ──────────────────────────────────────────────────────
@@ -507,20 +791,51 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         icon="mdi:wifi-settings",
         value_source=_net("wifiName"),
         entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
     LymowSensorDesc(
         key="sim_iccid",
-        name="SIM ICCID",
+        name="4G SIM ICCID",
         icon="mdi:sim",
         value_source=_net("simIccid"),
         entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
     LymowSensorDesc(
         key="sim_ip",
-        name="SIM IP",
+        name="4G SIM IP",
         icon="mdi:ip-network-outline",
         value_source=_net("simIp"),
         entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    # ── Cellular health (PbNetDetailInfo, populates on LTE) ───────────────
+    LymowSensorDesc(
+        key="cellular_registration",
+        name="4G Registration",
+        icon="mdi:sim-outline",
+        device_class=SensorDeviceClass.ENUM,
+        options=["None", "Registered", "Searching", "No Registered"],
+        value_source=_net("simRegistration"),
+        transform=lambda v: CELL_REGIST_LABELS.get(v, f"Unknown ({v})") if v is not None else None,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        description="Cellular network registration (4G). Registered = SIM is on the "
+                    "network (healthy); Searching = looking for a tower; No Registered = "
+                    "registration failed/denied; None = no cellular. Decoded from the app.",
+    ),
+    LymowSensorDesc(
+        key="sim_card_status",
+        name="4G SIM Status",
+        icon="mdi:sim",
+        device_class=SensorDeviceClass.ENUM,
+        options=["None", "Ready", "No Card", "Error"],
+        value_source=_net("simCardStatus"),
+        transform=lambda v: SIM_CARD_STATUS_LABELS.get(v, f"Unknown ({v})") if v is not None else None,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        description="SIM card state (4G). Ready = SIM present and usable; No Card = no SIM "
+                    "detected; Error = SIM fault; None = no cellular. Decoded from the app.",
     ),
     LymowSensorDesc(
         key="fw_version",
@@ -547,18 +862,32 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
+        key="mac_address",
+        name="MAC Address",
+        icon="mdi:network-outline",
+        value_source="macAddress",
+        description="The mower's network MAC address — its hardware network identifier. Diagnostic; off by default.",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    # NOTE: Camera Confidence + GNSS Confidence sensors removed 2026-06-03 — they read
+    # algoLocOutput.sensorConfidence, which the mower NEVER sends on the cloud telemetry
+    # topic (0/7505 frames; it's a local/BLE-only message). No field enables it; dead.
+    LymowSensorDesc(
         key="rtk_base_serial",
         name="RTK Base Serial",
         icon="mdi:radio-tower",
         value_source="rtkSn",
-        entity_category=EntityCategory.DIAGNOSTIC,
+        description="Serial number of the paired RTK base station (the fixed reference antenna that broadcasts the cm-level corrections). Diagnostic; off by default.",
         entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
     LymowSensorDesc(
         key="wheel_firmware",
         name="Wheel Motor Firmware",
         icon="mdi:tire",
         value_source="wheelVer",
+        description="Firmware version of the wheel/track motor controller. Diagnostic; off by default.",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),
@@ -567,6 +896,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         name="Blade Motor Firmware",
         icon="mdi:fan",
         value_source="knifeVer",
+        description="Firmware version of the blade/cutting motor controller. Diagnostic; off by default.",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),
@@ -576,6 +906,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         icon="mdi:volume-high",
         value_source="audioVolume",
         transform=lambda v: {0: "Mute", 30: "Low", 70: "Medium", 100: "High"}.get(v, f"{v}%"),
+        description="The mower's speaker volume level (how loud its audio cues play) — Mute / Low / Medium / High. Off by default.",
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
@@ -586,6 +917,7 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
             ", ".join(warning_label(c) for c in d.get("warningCodes", []))
             if d.get("warningCodes") else "None"
         ),
+        description="The mower's active warning(s), decoded from warningCodes to readable labels (e.g. lift timeout, tip-over, front/rear ultrasonic lost). 'None' when healthy. A WARNING is a caution (the mower keeps working) — distinct from Error, which is a hard fault. Drives the amber state on the map's mower icon.",
         entity_registry_enabled_default=False,
     ),
     LymowSensorDesc(
@@ -595,12 +927,14 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         key="last_audio",
         name="Last Audio",
         icon="mdi:bullhorn-variant",
+        description="The most recent audio cue the mower played (mow-start chime, charging, blade-stop, etc.), decoded from its audioId. Sticky — holds the last cue until a new one. Useful as a correlation marker (e.g. a blade-stop near a path anomaly).",
         value_source=lambda d: audio_label(d["audioId"]) if d.get("audioId") is not None else None,
     ),
     LymowSensorDesc(
         key="current_zone",
         name="Current Zone",
         icon="mdi:map-marker-radius",
+        description="Which mapped zone the mower is in right now — computed locally by point-in-polygon from its RTK position against the zone boundaries (with a ~1 ft edge buffer so a perimeter lap doesn't drop it, and exclusive-area sticky logic to pick a zone when overlapping ones contain the point). It PREFERS the active task's zones in an overlap (an edge-clip into an adjacent zone while mowing resolves to the zone being mowed), but never HIDES a non-task zone — if the mower is travelling through one to reach a far zone, or gets stuck/dies/errors in one, it still reports that zone so you can always locate it. If the mower drives PAST a small buffer INTO a no-go zone (an intrusion, common before it gets stuck), this reads 'No Go: <name>' instead; riding the no-go's edge on a perimeter lap is not flagged. 'unknown' when it's between zones (e.g. in a channel).",
         value_source="currentZone",
         entity_registry_enabled_default=False,
     ),
@@ -671,32 +1005,6 @@ SENSORS: tuple[LymowSensorDesc, ...] = (
         entity_registry_enabled_default=False,
     ),
 
-    LymowSensorDesc(
-        key="path_points",
-        name="Path Points",
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:vector-polyline",
-        value_source=lambda d: (d.get("path_data") or {}).get("points_count"),
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="path_segments",
-        name="Path Segments",
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:vector-line",
-        value_source=lambda d: (d.get("path_data") or {}).get("segment_count"),
-        entity_registry_enabled_default=False,
-    ),
-    LymowSensorDesc(
-        key="path_length",
-        name="Path Length",
-        native_unit_of_measurement=UnitOfLength.METERS,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:map-marker-distance",
-        value_source=lambda d: (d.get("path_data") or {}).get("path_length_m"),
-        entity_registry_enabled_default=False,
-    ),
-
 )
 
 
@@ -762,6 +1070,27 @@ async def async_setup_entry(
         update_before_add=False,
     )
 
+    # Per-zone history entities — one TIMESTAMP sensor per zone, discovered from the map
+    # catalog (which arrives over MQTT after setup) and for any zone added later in the app.
+    # (Discovery + hashId anchoring pattern adapted from Mortimer452/Lymow-One-MQTT, MIT.)
+    _seen: set[str] = set()
+
+    @callback
+    def _discover_zone_entities() -> None:
+        zones = ((coord.data or {}).get("btMap") or {}).get("zones") or []
+        new: list[LymowZonePerZoneSensor] = []
+        for z in zones:
+            hid = z.get("hashId")
+            if not hid or hid in _seen:
+                continue
+            _seen.add(hid)
+            new.append(LymowZonePerZoneSensor(coord, hid, z.get("name") or hid))
+        if new:
+            async_add_entities(new)
+
+    entry.async_on_unload(coord.async_add_listener(_discover_zone_entities))
+    _discover_zone_entities()
+
 
 class LymowCurrentChannelSensor(LymowEntity, SensorEntity):
     """Live channel the mower is transiting — point-in-polygon of its pose against
@@ -784,6 +1113,7 @@ class LymowCurrentChannelSensor(LymowEntity, SensorEntity):
     def extra_state_attributes(self):
         info = (self.coordinator.data or {}).get("currentChannelInfo") or {}
         return {
+            "description": "The connector channel the mower is transiting (the corridor linking two zones), computed locally by point-in-polygon of its position against each channel. When it's inside both a zone and a channel, the zone wins and this reads 'unknown'.",
             "channel_id": info.get("channel_id"),
             "zone_1": info.get("zone1"),
             "zone_2": info.get("zone2"),
@@ -812,12 +1142,21 @@ class LymowZoneHistorySensor(LymowEntity, SensorEntity):
         return {
             "zones": history,
             "zone_count": len(history),
-            # Lymow cloud telemetry only reports a single session-level clean
-            # summary (area/time/percent) plus the list of zones in the task. It
-            # does NOT break those stats down per zone, so any duration/area/percent
-            # shown per zone is the SESSION total covering all zones, not that zone
-            # alone. This flag documents that limitation for dashboards/automations.
+            # One unified record per zone (keyed by hashId). Fields:
+            #   last_mowed, end_type, mow_count, coverage_points
+            #   mowing_minutes  = blade-down time (cloud cleanTime)
+            #   session_minutes = wall-clock incl. travel to/from the dock
+            #   area_covered_m2 = total blade coverage (incl. chess overlap, cloud)
+            #   zone_area_m2    = the zone's geometric area
+            # NOTE: the cloud never breaks area/time/percent down PER zone — on a
+            # multi-zone task those cloud values are the SESSION total across all zones.
             "per_zone_stats_available": False,
+            # description surfaced for users browsing the entity
+            "description": "Per-zone mow history (persists across restarts). mowing_minutes = "
+                           "blade-down time; session_minutes = total incl. travel; "
+                           "area_covered_m2 = blade coverage incl. overlap; zone_area_m2 = "
+                           "geometric zone area. Cloud area/time are session totals on "
+                           "multi-zone tasks, not per-zone (per_zone_stats_available=false).",
         }
 
 
@@ -840,6 +1179,82 @@ class LymowSensor(LymowEntity, SensorEntity):
         if fn := self.entity_description.transform:
             return fn(raw)
         return raw
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        attrs: dict[str, Any] = {}
+        if fn := self.entity_description.attrs_source:
+            attrs.update(fn(self.coordinator.data or {}) or {})
+        if self.entity_description.description:
+            attrs["description"] = self.entity_description.description
+        return attrs or None
+
+
+class LymowZonePerZoneSensor(LymowEntity, SensorEntity, RestoreEntity):
+    """One sensor PER zone — state is the last-mowed timestamp, attributes carry that
+    zone's unified history record (mow_count, mowing_minutes, derived per-zone mow time,
+    session_minutes, battery_used, coverage, areas). hashId-anchored so an app rename keeps
+    the entity (and any automations on it); RestoreEntity keeps the timestamp across
+    restarts until the next mow. The 'Zone History' overview sensor still holds all zones
+    for templates/summary. (Per-zone pattern adapted from Mortimer452/Lymow-One-MQTT, MIT.)
+    """
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:map-marker-check"
+
+    def __init__(self, coordinator: LymowCoordinator, hash_id: str, name: str) -> None:
+        super().__init__(coordinator, f"zone_hist_{hash_id}")
+        self._hash_id = hash_id
+        self._attr_name = f"Zone {name}"
+        self._restored_ts: datetime | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last and last.state not in (None, "unknown", "unavailable"):
+            try:
+                self._restored_ts = datetime.fromisoformat(last.state)
+            except (TypeError, ValueError):
+                pass
+
+    @property
+    def _record(self) -> dict:
+        return ((self.coordinator.data or {}).get("zone_history") or {}).get(self._hash_id) or {}
+
+    @property
+    def native_value(self) -> datetime | None:
+        lm = self._record.get("last_mowed")
+        if lm:
+            try:
+                return datetime.fromisoformat(lm)
+            except (TypeError, ValueError):
+                pass
+        return self._restored_ts
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        rec = self._record
+        # Pick up app renames live from the catalog.
+        for z in ((self.coordinator.data or {}).get("btMap") or {}).get("zones") or []:
+            if z.get("hashId") == self._hash_id and z.get("name"):
+                self._attr_name = f"Zone {z['name']}"
+                break
+        keys = ("zone_name", "mow_count", "mowing_minutes", "mowing_minutes_derived",
+                "session_minutes", "battery_used_pct", "coverage_points",
+                "area_covered_m2", "session_area_m2", "zone_area_m2",
+                "path_spacing_in", "cut_overlap_pct", "end_type",
+                "per_zone_stats_available")
+        out = {k: rec.get(k) for k in keys if k in rec}
+        out["description"] = ("Per-zone mow history. PER-SESSION (last mow, matches the "
+                              "timestamp): mowing_minutes_derived = true blade-down time IN "
+                              "this zone (mow-only, pauses across a recharge); battery_used_pct "
+                              "= battery spent mowing THIS zone (continuous in-zone drain only); "
+                              "area_covered_m2 = this zone's real mowed footprint; session_minutes "
+                              "= this mow's wall-clock incl. travel. LIFETIME: mow_count. "
+                              "CLOUD SESSION TOTALS (all zones): mowing_minutes, session_area_m2; "
+                              "zone_area_m2 = the zone's geometric size.")
+        return out
 
 
 class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
@@ -923,6 +1338,7 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
         mowed_area_features: list[dict[str, Any]] = []
         dock_features: list[dict[str, Any]] = []
         robot_features: list[dict[str, Any]] = []
+        rtk_features: list[dict[str, Any]] = []
 
         # Zone polygons — decimated to max 150 pts each
         for idx, zone in enumerate(zones):
@@ -1036,6 +1452,23 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
                 features.append(feature)
                 robot_features.append(feature)
 
+        # RTK base station antenna — physically located at the ENU origin
+        # (btMap.enuBasePoint), the survey datum RTK positions are referenced to.
+        # The app maps the dock and mower but not this; surface it as its own pin.
+        # By definition it's the origin: (lat0,lon0) in WGS84, or (0,0) in ENU
+        # fallback — so it renders alongside the dock/robot in either frame.
+        if has_origin:
+            rtk_coords: list[float] = [round(lon0, 8), round(lat0, 8)]
+        else:
+            rtk_coords = [0.0, 0.0]
+        feature = {
+            "type": "Feature",
+            "properties": {"type": "rtk_antenna", "name": "RTK Antenna"},
+            "geometry": {"type": "Point", "coordinates": rtk_coords},
+        }
+        features.append(feature)
+        rtk_features.append(feature)
+
         # Mowed area polygons from QUERY_PATH
         for idx, poly in enumerate(mowed_polygons):
             pts = _safe_pts(poly)
@@ -1090,6 +1523,10 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
             "geojson_robot": {
                 "type": "FeatureCollection",
                 "features": robot_features,
+            },
+            "geojson_rtk_antenna": {
+                "type": "FeatureCollection",
+                "features": rtk_features,
             },
 
             "zone_count": len(zones),

@@ -35,6 +35,7 @@ class LymowChannelBuffer(LymowEntity, NumberEntity):
 
     _attr_name = "Channel Detection Buffer"
     _attr_icon = "mdi:vector-polyline-plus"
+    _attr_extra_state_attributes = {"description": "Extra slack (metres) OUTSIDE the channel corridor where the mower still counts as 'in' that channel. Detection now tests a corridor RIBBON offset from the channel centreline (corridor width = map_tuning.CHANNEL_RIBBON_HALFWIDTH_M), so this defaults to 0 (strict inside the corridor) — raise it only for extra GPS slack. Local setting — NOT sent to the mower."}
     _attr_native_min_value = 0.0
     _attr_native_max_value = 5.0
     _attr_native_step = 0.25
