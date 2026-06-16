@@ -47,13 +47,17 @@ USER_CTRL_QUERY_NET_DETAIL       = 53
 USER_CTRL_QUERY_RTK_L1           = 57
 USER_CTRL_QUERY_RTK_L2           = 58
 
-# cleanMode int -> string (PbZoneConfig.cleanMode values)
+# cleanMode int -> string (PbZoneConfig.cleanMode values). CORRECTED 2026-06-06 by decompiling
+# the Lymow 3.0.7 Hermes bundle (CleanModeType enum, declaration order = ordinal, cross-checked
+# vs MOW_END_NONE=0). The old table had 2/3/4 wrong (it claimed 2=CHESS,3=PERIMETER,4=ADAPTIVE),
+# which mislabeled every cross-pattern zone (cleanMode=3) as "perimeter-only". Verified against
+# Nate's live zones: his cross/double zones = 3 = CHESS_BOARD, Right Side single = 1 = ZIGZAG.
 CLEAN_MODE_INT = {
     0: "NONE",
-    1: "ZIGZAG_MODE",
-    2: "CHESS_BOARD_MODE",
-    3: "PERIMETER_LAPS_ONLY_MODE",
-    4: "ADAPTIVE_ZIGZAG_MODE",
+    1: "ZIGZAG_MODE",            # single pass
+    2: "ADAPTIVE_ZIGZAG_MODE",   # single pass, optimized direction
+    3: "CHESS_BOARD_MODE",       # cross pattern / DOUBLE pass
+    4: "PERIMETER_LAPS_ONLY_MODE",
 }
 CLEAN_MODE_STR = {v: k for k, v in CLEAN_MODE_INT.items() if k != 0}
 
@@ -101,6 +105,11 @@ class ChannelInfo:
     zone2: str = ""
     is_valid: bool | None = None
     is_docking_channel: bool = False
+    # Per-channel config (PbChannel fields 8/9/10) — the obstacle-detection mode,
+    # cut height and blade-lift used when transiting this corridor.
+    detect_mode: int | None = None
+    cut_height: int | None = None
+    channel_lift: bool | None = None
     polygon_points: list[tuple[float, float]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -114,6 +123,12 @@ class ChannelInfo:
         }
         if self.is_valid is not None:
             out["isValid"] = self.is_valid
+        if self.detect_mode is not None:
+            out["detectMode"] = self.detect_mode
+        if self.cut_height is not None:
+            out["cutHeight"] = self.cut_height
+        if self.channel_lift is not None:
+            out["channelLift"] = self.channel_lift
         return out
 
 @dataclass(slots=True)
@@ -355,6 +370,14 @@ def encode_userctrl(user_ctrl: int) -> bytes:
     return msg.SerializeToString()
 
 
+def encode_play_audio(audio_id: int) -> bytes:
+    """Make the mower play a voice prompt / sound by AudioId (PbInput.audioId,
+    field 16) — e.g. a locate / find-my-mower beep. IDs: see AUDIO_ID_LABELS."""
+    msg = _new_input()
+    msg.audioId = int(audio_id)
+    return msg.SerializeToString()
+
+
 def encode_query_map(query_index: int = 0) -> bytes:
     """Query full map via PbInput.btMap.queryMap."""
     msg = _new_input()
@@ -527,11 +550,28 @@ def encode_set_audio_volume(volume: int) -> bytes:
     return msg.SerializeToString()
 
 
-def encode_set_charging_mode(mode: int) -> bytes:
-    """Set return-to-dock route. 0=Direct Route, 1=Follow Perimeter."""
+def encode_set_task_config(
+    charging_mode: int,
+    rain_cleaning: bool,
+    zone_order: int = 0,
+    disable_charging_park: bool = False,
+) -> bytes:
+    """Write the FULL PbTaskConfig (userCtrl=36).
+
+    The mower applies the whole taskConfig message, so every field must be sent
+    on every write — sending just one field zeroes the rest. (Verified on
+    hardware 2026-06-02: toggling Rainy Mowing alone reset chargingMode to
+    Follow Perimeter.) Callers pass the current values of the fields they are
+    not changing; see LymowCoordinator._current_task_config.
+
+    chargingMode: 0=Follow Perimeter, 1=Direct Route (matches select.py).
+    """
     msg = _new_input()
     msg.userCtrl = 36  # USER_CTRL_SET_TASK_CONFIG
-    msg.taskConfig.chargingMode = int(mode)
+    msg.taskConfig.chargingMode = int(charging_mode)
+    msg.taskConfig.rainCleaning = bool(rain_cleaning)
+    msg.taskConfig.zoneOrder = int(zone_order)
+    msg.taskConfig.disableChargingPark = bool(disable_charging_park)
     return msg.SerializeToString()
 
 
@@ -656,10 +696,6 @@ def decode_pboutput_envelope(envelope_bytes: bytes) -> pb.PbOutput | None:
     return decode_pboutput(raw)
 
 
-def populated_fields(msg: pb.PbOutput) -> list[str]:
-    return [field.name for field, _ in msg.ListFields()]
-
-
 # ---------------------------------------------------------------------------
 # Low-level wire parser for opaque btMap/queryAck blobs
 # ---------------------------------------------------------------------------
@@ -733,6 +769,45 @@ def _split_path_segments(points: list[tuple[float, float]]) -> list[list[tuple[f
     return segments
 
 
+def _marker_kind(pt: tuple[float, float]) -> int | None:
+    """Return 333 or 444 if pt is that marker, else None."""
+    x, y = pt
+    if abs(x - 333.0) < 0.001 and abs(y - 333.0) < 0.001:
+        return 333
+    if abs(x - 444.0) < 0.001 and abs(y - 444.0) < 0.001:
+        return 444
+    return None
+
+
+def _split_path_segments_typed(
+    points: list[tuple[float, float]],
+) -> list[dict[str, Any]]:
+    """Like _split_path_segments, but tags each segment with the marker kind
+    (333 / 444) immediately before and after it. The legacy splitter collapses
+    both markers into a generic separator and discards which one it was, forcing
+    a fragile point-count heuristic downstream. Capturing the marker context lets
+    cut(333)/planned(444) classification use the real markers instead of size.
+    """
+    out: list[dict[str, Any]] = []
+    current: list[tuple[float, float]] = []
+    last_marker: int | None = None
+
+    for pt in points:
+        m = _marker_kind(pt)
+        if m is not None:
+            if len(current) >= 2:
+                out.append({"points": current, "marker_before": last_marker, "marker_after": m})
+            current = []
+            last_marker = m
+            continue
+        current.append(pt)
+
+    if len(current) >= 2:
+        out.append({"points": current, "marker_before": last_marker, "marker_after": None})
+
+    return out
+
+
 def _path_length(points: list[tuple[float, float]]) -> float:
     total = 0.0
     for i in range(1, len(points)):
@@ -776,6 +851,7 @@ def parse_query_path(bt_map_msg) -> dict:
         "bounds": None,
         "points": [],
         "segments": [],
+        "segment_markers": [],
     }
 
     try:
@@ -829,6 +905,12 @@ def parse_query_path(bt_map_msg) -> dict:
         result["segment_count"] = len(segments)
         result["points"] = clean_points
         result["segments"] = segments
+        # Diagnostic: per-segment marker context (size + bounding 333/444 markers),
+        # to learn the real cut/planned semantics and drive a marker-based classifier.
+        result["segment_markers"] = [
+            {"n": len(s["points"]), "before": s["marker_before"], "after": s["marker_after"]}
+            for s in _split_path_segments_typed(raw_points)
+        ]
         result["bounds"] = _bounds(clean_points)
         result["path_length_m"] = round(sum(_path_length(seg) for seg in segments), 2)
 
@@ -1376,6 +1458,9 @@ def parse_map_fields(map_data: dict[int, list[tuple[str, Any]]]) -> ZoneCatalog:
             zone2=_gs(chf, 3) or "",
             is_valid=bool(is_valid_raw) if is_valid_raw is not None else None,
             is_docking_channel=bool(_gv(chf, 6)) if _gv(chf, 6) is not None else False,
+            detect_mode=_gv(chf, 8),
+            cut_height=_gv(chf, 9),
+            channel_lift=bool(_gv(chf, 10)) if _gv(chf, 10) is not None else None,
             polygon_points=pts,
         ))
 
@@ -1493,26 +1578,6 @@ def _parse_nogo_zone(raw: bytes) -> NoGoZoneInfo | None:
         bound_11=bound_11,
         inner_point=inner_point,
     )
-
-
-def decode_btmap(raw: bytes) -> dict[str, Any]:
-    """Backward-compatible function returning btMap as dict."""
-    if not raw:
-        return {}
-    # raw may be PbBtMap bytes, not PbMap bytes.
-    msg = pb.PbBtMap()
-    try:
-        msg.ParseFromString(raw)
-        return parse_zone_catalog(msg).to_btmap_dict()
-    except Exception:
-        return parse_map_fields(_wire_parse(raw)).to_btmap_dict()
-
-
-def decode_pbmap(raw: bytes) -> dict[str, Any]:
-    """Decode standalone PbMap file downloaded from S3 backup maps."""
-    if not raw:
-        return {}
-    return parse_map_fields(_wire_parse(raw)).to_btmap_dict()
 
 
 # ---------------------------------------------------------------------------

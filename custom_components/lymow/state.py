@@ -9,10 +9,14 @@ The coordinator owns the dict. These helpers only mutate/derive it.
 """
 from __future__ import annotations
 
+import logging
 from math import cos, hypot, radians
 from typing import Any
 
 from .const import DEFAULT_CHANNEL_BUFFER_M
+from .map_tuning import CHANNEL_RIBBON_HALFWIDTH_M
+
+_LOGGER = logging.getLogger(__name__)
 
 try:
     from .proto import lymow_pb2 as pb
@@ -21,6 +25,10 @@ except Exception:  # pragma: no cover - allows standalone linting
 
 
 _ACTIVE_TASK_WORK_STATUSES = {2, 8, 9, 14}  # mowing, resume, zone partition, escaping
+# Hold a zone while the mower is within this distance of its edge — on a perimeter
+# lap the mower rides the boundary and its GPS sits right on/just outside the
+# polygon, which would otherwise drop current_zone out to unknown. ~1 ft.
+ZONE_EDGE_BUFFER_M = 0.3
 # Statuses where the mower is out navigating and we should resolve zone/channel.
 # Adds Docking (4) so it tracks on the way HOME too — it crosses the same
 # corridors returning, which matters for transit automations (e.g. a gate).
@@ -93,6 +101,15 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
 
         state[field.name] = value
 
+        # Diagnostic: mobilePushNotification (field 25) is the only push-ish field
+        # in the proto, but it never appeared during a live rain-dock test. Log it
+        # at INFO whenever it's actually non-zero so we can learn — from normal use —
+        # whether the firmware ever populates it on the telemetry topic (and capture
+        # the code values). If it stays silent over time, the field is dead on our
+        # channel and the push entity should be removed.
+        if field.name == "mobilePushNotification" and value:
+            _LOGGER.info("Lymow mobilePushNotification fired: code=%s", value)
+
     if getattr(msg, "msgId", None):
         state["msgId"] = msg.msgId
     if getattr(msg, "version", None):
@@ -142,7 +159,8 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
     if _has_msg(li):
         state["localizationInfo"] = li
         for src, dst in [
-            ("numSatellites", "gnssNumSatellites"),
+            # numSatellites intentionally NOT mapped: flat constant (~10), not a real
+            # satellite count — superseded by rtkSatellites (satelliteCount) below.
             ("horizontalAccuracy", "gnssHorizontalAccuracy"),
             ("verticalAccuracy", "gnssVerticalAccuracy"),
             ("positionQuality", "gnssPositionQuality"),
@@ -283,6 +301,33 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
             if _has_field(net, key):
                 state[key] = getattr(net, key)
 
+    # promptInfo (PbOutput field 15): transient command/check feedback the app uses
+    # but we never parsed. Carries selfCheckingRet (pre-mow subsystem self-test),
+    # mutateRet (command ack: code + human-readable errorMsg — the OTA-decline reason
+    # we were hunting), and zoneRet (zone-edit result). Each sub-field is optional;
+    # extract whichever is present and leave the others sticky.
+    if any(f.name == "promptInfo" for f, _ in msg.ListFields()):
+        pi = msg.promptInfo
+        if _has_field(pi, "selfCheckingRet"):
+            sc = pi.selfCheckingRet
+            state["selfCheck"] = {
+                "battery": bool(getattr(sc, "batteryPass", False)),
+                "rtk": bool(getattr(sc, "rtkPass", False)),
+                "cliff": bool(getattr(sc, "cliffPass", False)),
+                "blade": bool(getattr(sc, "bladePass", False)),
+                "rain": bool(getattr(sc, "rainPass", False)),
+                "algo": bool(getattr(sc, "algoPass", False)),
+            }
+            _LOGGER.debug("Lymow self-check result: %s", state["selfCheck"])
+        if _has_field(pi, "mutateRet"):
+            mr = pi.mutateRet
+            state["mutateResult"] = {"code": mr.code, "errorMsg": mr.errorMsg}
+            _LOGGER.info("Lymow command result (mutateRet): code=%s msg=%r",
+                         mr.code, mr.errorMsg)
+        if _has_field(pi, "zoneRet"):
+            zr = pi.zoneRet
+            state["zoneResult"] = {"code": zr.code, "hashId": zr.hashId}
+
     # taskConfig: check parent ListFields (not ByteSize) because proto3
     # zero values (chargingMode=0) produce ByteSize=0 but are still valid.
     if any(f.name == "taskConfig" for f, _ in msg.ListFields()):
@@ -301,10 +346,40 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
         state["rtkDiagnosticL1"] = rtk1
         if _has_field(rtk1, "rtkStatus"):
             state["rtkStatus"] = rtk1.rtkStatus
+        # Per-band SNR, L5 sat count, and base-station data error rate — RTK
+        # health detail (read directly; 0 is a valid reading for these metrics).
+        state["rtkL1Snr"] = rtk1.l1Snr
+        state["rtkL2Snr"] = rtk1.l2Snr
+        state["rtkL5Snr"] = rtk1.l5Snr
+        state["rtkL5Satellites"] = rtk1.l5SatelliteCount
+        # Total satellites used in the RTK solution (all bands). This is the count the
+        # Lymow app shows as "satellites" (~20) and the only sat metric with real spatial
+        # variation. Drives the RTK Satellites sensor + the RTK Satellites heatmap layer.
+        state["rtkSatellites"] = rtk1.satelliteCount
+        state["rtkBaseDataErrorRate"] = round(float(rtk1.baseDataErrorRate), 3)
 
     rtk2 = getattr(msg, "rtkDiagnosticL2", None)
     if _has_msg(rtk2):
         state["rtkDiagnosticL2"] = rtk2
+        # diffAge = age of the RTK correction data (s); high = degraded fix.
+        # loraBps = RTK radio link rate per channel; cw/ant/hwDc = advanced
+        # interference/antenna diagnostics (kept as attributes, not entities).
+        state["rtkDiffAge"] = round(float(rtk2.diffAge), 2)
+        state["rtkLoraBps"] = [rtk2.loraBps0, rtk2.loraBps1, rtk2.loraBps2]
+        state["rtkCwRatio"] = [rtk2.cwRatio0, rtk2.cwRatio1, rtk2.cwRatio2]
+        state["rtkAntValue"] = [rtk2.antValue0, rtk2.antValue1, rtk2.antValue2]
+        state["rtkHwDc"] = [round(float(rtk2.hwDc0), 2), round(float(rtk2.hwDc1), 2), round(float(rtk2.hwDc2), 2)]
+
+    # algoLocOutput (PbOutput field 19): localization-algo health. sensorConfidence
+    # = per-sensor confidence (vision cameras + GNSS); useGnss = is GNSS in the fix.
+    algo = getattr(msg, "algoLocOutput", None)
+    if _has_msg(algo):
+        state["algoLocOutput"] = algo
+        state["useGnss"] = bool(getattr(algo, "useGnss", False))
+        sc = getattr(algo, "sensorConfidence", None)
+        if _has_msg(sc):
+            state["cameraConfidence"] = [sc.camera1Conf, sc.camera2Conf]
+            state["gnssConfidence"] = sc.gnssConf
 
     cr = getattr(msg, "cleanReport", None)
     if _has_msg(cr):
@@ -482,6 +557,16 @@ def _zones_from_state(state: dict[str, Any]) -> list[Any]:
     return zones if isinstance(zones, list) else []
 
 
+def _nogo_zones_from_state(state: dict[str, Any]) -> list[Any]:
+    catalog = state.get("zone_catalog")
+    ng = getattr(catalog, "nogo_zones", None)
+    if isinstance(ng, list):
+        return ng
+    btmap = state.get("btMap") or {}
+    ng = btmap.get("nogoZones") if isinstance(btmap, dict) else None
+    return ng if isinstance(ng, list) else []
+
+
 def _localization_active(state: dict[str, Any]) -> bool:
     """Mower is actively positioned. Check BOTH robotStatus and workStatus: the
     mower reliably sets robotStatus (=Mowing) but often leaves workStatus unset,
@@ -511,14 +596,69 @@ def _polygon_latlon(pts: list[Any], ebp: Any) -> list[tuple[float, float]]:
     return out
 
 
-def derive_current_zone(state: dict[str, Any]) -> str | None:
-    """Zone whose polygon contains the mower's live position.
+def corridor_ribbon(points: list[Any], half_width: float) -> list[tuple[float, float]]:
+    """Offset a CENTRELINE path into a closed corridor RIBBON polygon of total width 2*half_width,
+    mitred at each vertex (normal ⟂ the averaged in/out tangent). `points` are ENU (x, y) as
+    dicts/tuples/objects; returns [(x, y), ...] ENU (left side forward + right side back), or [] if
+    fewer than 2 points. Shared by the map renderer and channel detection so the corridor you SEE
+    is exactly the corridor that's tested."""
+    pts: list[tuple[float, float]] = []
+    for p in points:
+        if isinstance(p, dict):
+            x, y = p.get("x"), p.get("y")
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            x, y = p[0], p[1]
+        else:
+            x, y = getattr(p, "x", None), getattr(p, "y", None)
+        if x is not None and y is not None:
+            pts.append((float(x), float(y)))
+    n = len(pts)
+    if n < 2:
+        return []
+    left: list[tuple[float, float]] = []
+    right: list[tuple[float, float]] = []
+    for i in range(n):
+        if i == 0:
+            tx, ty = pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]
+        elif i == n - 1:
+            tx, ty = pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]
+        else:
+            ax, ay = pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]
+            bx, by = pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]
+            la = hypot(ax, ay) or 1.0
+            lb = hypot(bx, by) or 1.0
+            tx, ty = ax / la + bx / lb, ay / la + by / lb
+        L = hypot(tx, ty) or 1.0
+        nx, ny = -ty / L * half_width, tx / L * half_width
+        x, y = pts[i]
+        left.append((x + nx, y + ny))
+        right.append((x - nx, y - ny))
+    return left + right[::-1]
 
-    Matches in WGS84: the mower's GPS (robot_gps_from_state, which falls back to
-    the RTK lat/lon if pose x/y are absent) vs each zone polygon converted from
-    ENU metres to lat/lon via the map's GPS origin. (The old version matched raw
-    pose x/y and gated on workStatus, which never resolved — wrong field + a
-    coordinate assumption that didn't hold.)"""
+
+def derive_current_zone(state: dict[str, Any]) -> str | None:
+    """Zone the mower is actively in, with overlap disambiguation.
+
+    Geometric point-in-polygon (mower GPS vs each zone polygon, ENU→WGS84). But
+    zones can overlap by many feet, and the mower never reports a single current
+    zone over telemetry (curZoneId_ lives only in PbRebootResume; the official app
+    also resolves this geometrically). So:
+      * inside exactly ONE zone -> that zone (its exclusive area; unambiguous)
+      * inside 2+ overlapping zones -> HOLD the previously-current zone if it is
+        one of them ("sticky-until-exclusive": never switch *inside* an overlap —
+        wait until the mower reaches a single zone's exclusive ground). If the prior
+        zone isn't among them, tiebreak to the smallest (innermost) zone.
+      * inside 0 zones (channel/transit gap) -> None, so the caller can fall back
+        to channel detection.
+    No-go zones take priority: if the mower has penetrated a no-go PAST the edge buffer
+    (not just riding its edge on a perimeter lap), report "No Go: <name>" so an intrusion
+    (a common get-stuck precursor) is visible rather than hidden behind the go-zone.
+    Active-task zones (cleanInfo.areaInfo.cleanZoneIds) are PREFERRED, not required: in an
+    overlap they win (an edge-clip into an adjacent zone while mowing resolves to the task
+    zone). But a non-task zone is NEVER hidden — if the mower is genuinely inside one
+    (travelling through it to a far zone, or stuck/dead there), Current Zone reports it, so
+    the mower can always be located. (Hiding non-task zones would lose it in transit.)
+    """
     if not _localization_active(state):
         return None
     mower = robot_gps_from_state(state)
@@ -527,19 +667,75 @@ def derive_current_zone(state: dict[str, Any]) -> str | None:
         return None
     mlat, mlon = mower
 
+    # No-go intrusion: if the mower has driven PAST the edge buffer INTO a no-go zone,
+    # surface it explicitly as "No Go: <name>" — it shouldn't be there, and this is a
+    # common precursor to getting stuck. Riding the no-go's edge during a perimeter lap
+    # (within ZONE_EDGE_BUFFER_M of the boundary) is NOT flagged, so the mower stays
+    # reported in its go-zone while lapping AROUND the obstacle; only a genuine
+    # penetration past the buffer trips it.
+    for i, ng in enumerate(_nogo_zones_from_state(state)):
+        if isinstance(ng, dict):
+            npts = ng.get("points") or []
+            nname = ng.get("name") or ng.get("hashId")
+        else:
+            npts = getattr(ng, "polygon_points", []) or []
+            nname = getattr(ng, "name", None) or getattr(ng, "hash_id", None)
+        if not npts or len(npts) < 3:
+            continue
+        npoly = _polygon_latlon(npts, ebp)
+        if len(npoly) < 3:
+            continue
+        if point_in_polygon(mlon, mlat, npoly) and _dist_to_polygon_m(mlon, mlat, npoly) > ZONE_EDGE_BUFFER_M:
+            return f"No Go: {nname or f'#{i + 1}'}"
+
+    task_ids = set(state.get("cleanZoneIds") or [])
+    containing: list[tuple[Any, Any, float]] = []  # (name, hashId, polygon area)
     for zone in _zones_from_state(state):
         if isinstance(zone, dict):
             pts = zone.get("points") or []
             name = zone.get("name") or zone.get("hashId")
+            hid = zone.get("hashId")
         else:
             pts = getattr(zone, "polygon_points", []) or []
             name = getattr(zone, "name", None) or getattr(zone, "hash_id", None)
+            hid = getattr(zone, "hash_id", None)
         if not pts or len(pts) < 3:
             continue
         poly = _polygon_latlon(pts, ebp)
-        if len(poly) >= 3 and point_in_polygon(mlon, mlat, poly):
-            return name
-    return None
+        if len(poly) < 3:
+            continue
+        # Inside the polygon OR within ZONE_EDGE_BUFFER_M of its edge — the buffer
+        # keeps the zone held while the mower rides the boundary on a perimeter lap
+        # (GPS on/just outside the edge would otherwise drop out to unknown).
+        if point_in_polygon(mlon, mlat, poly) or _dist_to_polygon_m(mlon, mlat, poly) <= ZONE_EDGE_BUFFER_M:
+            containing.append((name, hid, polygon_area(pts)))
+
+    if not containing:
+        return None  # transit / channel gap — caller falls back to channel
+
+    # PREFER (don't restrict to) the active-task zones. In an overlap, resolve to the task
+    # zone — so an edge-clip into an adjacent zone while mowing reads as the task zone. But
+    # if the mower is genuinely inside a NON-task zone (travelling through it to reach a far
+    # zone, or stuck / out of battery / errored there), we still report THAT zone, because
+    # the whole point of Current Zone is being able to LOCATE the mower wherever it is.
+    if task_ids:
+        in_task = [c for c in containing if c[1] in task_ids]
+        if in_task:
+            containing = in_task
+
+    if len(containing) == 1:
+        return containing[0][0]
+
+    # Overlap: hold the last unambiguous zone (sticky-until-exclusive). Only switch
+    # once the mower reaches a single zone's exclusive area (handled by the len==1
+    # branch above). If we entered the overlap with no prior match, pick the
+    # smallest (innermost / most specific) zone.
+    prev = state.get("currentZone")
+    names = [c[0] for c in containing]
+    if prev in names:
+        return prev
+    containing.sort(key=lambda c: c[2])
+    return containing[0][0]
 
 
 def _channels_from_state(state: dict[str, Any]) -> list[Any]:
@@ -596,15 +792,19 @@ def derive_current_channel(state: dict[str, Any]) -> dict[str, Any] | None:
             z1 = getattr(ch, "zone1", ""); z2 = getattr(ch, "zone2", "")
             dock = getattr(ch, "is_docking_channel", False)
 
-        if not pts or len(pts) < 3:
+        if not pts or len(pts) < 2:
             continue
-        poly = _polygon_latlon(pts, ebp)
+        # The channel points are a CENTRELINE path — test against the corridor RIBBON (the same
+        # geometry the map draws), not the raw points closed into a thin triangle. The ribbon's own
+        # width replaces almost all of what the old radial buffer compensated for, so buffer_m now
+        # defaults to ~0 (just extra GPS slack, still user-tunable).
+        ribbon = corridor_ribbon(pts, CHANNEL_RIBBON_HALFWIDTH_M)
+        poly = _polygon_latlon(ribbon, ebp)
         if len(poly) < 3:
             continue
 
-        # Inside the polygon = distance 0. Otherwise accept the channel when the
-        # mower is within the buffer of its perimeter (thin/short corridors miss
-        # otherwise). When several channels qualify (junctions), the nearest wins.
+        # Inside the corridor = distance 0. Otherwise accept when within buffer_m of its edge
+        # (extra GPS slack; default 0). When several channels qualify (junctions), the nearest wins.
         if point_in_polygon(mlon, mlat, poly):
             dist = 0.0
         elif buffer_m > 0.0:

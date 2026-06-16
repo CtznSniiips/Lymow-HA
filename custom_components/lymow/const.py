@@ -98,7 +98,6 @@ WORK_STATUS_MOWING         = 2   # CLEANING (mowing)
 WORK_STATUS_PAUSE          = 3   # paused mid-mow
 WORK_STATUS_DOCKING        = 4   # returning to base
 WORK_STATUS_CHARGING       = 5   # charging at station
-WORK_STATUS_REMOTE_CONTROL = 6   # manual remote control
 WORK_STATUS_ERROR          = 7   # error state
 WORK_STATUS_RESUME         = 8   # resuming after pause
 WORK_STATUS_ZONE_PARTITION = 9   # zone mapping/partitioning
@@ -107,7 +106,6 @@ WORK_STATUS_UPDATING       = 11  # OTA firmware update
 WORK_STATUS_CHARGING_FULL  = 12  # fully charged
 WORK_STATUS_EMERGENCY_STOP = 13  # emergency stop triggered
 WORK_STATUS_ESCAPING       = 14  # escaping from stuck position
-WORK_STATUS_RTT            = 15  # factory RTT test mode
 
 # Virtual status (not in protobuf enum, set locally when shadow absent)
 WORK_STATUS_OFFLINE        = -1
@@ -121,15 +119,6 @@ USER_CTRL_DOCK                   = 2
 
 # Statuses that map to LawnMowerActivity.MOWING
 MOWING_STATUSES    = {WORK_STATUS_MOWING, WORK_STATUS_RESUME, WORK_STATUS_ZONE_PARTITION}
-# Statuses that map to LawnMowerActivity.RETURNING
-RETURNING_STATUSES = {WORK_STATUS_DOCKING, WORK_STATUS_PAUSE_DOCKING, WORK_STATUS_ESCAPING}
-# Statuses that map to LawnMowerActivity.DOCKED
-DOCKED_STATUSES    = {WORK_STATUS_NONE, WORK_STATUS_WAITING, WORK_STATUS_CHARGING,
-                      WORK_STATUS_CHARGING_FULL, WORK_STATUS_UPDATING}
-# Statuses that map to LawnMowerActivity.PAUSED
-PAUSED_STATUSES    = {WORK_STATUS_PAUSE, WORK_STATUS_REMOTE_CONTROL}
-# Statuses that map to LawnMowerActivity.ERROR
-ERROR_STATUSES     = {WORK_STATUS_ERROR, WORK_STATUS_EMERGENCY_STOP}
 
 # ─────────────────────────────────────────────────────────────
 # RtkStatus enum — rtkStatus is an INTEGER
@@ -159,22 +148,15 @@ CLEAN_MODE_OPTIONS = [
     CLEAN_MODE_ADAPTIVE_ZIGZAG,
 ]
 
-# ─────────────────────────────────────────────────────────────
-# deviceState STRING (online/offline — separate from workStatus)
-# ─────────────────────────────────────────────────────────────
-DEVICE_STATE_ONLINE  = "online"
-DEVICE_STATE_OFFLINE = "offline"
 
 # ─────────────────────────────────────────────────────────────
 # Shadow field names — verified from decompiled APK protobuf defs
 # ─────────────────────────────────────────────────────────────
 
 # --- Top-level state ---
-F_WORK_STATUS    = "workStatus"       # int  (RobotStatus enum)
 F_DEVICE_STATE   = "deviceState"      # str  "online" / "offline"
 F_IS_ONLINE      = "isOnline"         # bool
 F_IS_CHARGING    = "isCharging"       # bool
-F_IS_RECHARGING  = "isRecharging"     # bool (docked and charging)
 
 # --- Battery ---
 F_BATTERY        = "battery"          # int  0-100 %
@@ -185,58 +167,26 @@ F_MCU_VERSION    = "mcuVersion"       # str  MCU firmware version
 
 # --- Mowing ---
 F_CUT_HEIGHT     = "cutHeight"        # int  mm  (protobuf / BLE side)
-F_CUTTING_HEIGHT = "cuttingHeight"    # int  mm  (cloud shadow side — same value)
 F_CLEAN_MODE     = "cleanMode"        # str  (CLEAN_MODE_* constants)
 F_CLEAN_AREA     = "cleanArea"        # int  m²  area mowed this session
-F_CUT_SPEED      = "cutSpeed"         # int  blade speed
-
-# --- Zones ---
-F_CLEAN_ZONE_IDS = "cleanZoneIds"     # list[str]  zones to mow
-F_GO_ZONE_ID     = "goZoneHashId"     # str        current target zone
-F_GO_ZONE_IDS    = "goZoneHashIds"    # list[str]  queued target zones
-F_CUT_ZONE_ID    = "cutZoneHashId"    # str        zone currently being cut
-F_NOGO_ZONE_IDS  = "nogoZoneHashIds"  # list[str]  exclusion zones
 
 # --- Errors ---
 F_ERROR_CODE     = "errorCode"        # int   primary error code
-F_ERROR_CODES    = "errorCodes"       # list[int] all active error codes
 
 # --- RTK / GPS ---
 F_RTK_STATUS     = "rtkStatus"        # int  (RtkStatus enum)
-F_RTK_L1         = "rtkDiagnosticL1"  # dict {rtkStatus, precision, satelliteCount,
-                                      #        l1/l2/l5 SatelliteCount, l1/l2/l5 Snr,
-                                      #        baseStationStatus, baseDataErrorRate}
-F_RTK_L2         = "rtkDiagnosticL2"  # dict {diffAge, loraBps0/1/2, hwDc0/1/2,
-                                      #        cwRatio0/1/2, antValue0/1/2}
 
 # --- Connectivity (nested inside netDetailInfo) ---
 F_NET_DETAIL     = "netDetailInfo"    # dict — keys below:
 #   netDetailInfo sub-keys:
-NET_CURRENT_NET      = "currentNet"       # int  0=none 1=WiFi 2=LTE
-NET_WIFI_NAME        = "wifiName"         # str
-NET_WIFI_IP          = "wifiIp"           # str
 NET_WIFI_SIGNAL      = "wifiSignal"       # int  dBm
-NET_SIM_CARD_STATUS  = "simCardStatus"    # int  (SimCardStatus enum)
-NET_SIM_IP           = "simIp"            # str
 NET_SIM_SIGNAL       = "simSignal"        # int  dBm
-NET_SIM_REGISTRATION = "simRegistration"  # int  (SimCardRegist enum)
-NET_SIM_CONNECTION   = "simConnection"    # bool
-NET_SIM_ICCID        = "simIccid"         # str
 
 # Signal quality (top-level, from protobuf BLE messages)
 F_WIFI_SIGNAL    = "wifiSignalQuality"  # int
 F_LTE_SIGNAL     = "lteSignalQuality"   # int
-F_BT_SIGNAL      = "btSignalQuality"    # int
 F_LTE_WORKING    = "lteWorking"         # bool
 F_WIFI_WORKING   = "wifiWorking"        # bool
-
-# --- Map ---
-F_OBS_MAP        = "obsMap"             # dict  obstacle/boundary map data
-F_MAP_AREA       = "mapArea"            # area of the mapped lawn
-
-# --- Motion ---
-F_LINEAR_SPEED   = "linearSpeed"        # float
-F_ANGULAR_SPEED  = "angularSpeed"       # float
 
 # ─────────────────────────────────────────────────────────────
 # Known error codes (partial — at least 84 codes in the app)
@@ -302,11 +252,6 @@ def error_label(code: int) -> str:
     if entry:
         return entry[1]
     return f"E{code}"
-
-
-# Backwards-compat alias for existing callers that imported ERROR_CODE_LABELS
-# as a code->label dict. Derived from ERROR_CODES.
-ERROR_CODE_LABELS: dict[int, str] = {code: lbl for code, (_, lbl) in ERROR_CODES.items()}
 
 
 # WarningCode enum — full table recovered from the Lymow app 3.0.7 Hermes bytecode
@@ -445,11 +390,9 @@ AUDIO_EVENT_TYPES: list[str] = [
 ]
 
 # ─────────────────────────────────────────────────────────────
-# Services
-# ─────────────────────────────────────────────────────────────
-SERVICE_START_ZONE   = "start_zone"
-SERVICE_SET_BLADE    = "set_blade_height"
-SERVICE_SET_SCHEDULE = "set_schedule"
+# (Push-notification event feature removed: mobilePushNotification codes were never
+# reverse-engineered and the feature went unused.)
+
 
 # ─────────────────────────────────────────────────────────────
 # Lift sensor — verified from APK protobuf enums
@@ -460,11 +403,7 @@ SERVICE_SET_SCHEDULE = "set_schedule"
 # WARNING_SECOND_LIFT_TIMEOUT = 6 → appears in warningCodes[]
 # BLE-only signals (not in cloud shadow): SIGNAL_ONE_CLICK_LIFT,
 # SIGNAL_MCU_LIFT_LITTLE, SIGNAL_MCU_RESTORE_LIFT
-LIFT_ERROR_CODES   = {7, 8}  # robot lifted or lift mechanism blocked
-LIFT_WARNING_CODES = {5, 6}  # lift timeout warnings
-
 # warningCodes is a separate list from errorCodes in the protobuf message
-F_WARNING_CODES = "warningCodes"   # list[int]
 
 # ─────────────────────────────────────────────────────────────
 # fwVersion protobuf object (nested in shadow — BLE/device info)
@@ -473,10 +412,7 @@ F_WARNING_CODES = "warningCodes"   # list[int]
 # The app builds the RTSP camera URL as:
 #   deviceProfile.ipAddress + ":10022/h264ESVideoTest"
 # ipAddress comes from fwVersion.ipAddress in the shadow.
-F_FW_DATA    = "fwVersion"     # nested dict (fwVersion protobuf object)
 F_IP_ADDRESS = "ipAddress"     # str  robot's local WiFi IP (inside fwVersion)
-F_WIFI_SSID  = "wifiSsid"      # str  connected WiFi SSID (inside fwVersion)
-F_MAC        = "macAddress"    # str  robot MAC address (inside fwVersion)
 F_SERIAL_NO  = "sn"            # str  robot serial number (inside fwVersion)
 
 RTSP_PORT = 10022
@@ -488,4 +424,19 @@ RTSP_PATH = "h264ESVideoTest"
 # a channel when it is inside OR within this distance of the polygon, so thin
 # corridors are reliable triggers for transit automations (gates/doors). User-
 # tunable via the Channel Detection Buffer number; 0 = strict inside only.
-DEFAULT_CHANNEL_BUFFER_M = 0.75
+# Now that channel detection tests the corridor RIBBON (offset from the centreline, see
+# map_tuning.CHANNEL_RIBBON_HALFWIDTH_M) instead of the old thin triangle, the ribbon's own width
+# does the work the radial buffer used to — so this defaults to 0 (strict inside the corridor).
+# Still user-tunable via the Channel Detection Buffer number for extra GPS slack if needed.
+DEFAULT_CHANNEL_BUFFER_M = 0.0
+
+# Coverage map render styles (UI preference, persisted via sticky_device_info).
+COVERAGE_STYLE_OPTIONS = ["Gradient", "Logical Passes", "Green Checker", "Activity", "Paths Off"]
+COVERAGE_STYLE_DEFAULT = "Green Checker"
+
+# Map mower-marker size (UI preference). The glyph is drawn at MULT × the real swath
+# (16 in), anchored to meters so it still scales with the yard — this just sets how
+# prominent the marker is. ~px on a ~49 m yard: Small 24, Medium 36, Large 48, X-Large 64.
+MOWER_SIZE_OPTIONS = ["Small", "Medium", "Large", "Extra Large"]
+MOWER_SIZE_DEFAULT = "Large"
+MOWER_SIZE_MULT = {"Small": 4.0, "Medium": 6.0, "Large": 8.0, "Extra Large": 11.0}

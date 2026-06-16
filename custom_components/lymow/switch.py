@@ -20,6 +20,7 @@ from homeassistant.components.switch import SwitchEntity, SwitchEntityDescriptio
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
@@ -175,9 +176,36 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowSwitch(coord, desc) for desc in SWITCHES] + [LymowHeadlightsSwitch(coord), LymowDockOnErrorSwitch(coord)],
+        [LymowSwitch(coord, desc) for desc in SWITCHES] + [LymowHeadlightsSwitch(coord), LymowDockOnErrorSwitch(coord), LymowRainyMowingSwitch(coord), LymowDiagnosticCaptureSwitch(coord)],
         update_before_add=False,
     )
+
+
+class LymowRainyMowingSwitch(LymowEntity, SwitchEntity):
+    """Rainy Mowing (taskConfig.rainCleaning): ON = keep mowing when the rain
+    sensor triggers; OFF = dock and wait for dry (recommended — wet mowing clogs
+    the deck and leaves grass juice on the charge contacts)."""
+
+    _attr_name = "Rainy Mowing"
+    _attr_icon = "mdi:weather-pouring"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "rainy_mowing_switch")
+
+    @property
+    def is_on(self) -> bool:
+        # rainCleaning is a proto3 bool: false (the default + recommended setting)
+        # is never transmitted, so it reads None after a reload. Default to False
+        # so the entity has a KNOWN state and renders as the normal pill toggle —
+        # not the "unknown" two-button (lightning-bolt) control. A True setting is
+        # restored from the sticky store (rainCleaning in _STICKY_KEYS).
+        return bool((self.coordinator.data or {}).get("rainCleaning"))
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self.coordinator.async_set_rainy_mowing(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self.coordinator.async_set_rainy_mowing(False)
 
 class LymowSwitch(LymowEntity, SwitchEntity):
     """Lymow switch entity."""
@@ -280,3 +308,26 @@ class LymowDockOnErrorSwitch(LymowEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         await self.coordinator.async_set_dock_on_error(False)
+
+
+class LymowDiagnosticCaptureSwitch(LymowEntity, SwitchEntity):
+    """Diagnostic Capture — writes the map's render-input snapshot to a file you can send to the
+    developers to reproduce a map issue. Local toggle, off by default, NOT sent to the mower."""
+
+    _attr_name = "Diagnostic Capture"
+    _attr_icon = "mdi:bug-outline"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_extra_state_attributes = {"description": "When ON, writes the map's render-input data (zones, channels, coverage trail, pass-coverage analysis, obstacles, anomalies, settings) to /config/lymow_diagnostic_<device>.json, refreshed every ~5 s. Flip on, reproduce the issue, flip off, download the file (Samba / File editor / VS Code add-on) and send it to the developers. Contains your yard's GPS layout — share only with devs. Off by default; resets off on restart."}
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "diagnostic_capture")
+
+    @property
+    def is_on(self) -> bool:
+        return bool(getattr(self.coordinator, "_diag_capture", False))
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.set_diag_capture(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.coordinator.set_diag_capture(False)
