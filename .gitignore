@@ -218,3 +218,5 @@ __marimo__/
 .streamlit/secrets.toml
 custom_components/lymow/lymow_mqtt_debug_merge.py
 test_update.py
+custom_components/lymow/lymow_mqtt_debug_merge_pathplanner.py
+custom_components/lymow/path_planner.py
