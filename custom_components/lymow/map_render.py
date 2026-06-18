@@ -427,6 +427,11 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
             return ACTIVITY_ZONE_FILL          # dim neutral so the colour-coded path reads clearly
         return MISSED_RED if (_pc_layer and idx in _mowed_idx) else GREEN
 
+    # Map name labels — user-toggleable (yards with many no-go zones get cluttered).
+    _labels = data.get("map_labels", "Both")
+    _show_zone_labels = _labels in ("Both", "Zone Names")
+    _show_nogo_labels = _labels in ("Both", "No-Go Names")
+
     for idx, zone in enumerate(drawable):
         pts = safe_points(zone.get("points") or [])
         if len(pts) > 300:
@@ -435,10 +440,11 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
         xy = [(sx(x), sy(y)) for x, y in pts]
         if len(xy) >= 3:
             draw.polygon(xy, fill=_zone_fill(zone, idx), outline=GREEN_LINE)
-            cx = sum(p[0] for p in xy) / len(xy)
-            cy = sum(p[1] for p in xy) / len(xy)
-            label = str(zone.get("name") or zone.get("hashId") or idx)[:16]
-            draw_center(draw, label, cx, cy, 10, WHITE)
+            if _show_zone_labels:
+                cx = sum(p[0] for p in xy) / len(xy)
+                cy = sum(p[1] for p in xy) / len(xy)
+                label = str(zone.get("name") or zone.get("hashId") or idx)[:16]
+                draw_center(draw, label, cx, cy, 10, WHITE)
     
     # No-go zones / excluded areas — orange overlay
     for idx, zone in enumerate(drawable_nogo):
@@ -461,10 +467,11 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
             # thick dark-burnt-orange border so the no-go boundary actually reads on the map.
             draw.line(xy, fill=(140, 45, 8, 255), width=3)
 
-            cx = sum(p[0] for p in xy) / len(xy)
-            cy = sum(p[1] for p in xy) / len(xy)
-            label = str(zone.get("name") or zone.get("hashId") or f"No-Go {idx + 1}")[:14]
-            draw_center(draw, label, cx, cy, 9, WHITE)
+            if _show_nogo_labels:
+                cx = sum(p[0] for p in xy) / len(xy)
+                cy = sum(p[1] for p in xy) / len(xy)
+                label = str(zone.get("name") or zone.get("hashId") or f"No-Go {idx + 1}")[:14]
+                draw_center(draw, label, cx, cy, 9, WHITE)
 
         except Exception:
             pass

@@ -17,6 +17,8 @@ from .const import (
     COVERAGE_STYLE_OPTIONS,
     DOMAIN,
     F_CLEAN_MODE,
+    MAP_LABELS_DEFAULT,
+    MAP_LABELS_OPTIONS,
     MOWER_SIZE_DEFAULT,
     MOWER_SIZE_OPTIONS,
 )
@@ -43,6 +45,7 @@ async def async_setup_entry(
         LymowCoverageStyleSelect(coord),
         LymowMapLayerSelect(coord),
         LymowHeatmapStyleSelect(coord),
+        LymowMapLabelsSelect(coord),
         LymowMowerSizeSelect(coord),
     ], update_before_add=False)
 
@@ -124,6 +127,25 @@ class LymowCoverageStyleSelect(LymowEntity, SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         await self.coordinator.async_set_coverage_style(option)
+
+
+class LymowMapLabelsSelect(LymowEntity, SelectEntity):
+    """Which polygon name labels are drawn on the map (local UI preference)."""
+
+    _attr_name = "Map Labels"
+    _attr_icon = "mdi:label-outline"
+    _attr_options = MAP_LABELS_OPTIONS
+    _attr_extra_state_attributes = {"description": "Which name labels are drawn on the map: Both, Zone Names only, No-Go Names only, or None. Yards with many no-go zones get their map cluttered with labels — set this to Zone Names or None to clean it up. Local display option, doesn't affect the mower."}
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "map_labels_select")
+
+    @property
+    def current_option(self) -> str | None:
+        return (self.coordinator.data or {}).get("map_labels", MAP_LABELS_DEFAULT)
+
+    async def async_select_option(self, option: str) -> None:
+        await self.coordinator.async_set_ui_pref("map_labels", option)
 
 
 class LymowCleanModeSelect(LymowEntity, SelectEntity):
