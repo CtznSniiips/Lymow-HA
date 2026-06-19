@@ -147,7 +147,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # "Follow Perimeter" default on every reload until taskConfig is re-received.
     _STICKY_KEYS = ("rtkSn", "wheelVer", "knifeVer", "rtkPowerMode", "chargingMode",
                     "rainCleaning", "coverage_style", "map_layer", "heatmap_style",
-                    "map_labels", "mower_size", "session_percent_display")
+                    "map_labels", "map_resolution", "mower_size", "session_percent_display")
 
     def __init__(
         self,
@@ -185,6 +185,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._state.setdefault("map_layer", "Coverage")
         self._state.setdefault("heatmap_style", "Smooth")
         self._state.setdefault("map_labels", "Both")
+        self._state.setdefault("map_resolution", "Large")
         # Persistent per-zone mow history (last_mowed / mow_count / minutes / area),
         # restored from the config entry. Survives restarts across sessions.
         if config_entry and config_entry.data.get("zone_history"):

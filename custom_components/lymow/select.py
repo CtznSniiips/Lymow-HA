@@ -19,6 +19,8 @@ from .const import (
     F_CLEAN_MODE,
     MAP_LABELS_DEFAULT,
     MAP_LABELS_OPTIONS,
+    MAP_RESOLUTION_DEFAULT,
+    MAP_RESOLUTION_OPTIONS,
     MOWER_SIZE_DEFAULT,
     MOWER_SIZE_OPTIONS,
 )
@@ -46,6 +48,7 @@ async def async_setup_entry(
         LymowMapLayerSelect(coord),
         LymowHeatmapStyleSelect(coord),
         LymowMapLabelsSelect(coord),
+        LymowMapResolutionSelect(coord),
         LymowMowerSizeSelect(coord),
     ], update_before_add=False)
 
@@ -146,6 +149,25 @@ class LymowMapLabelsSelect(LymowEntity, SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         await self.coordinator.async_set_ui_pref("map_labels", option)
+
+
+class LymowMapResolutionSelect(LymowEntity, SelectEntity):
+    """Render resolution of the diagnostic map camera (local UI preference)."""
+
+    _attr_name = "Map Resolution"
+    _attr_icon = "mdi:image-size-select-large"
+    _attr_options = MAP_RESOLUTION_OPTIONS
+    _attr_extra_state_attributes = {"description": "Pixel size of the rendered map. Bigger = sharper, important for large properties with many zones, but heavier per render (4K is slow on low-power hosts). The map only renders when viewed. Standard 800 / Large 1600 / Extra Large 2400 / 4K 3840 px. Local display option."}
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "map_resolution_select")
+
+    @property
+    def current_option(self) -> str | None:
+        return (self.coordinator.data or {}).get("map_resolution", MAP_RESOLUTION_DEFAULT)
+
+    async def async_select_option(self, option: str) -> None:
+        await self.coordinator.async_set_ui_pref("map_resolution", option)
 
 
 class LymowCleanModeSelect(LymowEntity, SelectEntity):
