@@ -1111,7 +1111,13 @@ def font(size: int):
         try:
             f = ImageFont.truetype("DejaVuSans.ttf", size)
         except Exception:
-            f = ImageFont.load_default()
+            # Where DejaVuSans isn't resolvable, prefer the SIZED bundled default
+            # (Pillow >= 10.1) so headers/labels still scale; fall back to the legacy
+            # fixed default on older Pillow (which renders everything one size).
+            try:
+                f = ImageFont.load_default(size)
+            except TypeError:
+                f = ImageFont.load_default()
         _FONT_CACHE[size] = f
     return f
 
