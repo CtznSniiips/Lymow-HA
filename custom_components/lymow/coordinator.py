@@ -673,7 +673,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._update_dwell_anomaly()                          # #5 stuck/spin detection
         if self._diag_capture and (time.monotonic() - self._diag_last_write) > 5.0:
             self._diag_last_write = time.monotonic()          # #4 throttled snapshot while ON
-            self._write_diag_snapshot()
+            self.hass.async_add_executor_job(self._write_diag_snapshot)
 
         # Debug: capture EVERY btMap response (size + flags) so we can see why
         # QUERY_PATH responses aren't hitting the path parse branch — does the
@@ -991,8 +991,9 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                         "planned_total": planned_total,
                                         "planned_segments": planned_segs,
                                     }
-                                    with open(self._plan_hist_path, "a") as _pf:
-                                        _pf.write(_pj.dumps(_rec, default=str) + "\n")
+                                    _line = _pj.dumps(_rec, default=str) + "\n"
+                                    self.hass.async_add_executor_job(
+                                        self._append_jsonl, self._plan_hist_path, _line)
                                 except Exception:
                                     _LOGGER.debug("plan-history append failed for %s",
                                                   self.thing_name, exc_info=True)
@@ -1832,7 +1833,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except Exception:
                 _LOGGER.debug("pathcap rotate failed", exc_info=True)
             self._pathcap_record({"type": "capture_start", "thing": self.thing_name})
-            self._write_diag_snapshot()
+            self.hass.async_add_executor_job(self._write_diag_snapshot)
             _LOGGER.info("Lymow %s: Diagnostic Capture ON → %s", self.thing_name, self._pathcap_path)
         elif was and not self._diag_capture:
             # Flush whatever's buffered so the file is complete the moment it's turned off.
@@ -1845,8 +1846,15 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.info("Lymow %s: Diagnostic Capture OFF (flushed)", self.thing_name)
         self.async_set_updated_data(self._state)
 
+    def _append_jsonl(self, path: str, line: str) -> None:
+        """Append one pre-serialized line to a file. Runs in the executor — the caller
+        builds the line on the loop, the blocking write happens off it."""
+        with open(path, "a") as f:
+            f.write(line)
+
     def _write_diag_snapshot(self) -> None:
-        """Write the JSON-safe render-input state so a map issue can be reproduced offline."""
+        """Write the JSON-safe render-input state so a map issue can be reproduced offline.
+        Always invoke via async_add_executor_job — it opens a file (blocking I/O)."""
         try:
             import json as _j
             keys = ("btMap", "breadcrumb_track", "coverage_track", "planned_path_segments",
