@@ -1096,13 +1096,24 @@ def png_bytes(img) -> bytes:
     return bio.getvalue()
 
 
+_FONT_CACHE: dict = {}
+
+
 def font(size: int):
+    """Cached font lookup. Previously every draw_text/draw_center re-ran
+    ImageFont.truetype("DejaVuSans.ttf") — which fails to resolve by bare name on most
+    HA OS installs and fell back to load_default() on EVERY text draw, a real source of
+    map-render lag (reported by xar). Resolve once per size and memoise. [2026-06-20]"""
     if ImageFont is None:
         return None
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size)
-    except Exception:
-        return ImageFont.load_default()
+    f = _FONT_CACHE.get(size)
+    if f is None:
+        try:
+            f = ImageFont.truetype("DejaVuSans.ttf", size)
+        except Exception:
+            f = ImageFont.load_default()
+        _FONT_CACHE[size] = f
+    return f
 
 
 def draw_text(draw, text: str, x: float, y: float, size: int, fill) -> None:
