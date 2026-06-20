@@ -915,9 +915,14 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
                 _rc = data.get("robotConfig")
                 _cam_led = (_rc.get("camLedStatus") if isinstance(_rc, dict)
                             else getattr(_rc, "camLedStatus", None))
+            # On while HEADING HOME (Docking), but NOT once parked + charging on the dock —
+            # otherwise a mid-task rain-hold (docked + charging, status still "Docking", never
+            # flips to Waiting) leaves the icon's headlight bit stuck on. Manual switch
+            # (camLedStatus==3) always wins. [Nate 2026-06-20]
             headlights_on = (_cam_led == 3
-                             or data.get("workStatus") == WORK_STATUS_DOCKING
-                             or data.get("robotStatus") == WORK_STATUS_DOCKING)
+                             or ((data.get("workStatus") == WORK_STATUS_DOCKING
+                                  or data.get("robotStatus") == WORK_STATUS_DOCKING)
+                                 and not charging))
             dbg["headlights"] = bool(headlights_on)
             # PIL rotates CCW; compass heading is CW from north → negate. Calibrated live.
             base = mower_icon(led=led, headlights_on=headlights_on)
