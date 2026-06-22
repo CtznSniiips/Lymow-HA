@@ -62,6 +62,12 @@ class LymowMapCamera(LymowEntity, Camera):
         Camera.__init__(self)
         self._render_error: str | None = None
         self._render_debug: dict[str, Any] = {}
+        # Single-flight render guard. HA can call async_camera_image concurrently (multiple
+        # dashboard viewers / rapid polling); a map render takes seconds, so without this the
+        # executor pool fills with duplicate renders and HA goes unresponsive. Render at most
+        # ONE map at a time; concurrent callers get the last finished frame. [xar]
+        self._render_lock = threading.Lock()
+        self._render_last_img: bytes | None = None
 
     @property
     def available(self) -> bool:
@@ -70,22 +76,32 @@ class LymowMapCamera(LymowEntity, Camera):
     # ── sync render (always called in executor) ──────────────────
 
     def _render(self) -> bytes:
+        # If a render is already running on another executor thread, don't pile on — hand back
+        # the last finished frame (or a placeholder until the first one lands). Non-blocking, so
+        # a slow render can never exhaust the executor pool and hang HA. [xar]
+        if not self._render_lock.acquire(blocking=False):
+            return self._render_last_img or text_png("Lymow map", "rendering…")
         try:
-            imperial = self.hass.config.units is US_CUSTOMARY_SYSTEM
-            name = (
-                self.coordinator.config_entry.data.get("device_name")
-                or (self.coordinator.device_info_data or {}).get("deviceName")
-                or (self.coordinator.data or {}).get("deviceName")
-                or "Lymow"
-            )
-            img, dbg = build_map_png(self.coordinator.data or {}, imperial=imperial, device_name=name)
-            self._render_debug = dbg
-            self._render_error = None
-            return png_bytes(img)
-        except Exception as exc:
-            self._render_error = f"{type(exc).__name__}: {exc}"
-            _LOGGER.exception("Lymow diagnostic map render failed")
-            return text_png("Lymow map render failed", self._render_error)
+            try:
+                imperial = self.hass.config.units is US_CUSTOMARY_SYSTEM
+                name = (
+                    self.coordinator.config_entry.data.get("device_name")
+                    or (self.coordinator.device_info_data or {}).get("deviceName")
+                    or (self.coordinator.data or {}).get("deviceName")
+                    or "Lymow"
+                )
+                img, dbg = build_map_png(self.coordinator.data or {}, imperial=imperial, device_name=name)
+                self._render_debug = dbg
+                self._render_error = None
+                data = png_bytes(img)
+            except Exception as exc:
+                self._render_error = f"{type(exc).__name__}: {exc}"
+                _LOGGER.exception("Lymow diagnostic map render failed")
+                data = text_png("Lymow map render failed", self._render_error)
+            self._render_last_img = data       # cache inside the lock so it's always consistent
+            return data
+        finally:
+            self._render_lock.release()         # always release, even on an unexpected error
 
     # ── camera interface ─────────────────────────────────────────
 
