@@ -17,6 +17,7 @@ from .const import (
     WORK_STATUS_ERROR, WORK_STATUS_EMERGENCY_STOP,
     WORK_STATUS_CHARGING, WORK_STATUS_CHARGING_FULL, WORK_STATUS_DOCKING,
     MOWER_SIZE_MULT, MOWER_SIZE_DEFAULT, MOWING_STATUSES,
+    MAP_RESOLUTION_PX, MAP_RESOLUTION_DEFAULT,
 )
 from .path_engine import simplify_path, segment_rows
 from .heatmap import LAYERS as HM_LAYERS, render_heatmap, render_categorical, CONN_COLORS
@@ -36,8 +37,14 @@ except Exception as exc:
 else:
     _PIL_ERROR = None
 
-W = H = 800
+W = H = 800          # default canvas edge (px); per-render value comes from the
+                     # Map Resolution setting (see build_map_png).
 PAD = 40
+HEADER_H = 95        # px reserved at the top for the title / layer / counts / battery
+                     # readout, so the map is fitted + centered in the area BELOW it.
+FOOTER_H = 90        # px reserved at the bottom for the colour + icon legends, so a
+                     # diagonal/corner-filling yard never renders zone labels UNDER them.
+                     # Fixed px, so it shrinks to irrelevance at higher resolutions.
 # All colours as RGBA tuples (image is created in RGBA mode and converted to RGB at save time)
 BG          = (17,  24,  39, 255)
 GREEN       = (34, 197,  94, 110)
@@ -281,22 +288,53 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
     if Image is None or ImageDraw is None:
         raise RuntimeError(f"Pillow not available: {_PIL_ERROR}")
 
-    # Use RGBA throughout; convert to RGB only when saving.
-    img  = Image.new("RGBA", (W, H), BG)
-    draw = ImageDraw.Draw(img, "RGBA")
-
+    # Parse zones EARLY so the canvas can be sized to the yard's actual shape.
     btmap    = data.get("btMap") or {}
     zones    = btmap.get("zones") or []
     drawable = [
         z for z in zones
         if z.get("points") and len(z.get("points") or []) >= 2
     ]
-
     nogo_zones = btmap.get("nogoZones") or []
     drawable_nogo = [
         z for z in nogo_zones
         if z.get("points") and len(z.get("points") or []) >= 3
     ]
+
+    all_pts: list[tuple[float, float]] = []
+    for z in drawable:
+        all_pts.extend(safe_points(z.get("points") or []))
+
+    # Map Resolution = the LONGER canvas edge (px); the shorter edge follows the yard's
+    # aspect ratio, so a wide property gets a landscape canvas that fills the frame
+    # instead of wasting half of a square one. The map area sits below a header band.
+    long_edge = MAP_RESOLUTION_PX.get(
+        data.get("map_resolution"), MAP_RESOLUTION_PX[MAP_RESOLUTION_DEFAULT]
+    )
+    if all_pts:
+        min_x = min(x for x, y in all_pts); max_x = max(x for x, y in all_pts)
+        min_y = min(y for x, y in all_pts); max_y = max(y for x, y in all_pts)
+        span_x = (max_x - min_x) or 1.0;    span_y = (max_y - min_y) or 1.0
+        aspect = max(0.34, min(3.0, span_x / span_y))   # clamp absurd long/thin strips (≤3:1)
+        if aspect >= 1.0:                                # landscape yard
+            map_w = float(long_edge); map_h = long_edge / aspect
+        else:                                            # portrait yard
+            map_h = float(long_edge); map_w = long_edge * aspect
+        W = int(round(map_w)) + PAD * 2
+        H = int(round(map_h)) + HEADER_H + FOOTER_H
+        # Fit the TRUE yard aspect into the map area + centre (fills exactly unless the
+        # aspect was clamped, in which case small balanced bands remain).
+        scale = min(map_w / span_x, map_h / span_y)
+        off_x = PAD + (map_w - span_x * scale) / 2
+        off_y = HEADER_H + (map_h - span_y * scale) / 2
+    else:
+        W = H = long_edge                                # no geometry yet → square msg
+        min_x = max_x = min_y = max_y = 0.0
+        scale = 1.0; off_x = float(PAD); off_y = float(HEADER_H)
+
+    # Use RGBA throughout; convert to RGB only when saving.
+    img  = Image.new("RGBA", (W, H), BG)
+    draw = ImageDraw.Draw(img, "RGBA")
 
     dbg = {
         "zones":        len(zones),
@@ -368,24 +406,16 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
         draw_text(draw, "No drawable polygons in state", 20, 100, 18, RED)
         return img.convert("RGB"), dbg
 
-    all_pts: list[tuple[float, float]] = []
-    for z in drawable:
-        all_pts.extend(safe_points(z.get("points") or []))
-
     if not all_pts:
         draw_text(draw, "Drawable zones exist but points failed to parse", 20, 100, 18, RED)
         return img.convert("RGB"), dbg
 
-    min_x = min(x for x, y in all_pts)
-    max_x = max(x for x, y in all_pts)
-    min_y = min(y for x, y in all_pts)
-    max_y = max(y for x, y in all_pts)
-    dbg.update({"min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y})
+    dbg.update({"min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y,
+                "canvas_w": W, "canvas_h": H})
 
-    scale = (W - PAD * 2) / max(max_x - min_x or 1, max_y - min_y or 1)
-
-    def sx(x: float) -> float: return (x - min_x) * scale + PAD
-    def sy(y: float) -> float: return H - ((y - min_y) * scale + PAD)
+    # scale / off_x / off_y were computed up top (canvas sized to the yard's aspect).
+    def sx(x: float) -> float: return (x - min_x) * scale + off_x
+    def sy(y: float) -> float: return off_y + (max_y - y) * scale
 
     # Channels / corridors are drawn AFTER the zones (as a corridor ribbon) so they're visible.
 
@@ -427,6 +457,11 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
             return ACTIVITY_ZONE_FILL          # dim neutral so the colour-coded path reads clearly
         return MISSED_RED if (_pc_layer and idx in _mowed_idx) else GREEN
 
+    # Map name labels — user-toggleable (yards with many no-go zones get cluttered).
+    _labels = data.get("map_labels", "Both")
+    _show_zone_labels = _labels in ("Both", "Zone Names")
+    _show_nogo_labels = _labels in ("Both", "No-Go Names")
+
     for idx, zone in enumerate(drawable):
         pts = safe_points(zone.get("points") or [])
         if len(pts) > 300:
@@ -435,10 +470,11 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
         xy = [(sx(x), sy(y)) for x, y in pts]
         if len(xy) >= 3:
             draw.polygon(xy, fill=_zone_fill(zone, idx), outline=GREEN_LINE)
-            cx = sum(p[0] for p in xy) / len(xy)
-            cy = sum(p[1] for p in xy) / len(xy)
-            label = str(zone.get("name") or zone.get("hashId") or idx)[:16]
-            draw_center(draw, label, cx, cy, 10, WHITE)
+            if _show_zone_labels:
+                cx = sum(p[0] for p in xy) / len(xy)
+                cy = sum(p[1] for p in xy) / len(xy)
+                label = str(zone.get("name") or zone.get("hashId") or idx)[:16]
+                draw_center(draw, label, cx, cy, 10, WHITE)
     
     # No-go zones / excluded areas — orange overlay
     for idx, zone in enumerate(drawable_nogo):
@@ -461,10 +497,11 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
             # thick dark-burnt-orange border so the no-go boundary actually reads on the map.
             draw.line(xy, fill=(140, 45, 8, 255), width=3)
 
-            cx = sum(p[0] for p in xy) / len(xy)
-            cy = sum(p[1] for p in xy) / len(xy)
-            label = str(zone.get("name") or zone.get("hashId") or f"No-Go {idx + 1}")[:14]
-            draw_center(draw, label, cx, cy, 9, WHITE)
+            if _show_nogo_labels:
+                cx = sum(p[0] for p in xy) / len(xy)
+                cy = sum(p[1] for p in xy) / len(xy)
+                label = str(zone.get("name") or zone.get("hashId") or f"No-Go {idx + 1}")[:14]
+                draw_center(draw, label, cx, cy, 9, WHITE)
 
         except Exception:
             pass
@@ -777,7 +814,7 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
     # Drawn as a cyan diamond (distinct shape vs the round dock/robot pins) so it
     # reads as a fixed reference rather than a movable unit.
     ax, ay = sx(0.0), sy(0.0)
-    if PAD - 13 <= ax <= W - PAD + 13 and PAD - 13 <= ay <= H - PAD + 13:
+    if -13 <= ax <= W + 13 and HEADER_H - 13 <= ay <= H - FOOTER_H + 13:
         # Survey-benchmark glyph: cyan triangle + center dot. The RTK base is the
         # fixed survey datum (the ENU origin everything is referenced to), so a
         # benchmark marker reads truer than a "broadcasting" antenna.

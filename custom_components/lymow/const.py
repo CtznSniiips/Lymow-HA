@@ -488,6 +488,20 @@ DEFAULT_CHANNEL_BUFFER_M = 0.0
 COVERAGE_STYLE_OPTIONS = ["Gradient", "Logical Passes", "Green Checker", "Activity", "Paths Off"]
 COVERAGE_STYLE_DEFAULT = "Green Checker"
 
+# Map name labels (UI preference, persisted via sticky_device_info). Controls which
+# polygon name labels are drawn on the map — yards with many no-go zones get cluttered.
+MAP_LABELS_OPTIONS = ["Both", "Zone Names", "No-Go Names", "None"]
+MAP_LABELS_DEFAULT = "Both"
+
+# Map render resolution (UI preference, persisted via sticky_device_info). The square
+# canvas edge in px. Big properties (dozens of zones) are unreadable at 800; a larger
+# canvas draws everything at true detail. Higher = sharper but heavier per render (the
+# renderer allocates several full-canvas RGBA layers) — it's on-demand (only when the
+# camera is viewed), but 4K on a low-power host is slow. Default bumped up from 800.
+MAP_RESOLUTION_OPTIONS = ["Standard", "Large", "Extra Large", "4K"]
+MAP_RESOLUTION_PX = {"Standard": 800, "Large": 1600, "Extra Large": 2400, "4K": 3840}
+MAP_RESOLUTION_DEFAULT = "Large"
+
 # Map mower-marker size (UI preference). The glyph is drawn at MULT × the real swath
 # (16 in), anchored to meters so it still scales with the yard — this just sets how
 # prominent the marker is. ~px on a ~49 m yard: Small 24, Medium 36, Large 48, X-Large 64.
