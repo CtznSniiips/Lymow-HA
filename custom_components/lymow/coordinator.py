@@ -73,8 +73,6 @@ from .protocol import (
     USER_CTRL_CLEAN,
     USER_CTRL_DOCK,
     USER_CTRL_FORCE_REINIT,
-    USER_CTRL_OTA,
-    USER_CTRL_ABORT_OTA,
     USER_CTRL_PAUSE,
     USER_CTRL_PAUSE_DOCK,
     USER_CTRL_RECHARGE_DOCK,
@@ -174,6 +172,10 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._password  = password
         self._client_uuid = str(uuid.uuid4())
         self._config_entry = config_entry
+
+        # Firmware OTA (cloud AWS IoT Job) — job id + background poll task.
+        self._ota_job_id: str | None = None
+        self._ota_poll_task: asyncio.Task | None = None
 
         self._state: dict[str, Any] = {}
         self.device_info_data: dict = {}
@@ -2082,8 +2084,31 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 note = (
                     update_info.get("releaseNote")
                 )
+                # Device-type prefix + RAW latest version build the OTA objectKey
+                # (<prefix><rawVersion>). The cloud only returns a non-empty
+                # prefix once the firmware object is actually staged/released to
+                # THIS device (staged rollout) — until then the update is merely
+                # announced and cannot be installed (the official app bails the
+                # same way). Stash both so readiness is observable.
+                prefix = update_info.get("prefix")
+                raw_latest = update_info.get("latestVersion")
                 if latest:
-                    self._merge_state({"latestFw": latest, "releaseNote": note})
+                    self._merge_state({
+                        "latestFw": latest,
+                        "releaseNote": note,
+                        "fwPrefix": prefix,
+                        "fwLatestRaw": raw_latest,
+                    })
+                    if prefix:
+                        _LOGGER.info(
+                            "OTA available + staged for %s: %s (prefix=%s)",
+                            self.thing_name, raw_latest, prefix,
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "OTA announced but not yet staged for %s (%s): empty prefix",
+                            self.thing_name, raw_latest,
+                        )
         except Exception:
             _LOGGER.debug("Firmware update check failed for %s", self.thing_name, exc_info=True)
 
@@ -2185,20 +2210,143 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._wait_state_update()
         return ok
 
+    def _set_ota_state(
+        self,
+        *,
+        status: str,
+        progress: int | None = None,
+        job_id: str | None = None,
+        target: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Publish OTA status into coordinator state so the update entity and
+        any sensors can render it. Progress comes from MQTT downloadProgress;
+        status/phase comes from the cloud IoT-Job summary."""
+        patch: dict[str, Any] = {"ota_status": status}
+        if progress is not None:
+            patch["ota_progress"] = int(progress)
+        if job_id is not None:
+            patch["ota_job_id"] = job_id
+        if target is not None:
+            patch["ota_target"] = target
+        patch["ota_detail"] = detail
+        self._merge_state(patch)
+        self.async_set_updated_data(self._state)
+
     async def async_ota_update(self) -> bool:
-        """Trigger a firmware OTA (userCtrl=26). No-op unless the mower has an
-        update available. Mower enters workStatus=11 (Updating) while it runs."""
+        """Trigger a firmware OTA the way the official app does it.
+
+        The app does NOT send a userCtrl opcode for OTA (opcode 26 is an unused
+        enum constant — a bare userCtrl=26 is a no-op, which is why earlier
+        attempts silently failed). The real flow is 100% cloud REST + an AWS IoT
+        Job:
+          1. GET /check-update            -> prefix + latestVersion (raw)
+          2. GET /create-ota-job          -> objectKey=<prefix><version> -> jobId
+             (the cloud creates an IoT Job; the mower pulls & installs it)
+          3. poll GET /get-ota-job-summary for status (background task)
+
+        The live percentage is read separately from MQTT telemetry
+        (PbDebugSetting.downloadProgress), surfaced by the update entity.
+        """
         await self.auth.ensure_valid(self._email, self._password)
-        ok = self._publish(encode_userctrl(USER_CTRL_OTA))
-        await self._wait_state_update()
-        return ok
+
+        # 1. Fresh check-update for the device-type prefix + RAW target version.
+        #    (objectKey must use the raw latestVersion, not our display-normalized
+        #    version, or the cloud will not find the firmware object.)
+        info = await self.client.check_update(self.thing_name)
+        prefix = (info or {}).get("prefix") or ""
+        target = (info or {}).get("latestVersion")
+        if not target:
+            _LOGGER.warning("OTA aborted for %s: no latestVersion from check-update", self.thing_name)
+            self._set_ota_state(status="error", detail="no update available")
+            return False
+        # objectKey = <prefix><rawVersion>. The app proceeds even when prefix is
+        # empty — its create-job path guards only the version, never the prefix —
+        # so the prefix is OPTIONAL (objectKey collapses to the raw version).
+        # Match the app exactly rather than refusing.
+        if not prefix:
+            _LOGGER.info(
+                "OTA for %s: empty prefix from check-update; objectKey=%s (matches app)",
+                self.thing_name, target,
+            )
+        object_key = f"{prefix}{target}"
+        _LOGGER.info("OTA: creating cloud job for %s objectKey=%s", self.thing_name, object_key)
+
+        # 2. Create the OTA job.
+        job = await self.client.create_ota_job(self.thing_name, object_key)
+        _LOGGER.info(
+            "OTA create-ota-job raw response for %s (objectKey=%s): %s",
+            self.thing_name, object_key, job,
+        )
+        job_id = None
+        if isinstance(job, dict):
+            job_id = job.get("jobId") or job.get("jobID") or job.get("id")
+        if not job_id:
+            _LOGGER.error("OTA: create-ota-job returned no jobId for %s: %s", self.thing_name, job)
+            self._set_ota_state(status="error", detail="failed to create OTA job")
+            return False
+
+        self._ota_job_id = job_id
+        self._set_ota_state(status="queued", progress=0, job_id=job_id, target=target, detail=None)
+
+        # 3. Poll job status in the background (non-blocking).
+        if self._ota_poll_task is None or self._ota_poll_task.done():
+            self._ota_poll_task = self.hass.async_create_background_task(
+                self._poll_ota_job(job_id, target),
+                name=f"lymow_ota_poll_{self.thing_name}",
+            )
+        return True
+
+    async def _poll_ota_job(self, job_id: str, target: str | None) -> None:
+        """Poll the cloud IoT-Job summary until terminal or timeout (10 min,
+        matching the app). Status drives the phase; the percentage shown comes
+        from live MQTT downloadProgress merged into state by the telemetry path."""
+        deadline = time.monotonic() + 600
+        terminal = {"SUCCEEDED", "FAILED", "CANCELED"}
+        try:
+            while time.monotonic() < deadline:
+                await asyncio.sleep(10)
+                try:
+                    summary = await self.client.get_ota_job_summary(self.thing_name, job_id)
+                except Exception:
+                    _LOGGER.debug("OTA poll error for %s", self.thing_name, exc_info=True)
+                    continue
+                status = (summary or {}).get("status") or "IN_PROGRESS"
+                pct = int(self._state.get("downloadProgress") or 0)
+                _LOGGER.debug(
+                    "OTA poll %s: status=%s downloadProgress=%s%% raw=%s",
+                    job_id, status, pct, summary,
+                )
+                detail = None
+                if status == "FAILED":
+                    details = (summary or {}).get("statusDetails") or {}
+                    dmap = details.get("detailsMap") if isinstance(details, dict) else None
+                    if isinstance(dmap, dict):
+                        detail = dmap.get("reason")
+                self._set_ota_state(
+                    status=status.lower(), progress=pct, job_id=job_id, target=target, detail=detail,
+                )
+                if status in terminal:
+                    _LOGGER.info("OTA job %s for %s finished: %s", job_id, self.thing_name, status)
+                    break
+            else:
+                _LOGGER.warning("OTA job %s for %s timed out after 10 min", job_id, self.thing_name)
+                self._set_ota_state(status="error", job_id=job_id, target=target, detail="timed out")
+        finally:
+            self._ota_job_id = None
 
     async def async_abort_ota(self) -> bool:
-        """Abort an in-progress firmware OTA (userCtrl=27)."""
-        await self.auth.ensure_valid(self._email, self._password)
-        ok = self._publish(encode_userctrl(USER_CTRL_ABORT_OTA))
-        await self._wait_state_update()
-        return ok
+        """Stop tracking an in-flight OTA.
+
+        Note: the official app provides NO user-initiated OTA cancel — once the
+        cloud IoT Job is created the firmware applies it; CANCELED is only ever a
+        status the cloud reports. The legacy userCtrl=27 opcode is unused/no-op.
+        We therefore just stop our local poll and clear OTA state."""
+        if self._ota_poll_task and not self._ota_poll_task.done():
+            self._ota_poll_task.cancel()
+        self._ota_job_id = None
+        self._set_ota_state(status="idle", progress=0, detail=None)
+        return True
 
     async def async_set_blade_height(self, height_mm: int) -> None:
         """Set global blade cut height via PbMap.runTimeConfig."""

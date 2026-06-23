@@ -399,6 +399,37 @@ class LymowClient:
         data = await self._api_get("checkUpdateApi", f"/check-update?deviceThingName={thing_name}")
         return data or {}
 
+    async def create_ota_job(self, thing_name: str, object_key: str) -> dict:
+        """Create the firmware OTA job (cloud AWS IoT Job).
+
+        Mirrors the official app exactly: GET /create-ota-job with the device
+        thing name and an objectKey of <prefix><targetVersion> (prefix +
+        latestVersion from check_update, concatenated with no separator). The
+        cloud creates an IoT Job; the mower pulls and installs the firmware.
+        Returns the response dict (carries jobId on success).
+        """
+        ok = urllib.parse.quote(object_key, safe="")
+        data = await self._api_get(
+            "createOtaJobApi",
+            f"/create-ota-job?deviceThingName={thing_name}&objectKey={ok}",
+        )
+        return data or {}
+
+    async def get_ota_job_summary(self, thing_name: str, job_id: str) -> dict:
+        """Poll an in-flight OTA job. Returns {status, statusDetails}.
+
+        status: QUEUED | IN_PROGRESS | SUCCEEDED | FAILED | CANCELED.
+        On FAILED, statusDetails.detailsMap.reason carries the failure reason.
+        Note: the live percentage is NOT here — it comes from MQTT telemetry
+        (PbDebugSetting.downloadProgress); this status only drives the phase.
+        """
+        jid = urllib.parse.quote(job_id, safe="")
+        data = await self._api_get(
+            "createOtaJobApi",
+            f"/get-ota-job-summary?deviceThingName={thing_name}&jobId={jid}",
+        )
+        return data or {}
+
 
 # ─────────────────────────────────────────────
 # Exceptions
