@@ -1276,6 +1276,15 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
     _attr_name = "Map GeoJSON"
     _attr_icon = "mdi:map-marker-path"
 
+    # The GeoJSON FeatureCollections are large (well over the recorder's 16 KB
+    # attribute cap on big maps) and have no value as DB history — they're consumed
+    # live by map cards. Tell the recorder to skip them: kills the "attributes exceed
+    # maximum size" warning + DB churn while leaving the live attributes full-size.
+    _unrecorded_attributes = frozenset({
+        "geojson", "geojson_zones", "geojson_nogo_zones", "geojson_mowed_area",
+        "geojson_dock", "geojson_robot", "geojson_rtk_antenna",
+    })
+
     def __init__(self, coordinator: LymowCoordinator) -> None:
         super().__init__(coordinator, "map_geojson")
         self._geojson_cache: dict | None = None
