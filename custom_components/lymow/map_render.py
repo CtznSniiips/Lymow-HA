@@ -952,9 +952,14 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
                 _rc = data.get("robotConfig")
                 _cam_led = (_rc.get("camLedStatus") if isinstance(_rc, dict)
                             else getattr(_rc, "camLedStatus", None))
+            # On while HEADING HOME (Docking), but NOT once parked + charging on the dock —
+            # otherwise a mid-task rain-hold (docked + charging, status still "Docking", never
+            # flips to Waiting) leaves the icon's headlight bit stuck on. Manual switch
+            # (camLedStatus==3) always wins. [Nate 2026-06-20]
             headlights_on = (_cam_led == 3
-                             or data.get("workStatus") == WORK_STATUS_DOCKING
-                             or data.get("robotStatus") == WORK_STATUS_DOCKING)
+                             or ((data.get("workStatus") == WORK_STATUS_DOCKING
+                                  or data.get("robotStatus") == WORK_STATUS_DOCKING)
+                                 and not charging))
             dbg["headlights"] = bool(headlights_on)
             # PIL rotates CCW; compass heading is CW from north → negate. Calibrated live.
             base = mower_icon(led=led, headlights_on=headlights_on)
@@ -1133,13 +1138,30 @@ def png_bytes(img) -> bytes:
     return bio.getvalue()
 
 
+_FONT_CACHE: dict = {}
+
+
 def font(size: int):
+    """Cached font lookup. Previously every draw_text/draw_center re-ran
+    ImageFont.truetype("DejaVuSans.ttf") — which fails to resolve by bare name on most
+    HA OS installs and fell back to load_default() on EVERY text draw, a real source of
+    map-render lag (reported by xar). Resolve once per size and memoise. [2026-06-20]"""
     if ImageFont is None:
         return None
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size)
-    except Exception:
-        return ImageFont.load_default()
+    f = _FONT_CACHE.get(size)
+    if f is None:
+        try:
+            f = ImageFont.truetype("DejaVuSans.ttf", size)
+        except Exception:
+            # Where DejaVuSans isn't resolvable, prefer the SIZED bundled default
+            # (Pillow >= 10.1) so headers/labels still scale; fall back to the legacy
+            # fixed default on older Pillow (which renders everything one size).
+            try:
+                f = ImageFont.load_default(size)
+            except TypeError:
+                f = ImageFont.load_default()
+        _FONT_CACHE[size] = f
+    return f
 
 
 def draw_text(draw, text: str, x: float, y: float, size: int, fill) -> None:
