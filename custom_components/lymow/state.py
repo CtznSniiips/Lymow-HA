@@ -181,6 +181,16 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
             if _has_field(twist, "angular"):
                 state["twistAngular"] = twist.angular
 
+    # Firmware OTA progress — PbDebugSetting.downloadProgress (field 7) is the
+    # exact value the official app renders as the live update percentage during
+    # an OTA. (uploadProgress is unrelated: a map backup/restore enum.)
+    ds = getattr(msg, "debugSetting", None)
+    if _has_msg(ds) and _has_field(ds, "downloadProgress"):
+        try:
+            state["downloadProgress"] = int(getattr(ds, "downloadProgress", 0) or 0)
+        except Exception:
+            pass
+
     dp = getattr(msg, "deviceInfo", None)
     if _has_msg(dp):
         state["deviceInfo"] = dp
