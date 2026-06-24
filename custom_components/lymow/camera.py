@@ -332,15 +332,17 @@ class LymowRTSPCamera(LymowEntity, Camera):
         self._proxy_process = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-loglevel", "warning",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
             "-rtsp_transport", "tcp",
             "-analyzeduration", "3000000",   # 3 s — waits for first IDR frame
             "-probesize", "5000000",
             "-i", url,
             "-c:v", "copy",                  # no re-encode; just remux
             "-f", "hls",
-            "-hls_time", "1",                # 1-second segments → low latency
-            "-hls_list_size", "3",           # rolling 3-segment window
-            "-hls_flags", "delete_segments+append_list",
+            "-hls_time", "2",                # 2-second segments — smoother than 1 s
+            "-hls_list_size", "5",           # 10-second rolling window
+            "-hls_flags", "delete_segments+append_list+program_date_time+independent_segments",
             "-hls_segment_filename", os.path.join(self._hls_dir, "seg%03d.ts"),
             os.path.join(self._hls_dir, "stream.m3u8"),
             stdout=asyncio.subprocess.DEVNULL,
