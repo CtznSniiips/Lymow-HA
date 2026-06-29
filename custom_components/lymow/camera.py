@@ -289,6 +289,13 @@ class LymowRTSPCamera(LymowEntity, Camera):
 
     async def _restart_hls_proxy(self) -> None:
         """Stop then start the proxy, serialised by _proxy_lock."""
+        # Tell HA's stream component to release its reference to the current
+        # HLS URL before we tear it down. Without this, HA keeps the old
+        # stream handle open and serves stale cached segments even after FFmpeg
+        # has restarted on a fresh temp directory with a new segment sequence.
+        if self.stream is not None:
+            with contextlib.suppress(Exception):
+                await self.stream.stop()
         async with self._proxy_lock:
             await self._stop_hls_proxy_unlocked()
             await self._start_hls_proxy_unlocked()
@@ -329,6 +336,12 @@ class LymowRTSPCamera(LymowEntity, Camera):
 
         # FFmpeg: RTSP in (TCP, generous probe) → HLS out.
         # stderr is captured via PIPE so the watchdog can log it on exit.
+        # Use a time-based start number so media_sequence never rolls back to 0
+        # on proxy restart — a backwards sequence confuses HA's stream component
+        # into replaying stale segments or stalling on the last cached frame.
+        import time as _time
+        hls_start_number = int(_time.monotonic() * 10) % 1000000
+
         self._proxy_process = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-loglevel", "warning",
@@ -342,8 +355,13 @@ class LymowRTSPCamera(LymowEntity, Camera):
             "-f", "hls",
             "-hls_time", "2",                # 2-second segments — smoother than 1 s
             "-hls_list_size", "5",           # 10-second rolling window
-            "-hls_flags", "delete_segments+append_list+program_date_time+independent_segments",
-            "-hls_segment_filename", os.path.join(self._hls_dir, "seg%03d.ts"),
+            # Removed append_list: rewriting the playlist fresh each segment avoids
+            # sequence-number confusion when the proxy restarts.
+            # Added discont_start: inserts #EXT-X-DISCONTINUITY so players know
+            # the stream context has reset and don't try to splice with cached segments.
+            "-hls_flags", "delete_segments+discont_start+program_date_time+independent_segments",
+            "-start_number", str(hls_start_number),
+            "-hls_segment_filename", os.path.join(self._hls_dir, "seg%06d.ts"),
             os.path.join(self._hls_dir, "stream.m3u8"),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,  # captured for watchdog diagnostics
